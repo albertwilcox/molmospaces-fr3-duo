@@ -1,0 +1,50 @@
+# Exclude git history
+.git/
+.github/
+
+# Folder-exclusions
+build/
+build-*/
+dist/
+tmp/
+venv/
+venv-*/
+.venv/
+Testing/
+.cache/
+.ruff_cache/
+uv.lock
+
+# Exclude settings from editors|IDEs
+.vscode
+
+# Exclude temporary python folders
+*.egg-info/
+*.ipynb_checkpoints/
+__pycache__/
+
+# Exclude generated typings from pybind11-stubgen
+/typings
+
+
+# Exclude some generated files
+/assets/scenes/*
+!/assets/scenes/refs/
+!/assets/scenes/ithor/
+/assets/objects/objaverse/
+
+
+# Exclude .json files from test runs
+/*.json
+
+# Exclude .txt files from test runs
+/*.txt
+/*.TXT
+
+# Exclude log files from procthor generation
+/*.json
+
+*.zip
+*.gz
+
+*.lock

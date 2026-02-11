@@ -1,0 +1,81 @@
+from functools import cached_property
+
+import mujoco
+import numpy as np
+from mujoco import MjData
+
+from molmo_spaces.env.data_views import create_mlspaces_body
+from molmo_spaces.robots.robot_views.abstract import (
+    FreeJointRobotBaseGroup,
+    GripperGroup,
+    RobotView,
+)
+from molmo_spaces.robots.robot_views.franka_fr3_view import FrankaFR3ArmGroup, FrankaFR3BaseGroup
+from molmo_spaces.utils.mj_model_and_data_utils import site_pose
+
+
+class CAPGripperGroup(GripperGroup):
+    def __init__(
+        self, mj_data: MjData, base_group: FrankaFR3BaseGroup, namespace: str = ""
+    ) -> None:
+        model = mj_data.model
+        self._namespace = namespace
+        joint_ids = [
+            model.joint(f"{namespace}gripper/finger_left_joint").id,
+            model.joint(f"{namespace}gripper/finger_right_joint").id,
+        ]
+        act_ids = [model.actuator(f"{namespace}gripper/fingers_actuator").id]
+        root_body_id = model.body(f"{namespace}gripper/base").id
+        super().__init__(mj_data, joint_ids, act_ids, root_body_id, base_group)
+        self._ee_site_id = model.site(f"{namespace}gripper/grasp_site").id
+        self._finger_1_geom_id = model.geom(f"{namespace}gripper/left_pad2").id
+        self._finger_2_geom_id = model.geom(f"{namespace}gripper/right_pad2").id
+
+    def set_gripper_ctrl_open(self, open: bool) -> None:
+        self.ctrl = [0 if open else 255]
+
+    @property
+    def inter_finger_dist(self) -> float:
+        dist = mujoco.mj_geomDistance(
+            self.mj_model, self.mj_data, self._finger_1_geom_id, self._finger_2_geom_id, 0.1, None
+        )
+        return max(0.0, dist)
+
+    @property
+    def inter_finger_dist_range(self) -> tuple[float, float]:
+        return 0.0, 0.087
+
+    @property
+    def leaf_frame_to_world(self) -> np.ndarray:
+        return site_pose(self.mj_data, self._ee_site_id)
+
+    @property
+    def root_frame_to_world(self) -> np.ndarray:
+        return self.leaf_frame_to_world
+
+    def get_jacobian(self) -> np.ndarray:
+        J = np.zeros((6, self.mj_model.nv))
+        mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self._ee_site_id)
+        return J
+
+
+class FrankaCAPRobotView(RobotView):
+    def __init__(self, mj_data: MjData, namespace: str = "") -> None:
+        self._namespace = namespace
+        base = FrankaFR3BaseGroup(mj_data, namespace=namespace)
+        move_groups = {
+            "base": base,
+            "arm": FrankaFR3ArmGroup(
+                mj_data, base, namespace=namespace, grasp_site_name="gripper/grasp_site"
+            ),
+            "gripper": CAPGripperGroup(mj_data, base, namespace=namespace),
+        }
+        super().__init__(mj_data, move_groups)
+
+    @property
+    def name(self) -> str:
+        return f"{self._namespace}franka_droid"
+
+    @property
+    def base(self) -> FrankaFR3BaseGroup:
+        return self._move_groups["base"]

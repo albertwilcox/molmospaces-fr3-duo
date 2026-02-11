@@ -1,0 +1,114 @@
+[project]
+name = "molmo-spaces-isaac"
+version = "0.0.1"
+description = "IsaacSim compatible environments for ProcTHOR and RoboTHOR"
+readme = "README.md"
+authors = []
+requires-python = ">=3.11"
+dependencies = [
+    "mujoco>=3.4.0",
+    "usd-exchange",
+    "tyro",
+    "numpy-stl",
+    "tinyobjloader>=2.0.0rc13",
+    "p_tqdm",
+    "scipy",
+    "msgspec",
+    "lmdb~=1.7.5",
+    "zstandard~=0.25.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "pybind11-stubgen",
+    "ruff",
+    "ty",
+    "ipython",
+    "types-usd",
+]
+sim = [
+    "isaaclab[all,isaacsim]>=2.3.1",
+]
+
+[tool.uv]
+override-dependencies = [
+    "pywin32==306; sys_platform == 'win32'",
+    "torch>=2.9.0", # Change here for different CUDA version
+    "torchvision>=0.24.0", # Change here for different CUDA version
+]
+
+[tool.uv.sources]
+isaacsim = { index = "nvidia" }
+torch = { index = "torch" }
+torchvision = { index = "torch" }
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu130" # Change here for different CUDA version
+explicit = true
+
+[project.scripts]
+ms-download = "molmo_spaces_isaac.downloader.main:main"
+ms-convert-assets = "molmo_spaces_isaac.assets.asset_converter:main"
+ms-convert-houses = "molmo_spaces_isaac.assets.house_converter:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+docstring-code-format = false
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # PEP8
+    "W",
+    # Pylint
+    "PL",
+]
+ignore = [
+    "C408", # dict() calls
+    "C901", # function complexity
+    "E501", # line too long (handled by line-length setting)
+    "B006", # defaults shouldn't be mutable
+    "UP015", # redundant mode arguments in open should be fine for now
+    "SIM117", # allow nested with statements for now
+    "SIM102", # don't be picky about nested if statements
+    "SIM114", # don't be picky about merging if branches using or
+    "PLR0912",
+    "PLR0913",
+    "E402",
+    "PLR0911",
+    "B905",
+]
+
+[tool.ty.environment]
+extra-paths = ["./typings"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

@@ -1,0 +1,29 @@
+Abhay Deshpande <a.deshpande012@gmail.com>
+Ainaz Eftekhar <69212889+Ainaz99@users.noreply.github.com>
+AlvaroHG <alvaroherrasti@gmail.com>
+Arjun Guru <aguru@cs.washington.edu>
+BlGene <BlGene@users.noreply.github.com>
+Eli VanderBilt <eliv@allenai.org>
+Jordi Salvador <jordis@allenai.org>
+Kiana Ehsani <ehsanik@gmail.com>
+KuoHaoZeng <khzeng@allenai.org>
+Luca Weihs <lucaw@allenai.org>
+Max Argus <maxa@allenai.org>
+Maya Guru <32654507+mayasguru@users.noreply.github.com>
+Omar Rayyan <orayyan@g.ucla.edu>
+Piper Wolters <piperwolters@gmail.com>
+Shuo <shuoliu@uw.edu>
+Snehal Jauhri <snehal.jauhri@gmail.com>
+Treeeplanter <shuoliu@uw.edu>
+Winson Han <winson.whan@gmail.com>
+Yejin <yejink@allenai.org>
+Yuquan Deng <yuquand@allenai.org>
+Yuquan Deng <yuquand@uw.edu>
+Zichen Zhang <zcczhang1@gmail.com>
+gregor <wpumacay@gmail.com>
+lucaw <lucaw@allenai.org>
+rosehendrix <roseh@allenai.org>
+shuoliu <shuoliu@uw.edu>
+sjauhri <snehal.jauhri@gmail.com>
+wpumacay <wpumacay@gmail.com>
+ykim104 <kimyejin2000@gmail.com>

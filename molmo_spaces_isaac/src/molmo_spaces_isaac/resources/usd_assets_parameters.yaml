@@ -1,0 +1,81 @@
+# Dressers -----------------------------------------------------------------------------------------
+Dresser_*:
+  core:
+    stiffness: 0.05
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+# Microwaves ---------------------------------------------------------------------------------------
+Microwave_*:
+  core:
+    stiffness: 0.05
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+# Side Tables --------------------------------------------------------------------------------------
+Side_Table_*:
+  core:
+    stiffness: 0.05
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+# Laptops ------------------------------------------------------------------------------------------
+Laptop_*:
+  core:
+    stiffness: 0.05
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+
+# iTHOR Custom objects -----------------------------------------------------------------------------
+Drawer_*:
+  core:
+    stiffness: 0.0
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+Cabinet_*:
+  core:
+    stiffness: 0.0
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+ShowerDoor_*:
+  core:
+    stiffness: 0.05
+    damping: 0.05
+  physx:
+    armature: 0.05
+    jointFriction: 1.5
+
+dishwasher_*:
+  core:
+    stiffness: 0.5
+    damping: 0.25
+    targetPosition: -20
+  physx:
+    armature: 0.5
+    jointFriction: 10
+
+oven_*:
+  core:
+    stiffness: 0.25
+    damping: 0.25
+    targetPosition: -20
+  physx:
+    armature: 0.05
+    jointFriction: 10
+
+# --------------------------------------------------------------------------------------------------
