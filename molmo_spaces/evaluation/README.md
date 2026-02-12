@@ -36,13 +36,16 @@ Download the checkpoint and start the policy server (leave it running in a separ
 ```bash
 git clone https://github.com/omarrayyann/openpi
 mkdir checkpoints && cd checkpoints
-gsutil cp -r gs://openpi-assets-simeval/pi0_fast_droid_jointpos .
+gsutil cp -r gs://openpi-assets/pi05_droid_jointpos .
+other options: `pi05_droid_jointpos`, `pi0_fast_droid_jointpos`, `pi0_droid_jointpos`
 ```
 
-Install openpi and run the server: (default port:8080)
+Install openpi and run the server (default port: 8080):
 
 ```bash
-uv run scripts/serve_policy.py --port=8080 policy:checkpoint --policy.config=pi0_fast_droid_jointpos_fullfinetune --policy.dir=checkpoints/pi0_fast_droid_jointpos/
+uv run scripts/serve_policy.py --port=8080 policy:checkpoint \
+  --policy.config=<checkpoint_name> \
+  --policy.dir=checkpoints/<checkpoint_name>/
 ```
 
 #### 2. Run the benchmark
