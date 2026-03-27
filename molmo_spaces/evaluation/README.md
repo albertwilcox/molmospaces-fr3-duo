@@ -3,6 +3,21 @@
 Run learned policies on fixed, reproducible benchmarks.
 
 
+## Resources
+
+This README focuses on benchmark installation and running.
+
+### Related documentation
+- Theoretical Notes on policy comparison can be found [here](https://docs.google.com/document/d/1FcMxJgAQ_2Ojd2uu8HE2MBfD6RE53zcXa55_r8EfPts/export?format=pdf)
+- Benchmark usage documentation can be found [here](https://docs.google.com/document/d/1aRJ_NGWBzdLk3jJ71GvYx-dj1nbATQbDGfSG3V4Iy0g/export?format=pdf). 
+
+
+### Submitting results
+
+1. Run the policy and evaluation script,following the instructions below to obtain .csv files or a zip of them.
+2. Create a GitHub issue in the repository mentioned [here](https://github.com/allenai/molmospaces/issues/8).
+3. Assign @BlGene or @omarrayyann, also feel free to reach out for help.
+
 ## Concepts
 
 A **benchmark** is a `benchmark.json` file containing a list of self-contained episode specs. Each spec includes everything needed to recreate a task: scene, robot pose, object poses, cameras, language instructions.
@@ -66,22 +81,6 @@ Make sure the *port* number is the same in `molmo_spaces.configs.policy_configs_
 Also, see `molmo_spaces/evaluation/configs/evaluation_configs.py` for more examples on eval configs.
 
 ---
-
-## Running benchmark with a custom asset
-
-You might want to replace the target rigid object for `pick` or `pick-and-place` with a custom asset for a specific episode.
-
-```bash
-python molmo_spaces/evaluation/eval_main.py \
-    molmo_spaces.evaluation.configs.evaluation_configs:PiPolicyEvalConfig \
-    --benchmark_dir assets/benchmarks/path-to-benchmark.json \
-    --checkpoint_path <path/to/checkpoint/pi0_fast_droid_jointpos> \
-    --task_horizon_steps 500
-    --idx 0
-    --add_custom_object
-    --custom_object_path <path/to/custom/object.xml>
-    --custom_object_name <natural/language/name/of/object>
-```
 
 
 
@@ -201,6 +200,25 @@ for r in results.episode_results:
 ```
 
 You can also pass `preloaded_policy=` if you've already instantiated the policy.
+
+
+## Running benchmark with a custom asset
+
+You might want to replace the target rigid object for `pick` or `pick-and-place` with a custom asset for a specific episode.
+
+```bash
+python molmo_spaces/evaluation/eval_main.py \
+    molmo_spaces.evaluation.configs.evaluation_configs:PiPolicyEvalConfig \
+    --benchmark_dir assets/benchmarks/path-to-benchmark.json \
+    --checkpoint_path <path/to/checkpoint/pi0_fast_droid_jointpos> \
+    --task_horizon_steps 500
+    --idx 0
+    --add_custom_object
+    --custom_object_path <path/to/custom/object.xml>
+    --custom_object_name <natural/language/name/of/object>
+```
+
+
 
 ## Sample Episode Spec
 
