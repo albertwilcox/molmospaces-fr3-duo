@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
+HAS_FILAMENT: bool = getattr(mujoco, "mjRENDERER", "classic") == "filament"
 
 class BaseMujocoEnv(ABC):
     object_managers: list["ObjectManager"]
@@ -148,7 +149,6 @@ class CPUMujocoEnv(BaseMujocoEnv):
         mj_model: MjModel,
         mj_base_scene_path: str,
         parallelize: bool = True,
-        use_filament: bool = False,
     ) -> None:
         super().__init__(exp_config, mj_model)
 
@@ -166,7 +166,6 @@ class CPUMujocoEnv(BaseMujocoEnv):
 
         self.camera_manager = CameraManager()
         self._renderer: MjAbstractRenderer | None = None
-        self._use_filament = use_filament
 
         self.object_managers = []
 
@@ -209,7 +208,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
             width, height = self.config.camera_config.img_resolution
         else:
             width, height = (640, 480)  # Default resolution
-        if self._use_filament:
+        if HAS_FILAMENT:
             self._renderer = MjFilamentRenderer(model=self.mj_model, width=width, height=height)
             log.info("Using MuJoCo renderer: filament")
         else:
@@ -730,7 +729,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
                     agent_radius=agent_radius,
                     px_per_m=px_per_m,
                     device_id=None,
-                    use_filament=self.config.use_filament,
+                    use_filament=HAS_FILAMENT,
                 )
         elif "procthor" in self.current_model_path or "holodeck" in self.current_model_path:
             model_path = Path(self.current_model_path.replace("_ceiling", ""))
@@ -746,7 +745,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
                     px_per_m=px_per_m,
                     agent_radius=agent_radius,
                     device_id=None,
-                    use_filament=self.config.use_filament,
+                    use_filament=HAS_FILAMENT,
                 )
         else:
             raise ValueError(f"Unknown scene type: {self.current_model_path}")

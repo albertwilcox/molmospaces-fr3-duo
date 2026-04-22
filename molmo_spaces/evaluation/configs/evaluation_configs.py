@@ -173,8 +173,6 @@ class DummyBenchmarkEvalConfig(JsonBenchmarkEvalConfig):
     # Policy config - DummyPolicy returns empty dict (no-op)
     policy_config: DummyPolicyConfig = DummyPolicyConfig()
 
-    use_filament: bool = False
-
     @property
     def tag(self) -> str:
         return "dummy_json_benchmark"
