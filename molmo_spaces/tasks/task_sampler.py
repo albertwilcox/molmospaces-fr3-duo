@@ -787,7 +787,6 @@ class BaseMujocoTaskSampler:
             robot_factory=self._create_robot,
             mj_model=model,
             mj_base_scene_path=scene_path,
-            use_filament=self.config.use_filament,
         )
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("scene_env_create")

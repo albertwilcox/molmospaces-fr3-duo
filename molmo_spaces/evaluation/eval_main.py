@@ -442,7 +442,6 @@ def run_evaluation(
     preloaded_policy: BasePolicy | None = None,
     max_episodes: int | None = None,
     camera_config_override: Any | None = None,
-    use_filament: bool = False,
     environment_light_intensity: float | None = None,
     episode_idx: int | None = None,
     add_custom_object: bool = False,
@@ -606,7 +605,6 @@ def run_evaluation(
     )
 
     # Custom filmanet settings to overwrite by the user
-    exp_config.use_filament |= use_filament
     exp_config.environment_light_intensity = (
         environment_light_intensity or exp_config.environment_light_intensity
     )
@@ -731,7 +729,6 @@ def main() -> None:
         num_workers=args.num_workers,
         use_wandb=not args.no_wandb,
         wandb_project=args.wandb_project,
-        use_filament=args.use_filament,
         environment_light_intensity=args.environment_light_intensity,
         camera_config_override=eval_camera_config,
         episode_idx=args.idx,
