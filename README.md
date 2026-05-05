@@ -150,7 +150,7 @@ molmo_spaces/data_generation/main.py  # data generation
 scripts/datagen/run_pipeline.py       # debugging
 ```
 
-This readme contains more information on [experiment configs](#experiment-configs) as well as the other entry-points, for those, please see the [evaluation](#molmospaces-benchmarks) and [data generation](#data-generation) sections of this readme. 
+This readme contains more information on [experiment configs](#experiment-configs) as well as the other entry-points, for those, please see the [evaluation](#benchmarks-and-evaluations) and [data generation](#data-generation) sections of this readme. 
 
 ## MolmoSpaces Assets
 
@@ -208,7 +208,7 @@ python molmo_spaces/evaluation/eval_main.py \
     molmo_spaces.evaluation.configs.evaluation_configs:PiPolicyEvalConfig \
     --benchmark_dir assets/bench/path-to-benchmark.json \
     --checkpoint_path <path/to/checkpoint/pi0_fast_droid_jointpos> \
-    --task_horizon_steps 500
+    --task_horizon_steps 500  # optional (defaults to benchmark value)
 ```
 
 For more information, please refer to an instruction in the [benchmark](molmo_spaces/evaluation/README.md).
