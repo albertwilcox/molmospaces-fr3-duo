@@ -13,7 +13,6 @@ managed by the RBY1 RobotView class.
 
 from typing import Literal
 
-import mujoco
 import numpy as np
 from mujoco import MjData
 
@@ -21,15 +20,16 @@ from molmo_spaces.robots.robot_views.abstract import (
     FreeJointRobotBaseGroup,
     GripperGroup,
     HoloJointsRobotBaseGroup,
-    MoveGroup,
+    MJCFFrameMixin,
     RobotBaseGroup,
+    SimplyActuatedMoveGroup,
     RobotView,
 )
 from molmo_spaces.utils.linalg_utils import normalize_ang_error
 from molmo_spaces.utils.mj_model_and_data_utils import body_pose, site_pose
 
 
-class RBY1ArmGroup(MoveGroup):
+class RBY1ArmGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
     """Implementation of the RBY1's 7-DOF arm, excluding the gripper."""
 
     def __init__(
@@ -56,6 +56,14 @@ class RBY1ArmGroup(MoveGroup):
         super().__init__(mj_data, joint_ids, act_ids, self._arm_root_id, base)
 
     @property
+    def leaf_frame_id(self) -> int:
+        return self._ee_site_id
+
+    @property
+    def leaf_frame_type(self):
+        return "site"
+
+    @property
     def noop_ctrl(self) -> np.ndarray:
         return self.joint_pos.copy()
 
@@ -67,13 +75,8 @@ class RBY1ArmGroup(MoveGroup):
     def root_frame_to_world(self) -> np.ndarray:
         return body_pose(self.mj_data, self._arm_root_id)
 
-    def get_jacobian(self) -> np.ndarray:
-        J = np.zeros((6, self.mj_model.nv))
-        mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self._ee_site_id)
-        return J
 
-
-class RBY1GripperGroup(GripperGroup):
+class RBY1GripperGroup(MJCFFrameMixin, GripperGroup):
     """Implementation of the RBY1's gripper.
 
     The RBY1 gripper has 2 fingers that are mechanically coupled, allowing for open/close motion of
@@ -104,6 +107,14 @@ class RBY1GripperGroup(GripperGroup):
         root_body_id = model.body(f"{namespace}EE_BODY_{side[0].upper()}")
         super().__init__(mj_data, joint_ids, act_ids, root_body_id, base)
         self._ee_site_id = model.site(f"{namespace}ee_site_{side[0]}").id
+
+    @property
+    def leaf_frame_id(self) -> int:
+        return self._ee_site_id
+
+    @property
+    def leaf_frame_type(self):
+        return "site"
 
     def set_gripper_ctrl_open(self, open: bool) -> None:
         self.ctrl = np.array([-0.05 if open else 0.0])
@@ -168,13 +179,8 @@ class RBY1GripperGroup(GripperGroup):
     def root_frame_to_world(self) -> np.ndarray:
         return self.leaf_frame_to_world
 
-    def get_jacobian(self) -> np.ndarray:
-        J = np.zeros((6, self.mj_model.nv))
-        mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self._ee_site_id)
-        return J
 
-
-class RBY1TorsoGroup(MoveGroup):
+class RBY1TorsoGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
     """Implementation of the RBY1's torso.
 
     The RBY1 torso has 6 degrees of freedom, allowing for full control of the
@@ -197,6 +203,14 @@ class RBY1TorsoGroup(MoveGroup):
         super().__init__(mj_data, joint_ids, act_ids, self._torso_root_id, base)
 
     @property
+    def leaf_frame_id(self) -> int:
+        return self._torso_leaf_id
+
+    @property
+    def leaf_frame_type(self):
+        return "body"
+
+    @property
     def noop_ctrl(self) -> np.ndarray:
         return self.joint_pos.copy()
 
@@ -207,11 +221,6 @@ class RBY1TorsoGroup(MoveGroup):
     @property
     def root_frame_to_world(self) -> np.ndarray:
         return body_pose(self.mj_data, self._torso_root_id)
-
-    def get_jacobian(self) -> np.ndarray:
-        J = np.zeros((6, self.mj_model.nv))
-        mujoco.mj_jacBody(self.mj_model, self.mj_data, J[:3], J[3:], self._torso_leaf_id)
-        return J
 
 
 class RBY1BaseGroup(FreeJointRobotBaseGroup):
@@ -261,7 +270,7 @@ class RBY1HoloBaseGroup(HoloJointsRobotBaseGroup):
         super().__init__(mj_data, world_site_id, holo_base_site_id, joints, act, root_body_id)
 
 
-class RBY1HeadGroup(MoveGroup):
+class RBY1HeadGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
     """Implementation of the RBY1's head.
 
     The RBY1 head has 2 degrees of freedom, allowing for pan and tilt motion
@@ -284,6 +293,14 @@ class RBY1HeadGroup(MoveGroup):
         self._head_leaf_id = model.body(f"{namespace}link_head_2").id
 
     @property
+    def leaf_frame_id(self) -> int:
+        return self._head_leaf_id
+
+    @property
+    def leaf_frame_type(self):
+        return "body"
+
+    @property
     def noop_ctrl(self) -> np.ndarray:
         return self.joint_pos.copy()
 
@@ -294,11 +311,6 @@ class RBY1HeadGroup(MoveGroup):
     @property
     def root_frame_to_world(self) -> np.ndarray:
         return body_pose(self.mj_data, self._head_root_id)
-
-    def get_jacobian(self) -> np.ndarray:
-        J = np.zeros((6, self.mj_model.nv))
-        mujoco.mj_jacBody(self.mj_model, self.mj_data, J[:3], J[3:], self._head_leaf_id)
-        return J
 
 
 class RBY1RobotView(RobotView):
@@ -321,6 +333,7 @@ class RBY1RobotView(RobotView):
             mj_data: The MuJoCo data structure containing the current simulation state
             namespace: Optional prefix for all joint/body names to support multiple robots
         """
+        namespace = namespace + "robot_0/"
         self._namespace = namespace
         base = (
             RBY1BaseGroup(mj_data, namespace=namespace)

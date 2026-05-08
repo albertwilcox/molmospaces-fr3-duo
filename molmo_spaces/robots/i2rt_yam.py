@@ -6,7 +6,8 @@ from mujoco import MjData, MjSpec, mjtGeom
 
 from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
-from molmo_spaces.kinematics.i2rt_yam_kinematics import I2rtYamKinematics
+from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
+from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
 from molmo_spaces.kinematics.parallel.dummy_parallel_kinematics import (
     DummyParallelKinematics,
 )
@@ -29,19 +30,9 @@ class I2rtYamRobot(Robot):
         self._robot_view = config.robot_config.robot_view_factory(
             mj_data, config.robot_config.robot_namespace
         )
-        self._kinematics = I2rtYamKinematics(
-            self.mj_model,
-            namespace=config.robot_config.robot_namespace,
-            robot_view_factory=config.robot_config.robot_view_factory,
-        )
+        self._kinematics = MlSpacesKinematics(config.robot_config)
 
-        # Use DummyParallelKinematics for batch IK (wraps the MlSpacesKinematics)
-        self._parallel_kinematics = DummyParallelKinematics(
-            config.robot_config,
-            self._kinematics,
-            mg_id="arm",
-            unlocked_mg_ids=["arm"],
-        )
+        self._parallel_kinematics = SimpleWarpKinematics(config.robot_config)
 
         arm_controller_cls = (
             JointPosController

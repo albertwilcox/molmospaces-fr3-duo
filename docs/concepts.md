@@ -23,11 +23,26 @@ The rest of the system doesn't need to know any of this: it interacts with move 
 
 | Class | Purpose |
 |-------|---------|
+| [`SimplyActuatedMoveGroup`][molmo_spaces.robots.robot_views.abstract.SimplyActuatedMoveGroup] | 1:1 mapping between joints, actuators, and position/velocity addresses |
 | [`GripperGroup`][molmo_spaces.robots.robot_views.abstract.GripperGroup] | Adds gripper-specific controls (`set_gripper_ctrl_open`, `is_open`, `inter_finger_dist`) |
 | [`RobotBaseGroup`][molmo_spaces.robots.robot_views.abstract.RobotBaseGroup] | Represents the robot's pose in the world |
-| [`ImmobileRobotBaseGroup`][molmo_spaces.robots.robot_views.abstract.ImmobileRobotBaseGroup] | Fixed base (e.g. tabletop Franka) |
+| [`MocapRobotBaseGroup`][molmo_spaces.robots.robot_views.abstract.MocapRobotBaseGroup] | Fixed teleportable base (e.g. tabletop Franka) |
 | [`FreeJointRobotBaseGroup`][molmo_spaces.robots.robot_views.abstract.FreeJointRobotBaseGroup] | Full 6-DoF free joint base |
 | [`HoloJointsRobotBaseGroup`][molmo_spaces.robots.robot_views.abstract.HoloJointsRobotBaseGroup] | Virtual x, y, theta (holonomic) |
+
+**Mixin:**
+
+| Class | Purpose |
+|-------|---------|
+| [`MJCFFrameMixin`][molmo_spaces.robots.robot_views.abstract.MJCFFrameMixin] | A move group whose leaf frame is represented by a body or site in the MJCF model|
+
+#### SimplyActuatedMoveGroup
+
+The base `MoveGroup` makes no assumptions about the relationship between joints and actuators — a group can have more joints than actuators (e.g. a mirrored gripper), or joints whose `qpos` dimension differs from their `qvel` dimension (free and ball joints). `SimplyActuatedMoveGroup` narrows this: every joint is a simple 1-DoF hinge or slide, and there is exactly one actuator per joint. This means `n_joints == pos_dim == vel_dim == n_actuators`, and the internal ID/address lists can be safely exposed as public properties (`joint_ids`, `actuator_ids`, `joint_posadr`, `joint_veladr`). Groups like the RBY1 torso or Franka FR3 arm extend `SimplyActuatedMoveGroup` directly.
+
+#### MJCFFrameMixin
+
+Most move groups define their leaf frame as a specific element in the MJCF model — either a MuJoCo **site** or **body**. `MJCFFrameMixin` captures this pattern: subclasses implement `leaf_frame_id` (the integer ID) and `leaf_frame_type` (`"site"` or `"body"`), and the mixin provides a default `get_jacobian()` that dispatches to `mj_jacSite` or `mj_jacBody` accordingly. All arm groups, gripper groups, and the RBY1 torso/head use this mixin. The base groups (`FreeJointRobotBaseGroup`, `HoloJointsRobotBaseGroup`) do **not** use it, since their leaf frame is derived from joint state rather than a fixed MJCF element.
 
 **Key interface:**
 

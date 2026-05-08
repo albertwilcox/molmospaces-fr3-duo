@@ -2,18 +2,12 @@
 This module defines the core abstractions for representing and controlling robots in MuJoCo.
 The architecture is based on a hierarchical structure where a RobotView contains multiple MoveGroups,
 each representing an atomic collection of joints and actuators.
-
-The key abstractions are:
-- MoveGroup: Base class for any collection of joints and actuators
-- Arm: A MoveGroup with additional gripper functionality
-- RobotBase: A MoveGroup that controls the overall robot pose
-- RobotView: Top-level class that contains and manages multiple MoveGroups
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from functools import cache, cached_property
-from typing import NoReturn, Optional, TypeAlias
+from functools import cached_property
+from typing import Literal, NoReturn, Optional, TypeAlias
 
 import mujoco
 import numpy as np
@@ -282,6 +276,73 @@ class MoveGroup(ABC):
         raise NotImplementedError
 
 
+class MJCFFrameMixin(ABC):
+    """
+    Mixin for move groups that represent the leaf frame as a body or site in the MJCF model.
+
+    Note: Since this mixin provides a `get_jacobian()` implementation, inheriting classes must
+        put this mixin first in the inheritance chain to satisfy the MRO.
+    """
+
+    @property
+    @abstractmethod
+    def leaf_frame_id(self) -> int:
+        """The ID of the leaf frame, either a body ID or a site ID."""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def leaf_frame_type(self) -> Literal["site", "body"]:
+        """The type of the leaf frame."""
+        raise NotImplementedError
+
+    def get_jacobian(self) -> np.ndarray:
+        """
+        Returns the (6, model.nv) jacobian of the move group's leaf frame.
+
+        The jacobian maps joint velocities to the spatial velocity of the leaf frame.
+
+        Returns:
+            A 6xN numpy array where N is the number of degrees of freedom in the model.
+
+        See: https://mujoco.readthedocs.io/en/stable/APIreference/APIfunctions.html#mj-jac
+        """
+        assert isinstance(self, MoveGroup), (
+            f"{self.__class__.__name__} must be used with a MoveGroup"
+        )
+
+        J = np.zeros((6, self.mj_model.nv))
+        if self.leaf_frame_type == "site":
+            mujoco.mj_jacSite(self.mj_model, self.mj_data, J[:3], J[3:], self.leaf_frame_id)
+        elif self.leaf_frame_type == "body":
+            mujoco.mj_jacBody(self.mj_model, self.mj_data, J[:3], J[3:], self.leaf_frame_id)
+        else:
+            raise ValueError(f"Invalid leaf frame type: {self.leaf_frame_type}")
+        return J
+
+
+class SimplyActuatedMoveGroup(MoveGroup):
+    """
+    A SimplyActuatedMoveGroup is a move group with a 1:1 mapping between joints, actuators, and position/velocity addresses.
+    """
+
+    @property
+    def joint_ids(self):
+        return self._joint_ids
+
+    @property
+    def actuator_ids(self):
+        return self._actuator_ids
+
+    @property
+    def joint_posadr(self):
+        return self._joint_posadr
+
+    @property
+    def joint_veladr(self):
+        return self._joint_veladr
+
+
 class GripperGroup(MoveGroup):
     @abstractmethod
     def set_gripper_ctrl_open(self, open: bool) -> None:
@@ -355,7 +416,7 @@ class RobotBaseGroup(MoveGroup):
 
     @pose.setter
     @abstractmethod
-    def pose(self, pose: np.ndarray) -> NoReturn:
+    def pose(self, pose: np.ndarray):
         """Set the pose of the robot base relative to the world frame.
 
         Args:
@@ -432,7 +493,7 @@ class FreeJointRobotBaseGroup(RobotBaseGroup):
         return J
 
 
-class HoloJointsRobotBaseGroup(RobotBaseGroup):
+class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
     """A RobotBase that uses virtual holonomic joints to represent its pose.
 
     Assumes three virtual holonomic joints for x, y, and theta control.
