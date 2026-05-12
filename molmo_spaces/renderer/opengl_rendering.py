@@ -1,3 +1,4 @@
+import os
 from queue import Queue
 from typing import Any, Literal
 
@@ -80,13 +81,18 @@ class MjOpenGLRenderer(MjAbstractRenderer):
             `height` exceed the dimensions of MuJoCo's offscreen framebuffer.
         """
         if device_id is None:
-            try:
-                import torch
+            # Check MUJOCO_EGL_DEVICE_ID env var first (reliable in forkserver workers)
+            env_device = os.environ.get("MUJOCO_EGL_DEVICE_ID")
+            if env_device is not None:
+                device_id = int(env_device)
+            else:
+                try:
+                    import torch
 
-                if torch.cuda.is_available():
-                    device_id = 0
-            except ImportError:
-                pass
+                    if torch.cuda.is_available():
+                        device_id = 0
+                except ImportError:
+                    pass
 
         super().__init__(**prepare_locals_for_super(locals()))
 

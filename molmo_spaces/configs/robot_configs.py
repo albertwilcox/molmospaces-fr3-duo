@@ -18,6 +18,7 @@ from molmo_spaces.configs.abstract_config import Config
 from molmo_spaces.molmo_spaces_constants import get_robot_path
 from molmo_spaces.robots.abstract import Robot
 from molmo_spaces.robots.bimanual_yam import BimanualYamRobot
+from molmo_spaces.robots.bimanual_franka import BimanualFrankaRobot
 from molmo_spaces.robots.floating_robotiq import FloatingRobotiqRobot
 from molmo_spaces.robots.floating_rum import FloatingRUMRobot
 from molmo_spaces.robots.franka import FrankaRobot
@@ -26,6 +27,7 @@ from molmo_spaces.robots.mobile_franka import MobileFrankaRobot
 from molmo_spaces.robots.rby1 import RBY1
 from molmo_spaces.robots.robot_views.abstract import RobotViewFactory
 from molmo_spaces.robots.robot_views.bimanual_yam_view import BimanualYamRobotView
+from molmo_spaces.robots.robot_views.bimanual_franka_view import BimanualFrankaRobotView
 from molmo_spaces.robots.robot_views.franka_cap_view import (
     FrankaCAPRobotView,
 )
@@ -411,6 +413,38 @@ class BimanualYamRobotConfig(BaseRobotConfig):
         "right_arm": [0.0006, 0.0147, 0.1669, -0.6407, 0.0746, 0.1516],
         "left_gripper": [0.03914, 0.0],
         "right_gripper": [0.04068, 0.0],
+    }
+    init_qpos_noise_range: dict[str, list[float]] | None = None
+    command_mode: dict[str, str] = {
+        "arm": "joint_position",
+        "gripper": "joint_position",
+    }
+    gravcomp: bool = True
+
+    def model_post_init(self, __context):
+        super().model_post_init(__context)
+        if "gripper" in self.command_mode:
+            assert self.command_mode["gripper"] == "joint_position"
+        if "arm" in self.command_mode:
+            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position"]
+
+
+class BimanualFrankaConfig(BaseRobotConfig):
+    """Configuration for bimanual Franka robot (two FR3 arms with Robotiq 2F-85 grippers)."""
+
+    robot_cls: type[BimanualFrankaRobot] | None = BimanualFrankaRobot
+    robot_factory: Callable[[MjData, Any], Robot] | None = BimanualFrankaRobot
+    robot_view_factory: RobotViewFactory | None = BimanualFrankaRobotView
+    robot_namespace: str = "robot_0/"
+    default_world_pose: list[float] = [0, 0, 0, 1, 0, 0, 0]
+    name: str = "bimanual_franka"
+    robot_xml_path: Path = Path("fr3_duo.xml")
+    base_size: list[float] | None = [0.4, 0.5, 0.7]
+    init_qpos: dict[str, list[float]] = {
+        "left_arm": [0, -0.7853, 0, -2.35619, 0, 1.57079, 0.0],
+        "right_arm": [0, -0.7853, 0, -2.35619, 0, 1.57079, 0.0],
+        "left_gripper": [0.0, 0.0],
+        "right_gripper": [0.0, 0.0],
     }
     init_qpos_noise_range: dict[str, list[float]] | None = None
     command_mode: dict[str, str] = {

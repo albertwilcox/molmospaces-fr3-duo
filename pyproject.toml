@@ -111,10 +111,15 @@ include-package-data = true
 [tool.uv]
 package = true
 environments = [
-    "sys_platform == 'darwin'",
     "sys_platform == 'linux'",
 ]
 extra-index-url = ["https://pypi.org/simple", "https://test.pypi.org/simple/"]
+conflicts = [
+    [
+        { extra = "mujoco" },
+        { extra = "mujoco-filament" },
+    ],
+]
 
 [tool.uv.sources]
 bpy = { index = "bpy" }

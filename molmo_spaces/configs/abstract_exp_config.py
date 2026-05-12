@@ -168,14 +168,14 @@ class MlSpacesExpConfig(Config, ABC):
         for i, camera in enumerate(sc.camera_config.cameras):
             # Some cameras can contain random sampling, e.g. of positions
             # Read the camera's positions and convert them to fixed cameras
-            if isinstance(camera, MjcfCameraConfig | RobotMountedCameraConfig):
+            if isinstance(camera, MjcfCameraConfig | RobotMountedCameraConfig) or type(camera).__name__ == 'SphericalRobotMountedCameraConfig':
                 cam = task.env.camera_manager.registry[camera.name]
                 new_camera = RobotMountedCameraConfig(
                     name=cam.name,
                     reference_body_names=list(cam.reference_body_names),
                     camera_offset=list(cam.camera_offset),
                     lookat_offset=list(cam.lookat_offset),
-                    camera_quaternion=list(cam.camera_quaternion),
+                    camera_quaternion=list(cam.camera_quaternion) if cam.camera_quaternion is not None else None,
                     fov=cam.fov,
                 )
                 sc.camera_config.cameras[i] = new_camera

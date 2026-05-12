@@ -99,20 +99,6 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                     )
                 ],
             ),
-            JointMoveSequence(
-                robot_view,
-                self.policy_config.move_settle_time,
-                gripper_empty_threshold=self.policy_config.gripper_empty_threshold,
-                move_segments=[
-                    JointMoveSegment(
-                        name="go_home",
-                        start_qpos=None,
-                        end_qpos=self.config.robot_config.init_qpos,
-                        duration_s=4.0,
-                    )
-                ],
-            ),
-            NoopAction(robot_view, 2.0),
         ]
 
     def _get_grasp_poses(

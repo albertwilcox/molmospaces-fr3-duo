@@ -291,6 +291,7 @@ class CameraManager:
             MjcfCameraConfig,
             RandomizedExocentricCameraConfig,
             RobotMountedCameraConfig,
+            SphericalRobotMountedCameraConfig,
         )
 
         # Store workspace center and visibility resolver for use in camera setup methods
@@ -307,6 +308,8 @@ class CameraManager:
                 self._setup_robot_mounted_camera(env, camera_spec)
             elif isinstance(camera_spec, FixedExocentricCameraConfig):
                 self._setup_fixed_exocentric_camera(env, camera_spec)
+            elif isinstance(camera_spec, SphericalRobotMountedCameraConfig):
+                self._setup_spherical_robot_mounted_camera(env, camera_spec)
             elif isinstance(camera_spec, RandomizedExocentricCameraConfig):
                 if deterministic_only:
                     log.info(
@@ -508,6 +511,88 @@ class CameraManager:
             )
 
         log.info(f"[CAMERA SETUP] Set up robot-mounted camera '{camera_config.name}'")
+
+
+    def _setup_spherical_robot_mounted_camera(
+        self, env, camera_config
+    ) -> None:
+        """Set up a robot-mounted camera using spherical coordinate sampling.
+
+        The camera orbits around a vertical axis through lookat_offset (the workspace
+        center), not around the robot base. This means:
+          - phi=0: camera is BEHIND the robot (along -X in local frame)
+          - phi=90: camera is to the robot's LEFT (+Y)
+          - phi=180: camera is in FRONT of the robot (+X)
+          - phi=270: camera is to the robot's RIGHT (-Y)
+
+        The orbit radius r is measured horizontally from the lookat point.
+        theta controls the elevation angle above horizontal (0=level, 90=directly above).
+        """
+        # Sample spherical coordinates uniformly
+        r = np.random.uniform(*camera_config.r_range)
+        theta = np.random.uniform(*camera_config.theta_range)
+        phi = np.random.uniform(*camera_config.phi_range)
+
+        lookat_base = np.array(camera_config.lookat_offset, dtype=np.float32)
+
+        # Convert cylindrical-style: orbit around lookat_offset
+        # phi=0 is behind robot (-X direction), phi increases CCW viewed from above
+        # theta is elevation above horizontal plane through lookat point
+        dx = -r * np.cos(theta) * np.cos(phi)  # negative so phi=0 is behind (-X)
+        dy = -r * np.cos(theta) * np.sin(phi)
+        dz = r * np.sin(theta)
+
+        # Camera offset = lookat center + orbital displacement (in local frame)
+        camera_offset = np.array([
+            lookat_base[0] + dx,
+            lookat_base[1] + dy,
+            lookat_base[2] + dz,
+        ], dtype=np.float32)
+
+        log.debug(
+            f"[CAMERA SETUP] Spherical sample for '{camera_config.name}': "
+            f"r={r:.2f}, theta={np.degrees(theta):.1f}deg, phi={np.degrees(phi):.1f}deg "
+            f"-> offset=[{camera_offset[0]:.3f}, {camera_offset[1]:.3f}, {camera_offset[2]:.3f}], "
+            f"lookat=[{lookat_base[0]:.3f}, {lookat_base[1]:.3f}, {lookat_base[2]:.3f}]"
+        )
+
+        # Lookat offset with optional noise
+        lookat_offset = lookat_base.copy()
+        if camera_config.lookat_noise_range is not None:
+            noise = np.random.uniform(
+                camera_config.lookat_noise_range[0],
+                camera_config.lookat_noise_range[1],
+                size=3,
+            )
+            lookat_offset = lookat_offset + noise
+
+        # Use lookat-based camera setup (always aims at workspace)
+        self.add_robot_mounted_camera(
+            env,
+            camera_name=camera_config.name,
+            reference_body_names=camera_config.reference_body_names,
+            camera_offset=camera_offset,
+            lookat_offset=lookat_offset,
+            up_axis=camera_config.up_axis,
+        )
+
+        # Sample FOV if range specified
+        if camera_config.fov_range is not None:
+            sampled_fov = np.random.uniform(*camera_config.fov_range)
+            camera = self.registry.cameras[camera_config.name]
+            camera.fov = sampled_fov
+            log.debug(f"[CAMERA SETUP] Sampled FOV for '{camera_config.name}': {sampled_fov:.1f}deg")
+
+        # Store visibility constraints for robot placement validation
+        if camera_config.visibility_constraints is not None:
+            camera = self.registry.cameras[camera_config.name]
+            camera.visibility_constraints = camera_config.visibility_constraints
+            log.debug(
+                f"[CAMERA SETUP] Stored visibility constraints for '{camera_config.name}': "
+                f"{camera_config.visibility_constraints}"
+            )
+
+        log.info(f"[CAMERA SETUP] Set up spherical robot-mounted camera '{camera_config.name}'")
 
     def _setup_fixed_exocentric_camera(
         self, env, camera_config: FixedExocentricCameraConfig

@@ -617,37 +617,54 @@ def save_depth_video(
         f"range [{depth_min:.3f}m, {depth_max:.3f}m]"
     )
 
-    # Encode each depth frame to RGB
-    encoded_frames = []
-    for frame in depth_frames:
-        encoded_frames.append(encode_depth_to_rgb(frame))
-    encoded_frames = np.array(encoded_frames)
+    # Save depth as uint16 lossless + turbo colormap MP4 for visualization.
+    # uint16 encoding: depth_meters * 1000 -> depth_mm, clamped to [0, 65535]mm = [0, 65.535m]
+    # Resolution: 1mm per step. Stored as 16-bit PNG frames in a zip archive.
+    from PIL import Image
+    import zipfile, io
+    import matplotlib.cm as cm
 
-    logger.debug(f"Encoded {len(encoded_frames)} depth frames to RGB: {encoded_frames.shape}")
-
-    # Prepare video path
+    DEPTH_SCALE = 1000.0  # meters to millimeters
     video_path = Path(video_path)
     os.makedirs(video_path.parent, exist_ok=True)
-    if video_path.suffix != ".mp4":
-        video_path = video_path.with_suffix(".mp4")
 
-    # Configure codec - ALL depth compression settings in one place
+    # --- 1. Save uint16 depth as zipped PNGs (lossless, ~2-5x compression) ---
+    zip_path = video_path.with_suffix(".depth.zip")
+    with zipfile.ZipFile(str(zip_path), 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for i, frame in enumerate(depth_frames):
+            depth_mm = np.clip(frame * DEPTH_SCALE, 0, 65535).astype(np.uint16)
+            img = Image.fromarray(depth_mm)
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            zf.writestr(f"{i:06d}.png", buf.getvalue())
+    logger.debug(f"Saved {len(depth_frames)} uint16 depth frames to {zip_path}")
+
+    # --- 2. Save turbo colormap MP4 for visual inspection ---
+    mp4_path = video_path.with_suffix(".mp4") if video_path.suffix != ".mp4" else video_path
+    depth_vis_max = 3.0
+    encoded_frames = []
+    for frame in depth_frames:
+        norm = np.clip(frame / depth_vis_max, 0, 1)
+        norm = 1.0 - norm  # invert: close=bright
+        colored = (cm.turbo(norm)[:, :, :3] * 255).astype(np.uint8)
+        colored[frame <= 0] = 0
+        encoded_frames.append(colored)
+    encoded_frames = np.array(encoded_frames)
+
     codec_kwargs = {
         "codec": DEPTH_VIDEO_CODEC,
         "pixelformat": DEPTH_VIDEO_PIXELFORMAT,
         "output_params": ["-crf", DEPTH_VIDEO_CRF],
     }
-
-    # Save video
     try:
-        writer = imageio.get_writer(str(video_path), format="ffmpeg", fps=fps, **codec_kwargs)
+        writer = imageio.get_writer(str(mp4_path), format="ffmpeg", fps=fps, **codec_kwargs)
         for frame in encoded_frames:
             writer.append_data(frame)
         writer.close()
-        logger.debug(f"Saved depth video to {video_path}")
+        logger.debug(f"Saved depth colormap video to {mp4_path}")
     except (ImportError, OSError, ValueError, RuntimeError) as e:
         logger.warning(f"FFmpeg writer failed ({type(e).__name__}: {e}), falling back to mimwrite")
-        imageio.mimwrite(str(video_path), encoded_frames, format="mp4", fps=fps, **codec_kwargs)
+        imageio.mimwrite(str(mp4_path), encoded_frames, format="mp4", fps=fps, **codec_kwargs)
 
 
 def load_depth_video(

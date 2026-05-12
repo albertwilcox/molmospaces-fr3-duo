@@ -34,6 +34,11 @@ log.setLevel(logging.DEBUG)
 
 HAS_FILAMENT: bool = getattr(mujoco, "mjRENDERER", "classic") == "filament"
 
+# Filament's handle allocator arena overflows on large scenes (4000+ geoms).
+# Force classic renderer for occupancy map generation which doesn't need
+# Filament quality. The main renderer still uses Filament for episode rendering.
+_THORMAP_USE_FILAMENT = False
+
 
 class BaseMujocoEnv(ABC):
     object_managers: list["ObjectManager"]
@@ -730,7 +735,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
                     agent_radius=agent_radius,
                     px_per_m=px_per_m,
                     device_id=None,
-                    use_filament=HAS_FILAMENT,
+                    use_filament=_THORMAP_USE_FILAMENT,
                 )
         elif "procthor" in self.current_model_path or "holodeck" in self.current_model_path:
             model_path = Path(self.current_model_path.replace("_ceiling", ""))
@@ -746,7 +751,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
                     px_per_m=px_per_m,
                     agent_radius=agent_radius,
                     device_id=None,
-                    use_filament=HAS_FILAMENT,
+                    use_filament=_THORMAP_USE_FILAMENT,
                 )
         else:
             raise ValueError(f"Unknown scene type: {self.current_model_path}")

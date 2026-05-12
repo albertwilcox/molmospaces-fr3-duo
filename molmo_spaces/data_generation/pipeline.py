@@ -33,6 +33,19 @@ from molmo_spaces.utils.mp_logging import (
 from molmo_spaces.utils.profiler_utils import DatagenProfiler, Profiler
 from molmo_spaces.utils.save_utils import prepare_episode_for_saving, save_trajectories
 
+# Eiger save hook: if EIGER_SAVE_MODULE is set, import save_trajectories_eiger from it
+# and use it instead of save_trajectories. This replaces the JSON-in-uint8 format
+# with clean numeric arrays. Works across forkserver workers because it's resolved
+# at import time from the environment variable.
+_eiger_save_fn = None
+_eiger_save_module_path = os.environ.get("EIGER_SAVE_MODULE")
+if _eiger_save_module_path:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("eiger_save", _eiger_save_module_path)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _eiger_save_fn = _mod.save_trajectories_eiger
+
 # Set multiprocessing context based on CUDA availability
 # forkserver is safer for CUDA, spawn for fallback
 mp_context = mp.get_context("forkserver") if torch.cuda.is_available() else mp.get_context("spawn")
@@ -241,14 +254,22 @@ def save_house_trajectories(
         t_save_start = time.perf_counter()
         if datagen_profiler is not None:
             datagen_profiler.start("save_trajectories")
-        save_trajectories(
-            house_trajectory_data,
-            save_dir=house_output_dir,
-            fps=exp_config.fps,
-            save_file_suffix=batch_suffix,
-            save_mp4s=True,
-            logger=worker_logger,
-        )
+        if _eiger_save_fn is not None:
+            _eiger_save_fn(
+                house_trajectory_data,
+                save_dir=house_output_dir,
+                fps=exp_config.fps,
+                save_file_suffix=batch_suffix,
+            )
+        else:
+            save_trajectories(
+                house_trajectory_data,
+                save_dir=house_output_dir,
+                fps=exp_config.fps,
+                save_file_suffix=batch_suffix,
+                save_mp4s=True,
+                logger=worker_logger,
+            )
         if datagen_profiler is not None:
             datagen_profiler.end("save_trajectories")
         t_save = time.perf_counter() - t_save_start

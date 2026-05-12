@@ -1,3 +1,6 @@
+assets/robots/bimanual_franka/fr3_duo_assets/**/*.obj filter=lfs diff=lfs merge=lfs -text
+assets/robots/bimanual_franka/fr3_duo_assets/**/*.png filter=lfs diff=lfs merge=lfs -text
+assets/robots/bimanual_franka/fr3_duo_assets/**/*.stl filter=lfs diff=lfs merge=lfs -text
 *.obj !text !filter !merge !diff
 *.png !text !filter !merge !diff
 *.stl !text !filter !merge !diff

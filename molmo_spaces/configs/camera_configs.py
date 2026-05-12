@@ -173,6 +173,40 @@ class EvalExocentricCameraConfig(FixedExocentricCameraConfig):
     camera_quaternion: list[float] = [-0.3633, -0.1241, 0.4263, 0.8191]
 
 
+
+class SphericalRobotMountedCameraConfig(CameraConfig):
+    """Robot-mounted camera positioned via spherical coordinates.
+
+    Samples (r, theta, phi) at setup time, converts to Cartesian offset
+    relative to a reference body, and uses lookat to always aim at the workspace.
+    Camera orbits around a vertical axis through lookat_offset.
+
+    phi=0: behind robot (-X), phi=90: left (+Y), phi=180: front (+X)
+    theta: elevation above horizontal (0=level, 90=directly above)
+    """
+
+    reference_body_names: list[str]  # Body names to try (uses first that exists)
+
+    # Spherical coordinate ranges (sampled uniformly at setup time)
+    r_range: tuple[float, float]  # (min, max) orbital radius from lookat point (meters)
+    theta_range: tuple[float, float]  # (min, max) elevation above horizontal (radians)
+    phi_range: tuple[float, float]  # (min, max) azimuth (radians). 0=behind, pi=front
+
+    # Where to look: offset relative to reference body (orbit center)
+    lookat_offset: list[float] = [0.3, 0.0, 0.4]
+    up_axis: str = "z"
+
+    # FOV range (degrees) — sampled uniformly per episode. If None, uses base fov.
+    fov_range: tuple[float, float] | None = None
+
+    # Visibility constraints for robot placement validation
+    visibility_constraints: dict[str, float] | None = None
+
+    # Optional per-episode jitter
+    orientation_noise_degrees: float | None = 5.0
+    lookat_noise_range: tuple[float, float] | None = (-0.05, 0.05)
+
+
 AllCameraTypes: TypeAlias = (
     MjcfCameraConfig
     | RobotMountedCameraConfig
@@ -180,6 +214,7 @@ AllCameraTypes: TypeAlias = (
     | RandomizedExocentricCameraConfig
     | EvalRobotMountedCameraConfig
     | EvalExocentricCameraConfig
+    | SphericalRobotMountedCameraConfig
 )
 
 
