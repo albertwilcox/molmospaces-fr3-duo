@@ -14,7 +14,6 @@ from mujoco.viewer import launch_passive
 from molmo_spaces.configs import BaseRobotConfig
 from molmo_spaces.configs.robot_configs import FrankaRobotConfig, I2rtYamRobotConfig, RBY1MConfig
 from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
-from molmo_spaces.molmo_spaces_constants import get_robot_path
 from molmo_spaces.robots.robot_views.abstract import RobotView
 
 N_ROBOTS = 4
@@ -55,16 +54,13 @@ def main():
     robot_configs["rby1m"].init_qpos["base"] = [0.0, 2.0, 0.0]
 
     for robot_config in robot_configs.values():
-        xml_path = get_robot_path(robot_config.name) / robot_config.robot_xml_path
         for i in range(N_ROBOTS):
-            robot_spec = MjSpec.from_file(str(xml_path))
             robot_config.robot_cls.add_robot_to_scene(
                 robot_config,
                 spec,
-                robot_spec,
-                f"{robot_config.name}_{i}/",
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
+                prefix=f"{robot_config.name}_{i}/",
+                pos=[0.0, 0.0, 0.0],
+                quat=[1.0, 0.0, 0.0, 0.0],
             )
 
     model: MjModel = spec.compile()

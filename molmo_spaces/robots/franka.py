@@ -14,7 +14,6 @@ from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
 from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
 from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
-from molmo_spaces.molmo_spaces_constants import get_robot_path
 from molmo_spaces.robots.abstract import Robot
 
 if TYPE_CHECKING:
@@ -155,7 +154,7 @@ class FrankaRobot(Robot):
         prefix: str,
         randomize_base_texture: bool,
     ) -> None:
-        texture_dir = get_robot_path(robot_config.name) / "assets" / "base_textures"
+        texture_dir = robot_config.get_robot_dir() / "assets" / "base_textures"
         assert texture_dir.is_dir(), f"Texture directory {texture_dir} does not exist"
         texture_path: Path | None = None
         if randomize_base_texture:
@@ -238,11 +237,11 @@ class FrankaRobot(Robot):
         cls,
         robot_config: "FrankaRobotConfig",
         spec: MjSpec,
-        robot_spec: MjSpec,
         prefix: str,
         pos: list[float],
         quat: list[float],
         randomize_textures: bool = False,
+        strip_meshes: bool = False,
     ) -> None:
         robot_config = cast("FrankaRobotConfig", robot_config)
         add_base = robot_config.base_size is not None
@@ -273,10 +272,11 @@ class FrankaRobot(Robot):
         else:
             attach_frame = robot_body.add_frame()
 
+        robot_spec = cls._load_robot_spec(robot_config, strip_meshes=strip_meshes)
+
         if randomize_textures:
             cls.randomize_robot_textures(robot_config, spec, prefix, robot_spec)
 
-        # Attach the robot to the base via the frame
         robot_root_name = cls.robot_model_root_name()
         robot_root = robot_spec.body(robot_root_name)
         if robot_root is None:

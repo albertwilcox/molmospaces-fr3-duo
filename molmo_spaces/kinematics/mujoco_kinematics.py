@@ -9,7 +9,6 @@ from typing import Literal, TYPE_CHECKING
 import mujoco
 import numpy as np
 
-from molmo_spaces.molmo_spaces_constants import get_robot_path
 from molmo_spaces.utils.linalg_utils import (
     inverse_homogeneous_matrix,
     relative_to_global_transform,
@@ -39,22 +38,13 @@ class MlSpacesKinematics:
             robot_config: The robot configuration.
         """
         spec = mujoco.MjSpec()
-        robot_xml_path = get_robot_path(robot_config.name) / robot_config.robot_xml_path
-        robot_spec = mujoco.MjSpec.from_file(str(robot_xml_path))
-        for body in robot_spec.bodies:
-            body: mujoco.MjsBody
-            for geom in body.geoms:
-                geom: mujoco.MjsGeom
-                if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
-                    robot_spec.delete(geom)
-
         robot_config.robot_cls.add_robot_to_scene(
             robot_config,
             spec,
-            robot_spec,
-            "",
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
+            prefix="",
+            pos=[0.0, 0.0, 0.0],
+            quat=[1.0, 0.0, 0.0, 0.0],
+            strip_meshes=True,
         )
 
         self._mj_model = spec.compile()

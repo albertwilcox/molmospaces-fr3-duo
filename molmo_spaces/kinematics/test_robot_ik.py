@@ -13,7 +13,6 @@ from mujoco.viewer import launch_passive
 
 from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
 from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
-from molmo_spaces.molmo_spaces_constants import get_robot_path
 from molmo_spaces.configs.robot_configs import BaseRobotConfig
 
 
@@ -53,15 +52,12 @@ def main() -> None:
         kinematics = MlSpacesKinematics(robot_config)
 
     spec = mujoco.MjSpec()
-    robot_xml_path = get_robot_path(robot_config.name) / robot_config.robot_xml_path
-    robot_spec = mujoco.MjSpec.from_file(str(robot_xml_path))
     robot_config.robot_cls.add_robot_to_scene(
         robot_config,
         spec,
-        robot_spec,
-        "",
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0, 0.0],
+        prefix="",
+        pos=[0.0, 0.0, 0.0],
+        quat=[1.0, 0.0, 0.0, 0.0],
     )
     model = spec.compile()
     data = mujoco.MjData(model)

@@ -1,26 +1,26 @@
-"""i2rt YAM robot implementation for the framework."""
+import logging
+from typing import TYPE_CHECKING, Any, cast
 
-from typing import TYPE_CHECKING, cast
-
+import mujoco
+import numpy as np
 from mujoco import MjData, MjSpec, mjtGeom
 
+from molmo_spaces.controllers.abstract import Controller
 from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
 from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
 from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
-from molmo_spaces.kinematics.parallel.dummy_parallel_kinematics import (
-    DummyParallelKinematics,
-)
 from molmo_spaces.robots.abstract import Robot
 
 if TYPE_CHECKING:
     from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
-    from molmo_spaces.configs.robot_configs import I2rtYamRobotConfig
+    from xarm7_config import XArm7RobotConfig
 
 
-class I2rtYamRobot(Robot):
-    """i2rt YAM 6-DOF arm robot implementation."""
+log = logging.getLogger(__name__)
 
+
+class XArm7Robot(Robot):
     def __init__(
         self,
         mj_data: MjData,
@@ -31,13 +31,12 @@ class I2rtYamRobot(Robot):
             mj_data, config.robot_config.robot_namespace
         )
         self._kinematics = MlSpacesKinematics(config.robot_config)
-
         self._parallel_kinematics = SimpleWarpKinematics(config.robot_config)
 
         arm_controller_cls = (
             JointPosController
             if config.robot_config.command_mode == {}
-            or config.robot_config.command_mode.get("arm") == "joint_position"
+            or config.robot_config.command_mode["arm"] == "joint_position"
             else JointRelPosController
         )
         self._controllers = {
@@ -62,21 +61,22 @@ class I2rtYamRobot(Robot):
         return self._parallel_kinematics
 
     @property
-    def controllers(self):
+    def controllers(self) -> dict[str, Controller]:
         return self._controllers
 
     @property
     def state_dim(self) -> int:
-        return 6  # YAM arm has 6 DOF
+        return 7
 
     def action_dim(self, move_group_ids: list[str]):
         return sum(self._robot_view.get_move_group(mg_id).n_actuators for mg_id in move_group_ids)
 
     def get_arm_move_group_ids(self) -> list[str]:
-        """YAM has a single arm move group."""
         return ["arm"]
 
-    def update_control(self, action_command_dict) -> None:
+    def update_control(self, action_command_dict: dict[str, Any]) -> None:
+        action_command_dict = self._apply_action_noise_and_save_unnoised_cmd_jp(action_command_dict)
+
         for mg_id, controller in self.controllers.items():
             if mg_id in action_command_dict and action_command_dict[mg_id] is not None:
                 controller.set_target(action_command_dict[mg_id])
@@ -102,12 +102,12 @@ class I2rtYamRobot(Robot):
 
     @staticmethod
     def robot_model_root_name() -> str:
-        return "arm"
+        return "link_base"
 
     @classmethod
     def add_robot_to_scene(
         cls,
-        robot_config: "I2rtYamRobotConfig",
+        robot_config: "XArm7RobotConfig",
         spec: MjSpec,
         prefix: str,
         pos: list[float],
@@ -115,31 +115,24 @@ class I2rtYamRobot(Robot):
         randomize_textures: bool = False,
         strip_meshes: bool = False,
     ) -> None:
-        robot_config = cast("I2rtYamRobotConfig", robot_config)
+        robot_config = cast("XArm7RobotConfig", robot_config)
         add_base = robot_config.base_size is not None
         pos = pos + [0.0] if len(pos) == 2 else pos
 
-        # Create a mocap body to control the robot base pose
         robot_body = spec.worldbody.add_body(
             name=f"{prefix}base",
             pos=pos,
             quat=quat,
             mocap=True,
         )
-
         if add_base:
             base_height = robot_config.base_size[2]
 
-            # Create a base material (plain dark wood color)
-            material_name = f"{prefix}robot_base_material"
-            spec.add_material(name=material_name, rgba=[0.3, 0.2, 0.1, 1.0])
-
-            # Add base geometry (platform)
             robot_body.add_geom(
                 type=mjtGeom.mjGEOM_BOX,
                 size=[x / 2 for x in robot_config.base_size],
                 pos=[0, 0, base_height / 2],
-                material=material_name,
+                rgba=[0.4, 0.4, 0.4, 1.0],
                 group=0,  # Visual group
             )
             attach_frame = robot_body.add_frame(pos=[0, 0, base_height])
@@ -152,3 +145,28 @@ class I2rtYamRobot(Robot):
         if robot_root is None:
             raise ValueError(f"Robot {robot_root_name=} not found in {robot_spec}")
         attach_frame.attach_body(robot_root, prefix, "")
+
+
+if __name__ == "__main__":
+    import mujoco
+    from mujoco.viewer import launch
+
+    from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
+
+    from xarm7_config import XArm7RobotConfig
+
+    robot_config = XArm7RobotConfig()
+    spec = MjSpec()
+
+    XArm7Robot.add_robot_to_scene(
+        robot_config,
+        spec,
+        prefix="robot_0/",
+        pos=[0.0, 0.0, 0.0],
+        quat=[1.0, 0.0, 0.0, 0.0],
+    )
+    model = spec.compile()
+    data = MjData(model)
+    mujoco.mj_forward(model, data)
+
+    launch(model, data)
