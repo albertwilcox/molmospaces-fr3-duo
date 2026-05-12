@@ -116,6 +116,7 @@ class MoveSequence(ActionPrimitive):
         move_segments: list[MoveSegment],
         is_holding_object: bool = False,
         gripper_empty_threshold: float = 0.0,
+        gripper_mg_id: str | None = None,
     ) -> None:
         super().__init__(robot_view, sum(seg.duration for seg in move_segments))
         self._move_segments = move_segments
@@ -124,6 +125,7 @@ class MoveSequence(ActionPrimitive):
         self.settle_time = settle_time
         self.is_holding_object = is_holding_object
         self.gripper_empty_threshold = gripper_empty_threshold
+        self._gripper_mg_id = gripper_mg_id
 
     def execute(self) -> bool:
         if self.start_time is None:
@@ -178,7 +180,7 @@ class MoveSequence(ActionPrimitive):
             return True
 
         if self.is_holding_object:
-            gripper_mg_id = self.robot_view.get_gripper_movegroup_ids()[0]
+            gripper_mg_id = self._gripper_mg_id or self.robot_view.get_gripper_movegroup_ids()[0]
             gripper = self.robot_view.get_gripper(gripper_mg_id)
             if (
                 gripper.inter_finger_dist
@@ -210,6 +212,7 @@ class TCPMoveSequence(MoveSequence):
         gripper_empty_threshold: float = 0.0,
         tcp_pos_err_threshold: float = np.inf,
         tcp_rot_err_threshold: float = np.inf,
+        gripper_mg_id: str | None = None,
     ) -> None:
         super().__init__(
             robot_view,
@@ -217,6 +220,7 @@ class TCPMoveSequence(MoveSequence):
             move_segments,
             is_holding_object,
             gripper_empty_threshold,
+            gripper_mg_id=gripper_mg_id,
         )
         self.tcp_to_jp_fn = tcp_to_jp_fn
         self.tcp_pos_err_threshold = tcp_pos_err_threshold
@@ -246,7 +250,7 @@ class TCPMoveSequence(MoveSequence):
         curr_target_pose = self.get_current_target_pose()
 
         # Solve IK for current target pose
-        mg_id = self.robot_view.get_gripper_movegroup_ids()[0]
+        mg_id = self._gripper_mg_id or self.robot_view.get_gripper_movegroup_ids()[0]
         return self.tcp_to_jp_fn(mg_id, curr_target_pose)
 
     def check_failure(self) -> bool:
@@ -257,7 +261,7 @@ class TCPMoveSequence(MoveSequence):
             return False
 
         curr_target_pose = self.get_current_target_pose()
-        gripper_mg_id = self.robot_view.get_gripper_movegroup_ids()[0]
+        gripper_mg_id = self._gripper_mg_id or self.robot_view.get_gripper_movegroup_ids()[0]
         gripper = self.robot_view.get_gripper(gripper_mg_id)
 
         trf = np.linalg.inv(gripper.leaf_frame_to_world) @ curr_target_pose
@@ -332,9 +336,13 @@ class GripperAction(ActionPrimitive):
     Action primitive that opens or closes the gripper.
     """
 
-    def __init__(self, robot_view: RobotView, target_open: bool, duration: float) -> None:
+    def __init__(
+        self, robot_view: RobotView, target_open: bool, duration: float,
+        gripper_mg_id: str | None = None,
+    ) -> None:
         super().__init__(robot_view, duration)
         self.target_open = target_open
+        self._gripper_mg_id = gripper_mg_id
 
     def execute(self) -> bool:
         if self.start_time is None:
@@ -344,7 +352,7 @@ class GripperAction(ActionPrimitive):
             else:
                 log.info("Closing gripper...")
 
-            mg_id = self.robot_view.get_gripper_movegroup_ids()[0]
+            mg_id = self._gripper_mg_id or self.robot_view.get_gripper_movegroup_ids()[0]
             gripper = self.robot_view.get_gripper(mg_id)
             gripper.set_gripper_ctrl_open(self.target_open)
 
@@ -400,6 +408,29 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
         self.ik_warmed_up = False
         self.sequential_ik_failures = 0
 
+        # Active gripper for this episode — set in _compute_trajectory() by subclasses.
+        # Defaults to the first gripper (single-arm robots or left arm of bimanual).
+        self.active_gripper_mg_id: str = self.robot_view.get_gripper_movegroup_ids()[0]
+
+    def select_arm_for_object(self, object_position: np.ndarray) -> str:
+        """Choose the gripper closest to *object_position* (world frame).
+
+        For single-arm robots this always returns the only gripper.
+        For bimanual robots it picks the arm whose gripper TCP is nearest.
+        """
+        gripper_ids = self.robot_view.get_gripper_movegroup_ids()
+        if len(gripper_ids) == 1:
+            return gripper_ids[0]
+
+        best_id, best_dist = gripper_ids[0], np.inf
+        for gid in gripper_ids:
+            ee_pos = self.robot_view.get_move_group(gid).leaf_frame_to_world[:3, 3]
+            dist = np.linalg.norm(ee_pos - object_position)
+            if dist < best_dist:
+                best_id, best_dist = gid, dist
+        log.info(f"Selected arm {best_id} (dist={best_dist:.3f}m) for object at {object_position[:3]}")
+        return best_id
+
     @property
     def planners(self):
         return {}
@@ -442,7 +473,7 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
                 for move_segment in action_primitive.move_segments:
                     self.target_poses[move_segment.name] = move_segment.end_pose
             elif isinstance(action_primitive, JointMoveSequence):
-                gripper_mg_id = self.robot_view.get_gripper_movegroup_ids()[0]
+                gripper_mg_id = self.active_gripper_mg_id
                 kinematics = self.task.env.current_robot.kinematics
                 for move_segment in action_primitive.move_segments:
                     end_qpos = move_segment.end_qpos
@@ -561,7 +592,7 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
             assert pose.shape == (4, 4)
             robot_view = self.task.env.current_robot.robot_view
             kinematics = self.task.env.current_robot.kinematics
-            gripper_mg_id = robot_view.get_gripper_movegroup_ids()[0]
+            gripper_mg_id = self.active_gripper_mg_id
             jp_dict = kinematics.ik(
                 gripper_mg_id,
                 pose,

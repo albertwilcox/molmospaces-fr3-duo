@@ -31,10 +31,12 @@ class BimanualFrankaRobot(Robot):
         )
         self._kinematics = BimanualFrankaKinematics(config.robot_config)
 
-        # Default to left arm for parallel kinematics (used by planner)
+        # Default to left arm for parallel kinematics (used by grasp feasibility checker)
         self._parallel_kinematics = DummyParallelKinematics(
             config.robot_config,
             self._kinematics,
+            mg_id="left_gripper",
+            unlocked_mg_ids=["left_arm"],
         )
 
         # Determine controller classes based on command mode

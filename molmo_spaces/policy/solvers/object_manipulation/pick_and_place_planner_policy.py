@@ -25,11 +25,11 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
         robot_view = self.task.env.current_robot.robot_view
         target_poses = self._compute_target_poses()
 
-        gripper_mg_id = robot_view.get_gripper_movegroup_ids()[0]
+        gripper_mg_id = self.active_gripper_mg_id
         start_ee_pose = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_world
 
         return [
-            GripperAction(robot_view, True, 0.0),
+            GripperAction(robot_view, True, 0.0, gripper_mg_id=gripper_mg_id),
             TCPMoveSequence(
                 robot_view,
                 self._tcp_to_jp_fn,
@@ -37,6 +37,7 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                 gripper_empty_threshold=self.policy_config.gripper_empty_threshold,
                 tcp_pos_err_threshold=self.policy_config.tcp_pos_err_threshold,
                 tcp_rot_err_threshold=self.policy_config.tcp_rot_err_threshold,
+                gripper_mg_id=gripper_mg_id,
                 move_segments=[
                     TCPMoveSegment(
                         name="pregrasp",
@@ -52,7 +53,7 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                     ),
                 ],
             ),
-            GripperAction(robot_view, False, self.policy_config.gripper_close_duration),
+            GripperAction(robot_view, False, self.policy_config.gripper_close_duration, gripper_mg_id=gripper_mg_id),
             TCPMoveSequence(
                 robot_view,
                 self._tcp_to_jp_fn,
@@ -61,6 +62,7 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                 gripper_empty_threshold=self.policy_config.gripper_empty_threshold,
                 tcp_pos_err_threshold=self.policy_config.tcp_pos_err_threshold,
                 tcp_rot_err_threshold=self.policy_config.tcp_rot_err_threshold,
+                gripper_mg_id=gripper_mg_id,
                 move_segments=[
                     TCPMoveSegment(
                         name="lift",
@@ -82,7 +84,7 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                     ),
                 ],
             ),
-            GripperAction(robot_view, True, self.policy_config.gripper_open_duration),
+            GripperAction(robot_view, True, self.policy_config.gripper_open_duration, gripper_mg_id=gripper_mg_id),
             TCPMoveSequence(
                 robot_view,
                 self._tcp_to_jp_fn,
@@ -90,6 +92,7 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                 gripper_empty_threshold=self.policy_config.gripper_empty_threshold,
                 tcp_pos_err_threshold=self.policy_config.tcp_pos_err_threshold,
                 tcp_rot_err_threshold=self.policy_config.tcp_rot_err_threshold,
+                gripper_mg_id=gripper_mg_id,
                 move_segments=[
                     TCPMoveSegment(
                         name="retreat",
@@ -228,6 +231,9 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
         om = self.task.env.object_managers[self.task.env.current_batch_index]
         pickup_obj: MlSpacesObject = om.get_object_by_name(task_config.pickup_obj_name)
         place_receptacle: MlSpacesObject = om.get_object_by_name(task_config.place_receptacle_name)
+
+        # Select which arm to use based on object proximity
+        self.active_gripper_mg_id = self.select_arm_for_object(pickup_obj.position)
 
         grasp_pose_world = compute_grasp_pose(
             self,
