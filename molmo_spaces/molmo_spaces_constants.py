@@ -12,6 +12,7 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
+from copy import deepcopy
 
 import compress_json
 from molmospaces_resources import (
@@ -133,9 +134,29 @@ DATA_TYPE_TO_SOURCE_TO_VERSION = dict(
 _RESOURCE_MANAGER = None
 
 
-def get_resource_manager(force_post_setup: bool = False):
+def _select_storage():
+    return (
+        HFRemoteStorage("allenai/molmospaces", repo_prefix="mujoco", token=os.getenv("HF_TOKEN"))
+        if USE_HUGGING_FACE
+        else R2RemoteStorage("mujoco-thor-resources")
+    )
+
+
+def get_resource_manager(
+    force_post_setup: bool = False, data_type_to_source_to_version: dict | None = None
+):
+    # Note: This would still be effective even wíthin a specific branch in the if-else below.
+    # The scope of variables is defined before execution starts.
     global _RESOURCE_MANAGER
-    if _RESOURCE_MANAGER is None:
+
+    if data_type_to_source_to_version is None:
+        # save resource manager
+        use_global = True
+        data_type_to_source_to_version = DATA_TYPE_TO_SOURCE_TO_VERSION
+    else:
+        use_global = False
+
+    if _RESOURCE_MANAGER is None or not use_global:
 
         def post_setup(manager: ResourceManager):
             if not os.environ.get("_IN_MULTIPROCESSING_CHILD") and str2bool(
@@ -147,7 +168,7 @@ def get_resource_manager(force_post_setup: bool = False):
                 manager.install_all_for_data_type("grasps")
             else:
                 to_install = {}
-                for scene_source in DATA_TYPE_TO_SOURCE_TO_VERSION["scenes"]:
+                for scene_source in data_type_to_source_to_version["scenes"]:
                     source_packages = manager.find_all_packages_for_source("scenes", scene_source)
                     if len(source_packages) < 10:
                         # Fully install small scene datasets
@@ -164,19 +185,21 @@ def get_resource_manager(force_post_setup: bool = False):
 
         # resource_manager_log_level()
 
-        _RESOURCE_MANAGER = setup_resource_manager(
-            HFRemoteStorage(
-                "allenai/molmospaces", repo_prefix="mujoco", token=os.getenv("HF_TOKEN")
-            )
-            if USE_HUGGING_FACE
-            else R2RemoteStorage("mujoco-thor-resources"),
+        manager = setup_resource_manager(
+            _select_storage(),
             symlink_dir=ASSETS_DIR,
-            versions=DATA_TYPE_TO_SOURCE_TO_VERSION,
+            versions=data_type_to_source_to_version,
             cache_dir=DATA_CACHE_DIR,
             env_prefix="MLSPACES",
             post_setup=post_setup,
             force_post_setup=force_post_setup,
         )
+
+        if use_global:
+            _RESOURCE_MANAGER = manager
+        else:
+            return manager
+
     return _RESOURCE_MANAGER
 
 
@@ -564,10 +587,55 @@ def get_robot_paths() -> dict[str, Path]:
     return robot_paths
 
 
+def install_missing_source(data_type: str, missing_source: str, existing_sources: list[str]):
+    from molmospaces_resources.manager import _lock_context, LOCAL_MANIFEST_NAME
+    from molmospaces_resources.setup_utils import (
+        _get_current_install,
+        _RESOURCE_MANAGERS,
+        _manager_key,
+    )
+
+    assert missing_source in DATA_TYPE_TO_SOURCE_TO_VERSION[data_type], (
+        f"{missing_source} has no version under {data_type}"
+    )
+
+    data_type_to_source_to_version = deepcopy(DATA_TYPE_TO_SOURCE_TO_VERSION)
+    existing_sources = [
+        source for source in existing_sources if source in data_type_to_source_to_version[data_type]
+    ] + [missing_source]
+    data_type_to_source_to_version[data_type] = {
+        source: DATA_TYPE_TO_SOURCE_TO_VERSION[data_type][source] for source in existing_sources
+    }
+
+    current_install = _get_current_install(ASSETS_DIR, data_type_to_source_to_version)
+    current_install[data_type][missing_source] = None
+    manifest_path = ASSETS_DIR / LOCAL_MANIFEST_NAME
+    key = _manager_key(str(_select_storage()), data_type_to_source_to_version)
+    with _lock_context(ASSETS_DIR, DATA_CACHE_DIR):
+        if key in _RESOURCE_MANAGERS:
+            _RESOURCE_MANAGERS.pop(key)
+        with open(manifest_path, "w") as f:
+            json.dump(current_install, f, indent=2)
+
+    get_resource_manager(data_type_to_source_to_version=data_type_to_source_to_version)
+    assert key in _RESOURCE_MANAGERS, f"BUG: Missing expected {key} from _RESOURCE_MANAGERS"
+
+
 def get_robot_path(robot_name) -> Path:
     """
     Return the path to the prepackaged MlSpaces robot file for the given robot name.
     """
+    robot_dirs = os.listdir(ROBOTS_DIR)
+    if robot_name not in robot_dirs or not (ROBOTS_DIR / robot_name).is_dir():
+        logging.info(
+            f"Robot {robot_name} not found in {ROBOTS_DIR}. Attempting direct installation."
+        )
+        robot_dirs = [robot_dir for robot_dir in robot_dirs if (ROBOTS_DIR / robot_dir).is_dir()]
+        install_missing_source("robots", robot_name, robot_dirs)
+        assert robot_name in os.listdir(ROBOTS_DIR) and (ROBOTS_DIR / robot_name).is_dir(), (
+            f"Failed to install missing robot {robot_name}"
+        )
+
     return ROBOTS_DIR / robot_name
 
 
