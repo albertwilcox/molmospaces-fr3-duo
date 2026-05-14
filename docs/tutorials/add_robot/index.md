@@ -88,14 +88,6 @@ class XArm7ArmGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
         return "site"
 
     @property
-    def noop_ctrl(self) -> np.ndarray:
-        return self.joint_pos.copy()
-
-    @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return site_pose(self.mj_data, self._ee_site_id)
-
-    @property
     def root_frame_to_world(self) -> np.ndarray:
         return body_pose(self.mj_data, self._arm_root_id)
 ```
@@ -154,10 +146,6 @@ class XArm7GripperGroup(MJCFFrameMixin, GripperGroup):
             self.mj_model, self.mj_data, self._finger_1_geom_id, self._finger_2_geom_id, 0.1, None
         )
         return max(0.0, dist)
-
-    @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return site_pose(self.mj_data, self._ee_site_id)
 
     @property
     def root_frame_to_world(self) -> np.ndarray:
@@ -288,36 +276,8 @@ class XArm7Robot(Robot):
     def controllers(self) -> dict[str, Controller]:
         return self._controllers
 
-    @property
-    def state_dim(self) -> int:
-        return 7
-
-    def action_dim(self, move_group_ids: list[str]):
-        return sum(self._robot_view.get_move_group(mg_id).n_actuators for mg_id in move_group_ids)
-
     def get_arm_move_group_ids(self) -> list[str]:
         return ["arm"]
-
-    def update_control(self, action_command_dict: dict[str, Any]) -> None:
-        action_command_dict = self._apply_action_noise_and_save_unnoised_cmd_jp(action_command_dict)
-
-        for mg_id, controller in self.controllers.items():
-            if mg_id in action_command_dict and action_command_dict[mg_id] is not None:
-                controller.set_target(action_command_dict[mg_id])
-            elif not controller.stationary:
-                controller.set_to_stationary()
-
-    def compute_control(self) -> None:
-        for controller in self.controllers.values():
-            ctrl_inputs = controller.compute_ctrl_inputs()
-            controller.robot_move_group.ctrl = ctrl_inputs
-
-    def set_joint_pos(self, robot_joint_pos_dict) -> None:
-        for mg_id, joint_pos in robot_joint_pos_dict.items():
-            self._robot_view.get_move_group(mg_id).joint_pos = joint_pos
-
-    def set_world_pose(self, robot_world_pose) -> None:
-        self._robot_view.base.pose = robot_world_pose
 
     def reset(self) -> None:
         for mg_id, default_pos in self.exp_config.robot_config.init_qpos.items():

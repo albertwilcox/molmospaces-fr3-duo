@@ -26,7 +26,7 @@ from molmo_spaces.robots.robot_views.abstract import (
     RobotView,
 )
 from molmo_spaces.utils.linalg_utils import normalize_ang_error
-from molmo_spaces.utils.mj_model_and_data_utils import body_pose, site_pose
+from molmo_spaces.utils.mj_model_and_data_utils import body_pose
 
 
 class RBY1ArmGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
@@ -62,14 +62,6 @@ class RBY1ArmGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
     @property
     def leaf_frame_type(self):
         return "site"
-
-    @property
-    def noop_ctrl(self) -> np.ndarray:
-        return self.joint_pos.copy()
-
-    @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return site_pose(self.mj_data, self._ee_site_id)
 
     @property
     def root_frame_to_world(self) -> np.ndarray:
@@ -172,10 +164,6 @@ class RBY1GripperGroup(MJCFFrameMixin, GripperGroup):
         self.mj_data.qpos[self._joint_posadr] = coupled_pos
 
     @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return site_pose(self.mj_data, self._ee_site_id)
-
-    @property
     def root_frame_to_world(self) -> np.ndarray:
         return self.leaf_frame_to_world
 
@@ -209,14 +197,6 @@ class RBY1TorsoGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
     @property
     def leaf_frame_type(self):
         return "body"
-
-    @property
-    def noop_ctrl(self) -> np.ndarray:
-        return self.joint_pos.copy()
-
-    @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return body_pose(self.mj_data, self._torso_leaf_id)
 
     @property
     def root_frame_to_world(self) -> np.ndarray:
@@ -301,14 +281,6 @@ class RBY1HeadGroup(MJCFFrameMixin, SimplyActuatedMoveGroup):
         return "body"
 
     @property
-    def noop_ctrl(self) -> np.ndarray:
-        return self.joint_pos.copy()
-
-    @property
-    def leaf_frame_to_world(self) -> np.ndarray:
-        return body_pose(self.mj_data, self._head_leaf_id)
-
-    @property
     def root_frame_to_world(self) -> np.ndarray:
         return body_pose(self.mj_data, self._head_root_id)
 
@@ -333,7 +305,6 @@ class RBY1RobotView(RobotView):
             mj_data: The MuJoCo data structure containing the current simulation state
             namespace: Optional prefix for all joint/body names to support multiple robots
         """
-        namespace = namespace + "robot_0/"
         self._namespace = namespace
         base = (
             RBY1BaseGroup(mj_data, namespace=namespace)
