@@ -53,6 +53,7 @@ class MoveGroup(ABC):
         """
         self.mj_model = mj_data.model
         self.mj_data = mj_data
+        self._name: str | None = None
         self._joint_ids = joint_ids
         self._robot_base_group = robot_base_group
         self._root_body_id = root_body_id
@@ -76,6 +77,15 @@ class MoveGroup(ABC):
             )
 
         self._actuator_ids = actuator_ids
+
+    @property
+    def name(self) -> str:
+        """
+        The name of this move group, which matches the move group ID in the containing robot view.
+        Not safe to call before the move group is added to a robot view.
+        """
+        assert self._name is not None, "Move group name is not set"
+        return self._name
 
     @cached_property
     def n_joints(self) -> int:
@@ -531,13 +541,21 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
             joint_ids: List of joint IDs that belong to the virtual holonomic base pose.
                        NOTE: Assumed order is [x, y, theta].
             actuator_ids: List of actuator IDs that control the base
+            root_body_id: The ID of the body that represents the robot base
         """
         super().__init__(mj_data, joint_ids, actuator_ids, root_body_id)
+
+        assert len(joint_ids) == 3, "HoloJointsRobotBaseGroup must have 3 joints (x, y, theta)"
         assert all(
-            self.mj_model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_HINGE
-            or self.mj_model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE
-            for jid in joint_ids
-        ), "All holonomic joints must be position joints (hinge or slide)"
+            self.mj_model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE for jid in joint_ids[:2]
+        ), "x, y joints must be slide joints"
+        assert self.mj_model.jnt_type[joint_ids[2]] == mujoco.mjtJoint.mjJNT_HINGE, (
+            "theta joint must be hinge"
+        )
+        assert len(actuator_ids) == 3, (
+            "HoloJointsRobotBaseGroup must have 3 actuators (x, y, theta)"
+        )
+
         self._world_site_id = world_site_id
         self._holo_base_site_id = holo_base_site_id
 
@@ -572,16 +590,11 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
         Args:
             ctrl: Array of control signals to set
         """
-        # Wrap target theta to [-pi, pi]
-        ctrl[2] = normalize_ang_error(ctrl[2])
+        ctrl = ctrl.copy()
 
-        # The theta actuator can flip the robot base from -pi to pi when crossing zero.
-        # To avoid this, current solution is to just set the joint positions to the
-        # flipped side ctrl position (without physics simulation)
-        theta_qpos_idx = self.mj_model.jnt_qposadr[self._joint_ids[2]]
-        current_theta = self.mj_data.qpos[theta_qpos_idx]
-        if np.abs(current_theta - ctrl[2]) > np.pi:
-            self.mj_data.qpos[theta_qpos_idx] = ctrl[2]
+        # Wrap target yaw to be within +-pi of current yaw
+        curr_yaw = self.joint_pos[2]
+        ctrl[2] = curr_yaw + normalize_ang_error(ctrl[2] - curr_yaw)
 
         self.mj_data.ctrl[self._actuator_ids] = ctrl
 
@@ -687,6 +700,9 @@ class RobotView(ABC):
         self.mj_model = mj_data.model
         self.mj_data = mj_data
         self._move_groups = move_groups
+        for mg_name, mg in move_groups.items():
+            assert mg._name is None, f"Move group {mg_name} already has a name {mg._name}"
+            mg._name = mg_name
 
     @property
     @abstractmethod
