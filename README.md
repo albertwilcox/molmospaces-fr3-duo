@@ -3,7 +3,7 @@
   <img src="docs/images/MolmoSpacesLogo.png" alt="MolmoSpaces Logo" width="800" style="margin-left:'auto' margin-right:'auto' display:'block'"/></br>
   A Large-Scale Open Ecosystem for Robot Manipulation and Navigation
   <div align="center">
-    <a href="https://arxiv.org/pdf/2602.11337" target="_blank" rel="noopener noreferrer"><img alt="Paper" src="./docs/images/button_paper.svg"/></a>&nbsp;&nbsp;<a href="https://huggingface.co/datasets/allenai/molmospaces" target="_blank" rel="noopener noreferrer"><img alt="Data" src="./docs/images/button_data.svg"/></a>&nbsp;&nbsp;<a href="https://molmospaces.allen.ai/" target="_blank" rel="noopener noreferrer"><img alt="Demo" src="./docs/images/button_demo.svg"/></a>&nbsp;&nbsp;<a href="https://molmospaces.allen.ai/leaderboard" target="_blank" rel="noopener noreferrer"><img alt="Leaderboard" src="./docs/images/button_leaderboard.svg"/></a>
+    <a href="https://arxiv.org/pdf/2602.11337" target="_blank" rel="noopener noreferrer"><img alt="Paper" src="./docs/images/button_paper.svg"/></a>&nbsp;&nbsp;<a href="https://huggingface.co/datasets/allenai/molmospaces" target="_blank" rel="noopener noreferrer"><img alt="Data" src="./docs/images/button_data.svg"/></a>&nbsp;&nbsp;<a href="https://allenai.github.io/molmospaces/" target="_blank" rel="noopener noreferrer"><img alt="Docs" src="./docs/images/button_docs.svg"/></a>&nbsp;&nbsp;<a href="https://molmospaces.allen.ai/" target="_blank" rel="noopener noreferrer"><img alt="Demo" src="./docs/images/button_demo.svg"/></a>&nbsp;&nbsp;<a href="https://molmospaces.allen.ai/leaderboard" target="_blank" rel="noopener noreferrer"><img alt="Leaderboard" src="./docs/images/button_leaderboard.svg"/></a>
   </div>
   </br>
   &</br>
@@ -21,7 +21,7 @@
 <div align="center">
   <img src="docs/images/Multi_Simulator_Pan.jpg" alt="Multi-Simulator-Pan" width="1200" style="margin-left:'auto' margin-right:'auto' display:'block'"/>
   <br>
-  <p>Assets from MolmoSpaces are usable in MujoCo, Isaac, and ManiSkill.
+  <p>Assets from MolmoSpaces are usable in MuJoCo, Isaac, and ManiSkill.
   <br>
 </div>
 
@@ -72,16 +72,16 @@ One of the following options must be provided:
 - `mujoco-filament` to use the improved Filament renderer for MuJoCo
 
 The optional installation options are:
-- `dev` installs dependencies for code development
-- `grasp` installs dependencies for the grasp generation pipeline
-- `housegen` installs dependencies for house generation pipeline from iTHOR, ProcTHOR, or Holodeck JSONs
-- `curobo` installs CuRobo for GPU-accelerated planning
+- `dev` installs dependencies for code development.
+- `grasp` installs dependencies for the grasp generation pipeline.
+- `housegen` installs dependencies for the house generation pipeline from iTHOR, ProcTHOR, or Holodeck JSONs.
+- `curobo` installs CuRobo for GPU-accelerated planning.
 
 You may wish to specify some [environment variables](#environment-variables) to configure behavior.
 Currently `molmospaces` supports Linux and Mac.
 
 We provide simulation assets for Mujoco, Isaac, and ManiSkill.
-Data genration and Benchmarking are only supported for Mujoco.
+Data generation and benchmarking are only supported for Mujoco.
 
 
 ### Installing the Filament renderer (optional)
@@ -99,15 +99,15 @@ pip install -i https://test.pypi.org/simple/ mujoco-filament
 pip install -e .[mujoco-filament]
 ```
 
-### Installing Curobo (optional, used only for RB-Y1 tasks)
+### Installing cuRobo (optional, used only for RB-Y1 tasks)
 
-For curobo support, inside of your conda environment, install with:
+For cuRobo support, inside your conda environment, install with:
 
 ```bash
 # Install CUDA toolkit and build tools (conda-forge for toolkit, nvidia channel for headers)
 conda install -c conda-forge cuda-toolkit=12.8 ninja evdev cuda-nvcc cuda-cudart-dev -n mlspaces
 
-# Install torch with CUDA 12.8 support BEFORE installing curobo (Ignore warnings after this step)
+# Install torch with CUDA 12.8 support BEFORE installing cuRobo (Ignore warnings after this step)
 pip install "torch~=2.7.0" "torchvision>=0.22.0,<0.23.0" --index-url https://download.pytorch.org/whl/cu128
 
 # Then compile and install the project against the installed torch
@@ -129,12 +129,12 @@ Environment variables beginning with the `MLSPACES` prefix can be used to custom
 | `MLSPACES_ASSETS_DIR` | Where to place downloaded assets | `~/.cache/molmospaces/assets/<install-hash>` |
 | `MLSPACES_FORCE_INSTALL` | Override existing assets | `True` |
 | `MLSPACES_PINNED_ASSETS_FILE` | A `.json` file containing pinned versions for each asset, used to override the versions specified in [molmo_spaces_constants.py](molmo_spaces/molmo_spaces_constants.py). |  |
-| `MUJOCO_EGL_DEVICE_ID` | The rendering device, indices do not always match `CUDA_VISIBLE_DEVICES`. See [here](https://github.com/allenai/molmospaces/issues/66) for details. | `0`| 
+| `MUJOCO_EGL_DEVICE_ID` | The rendering device; indices do not always match `CUDA_VISIBLE_DEVICES`. See [here](https://github.com/allenai/molmospaces/issues/66) for details. | `0`| 
 
 
 ### Quick Test
 
-Run a quick sample of data generation. For machines with a display use the `--viewer` option to launching the passive debug viewer (push "w" for wire-frame view to see the robot more easily, more details [here](#mujoco-viewer-tips)). Assets should be downloaded automatically for all runs.
+Run a quick sample of data generation. For machines with a display, use the `--viewer` option to launch the passive debug viewer (push "w" for wire-frame view to see the robot more easily; more details [here](#mujoco-viewer-tips)). Assets should be downloaded automatically for all runs.
 
 ```bash
 # Linux
@@ -143,7 +143,7 @@ python scripts/datagen/run_pipeline.py --viewer --seed 3
 mjpython scripts/datagen/run_pipeline.py --viewer --seed 3
 ```
 
-The MolmoSpaces codebase has three entry points for data generation, evaluation, and debugging. The two initial entry points make use of experiment configs to configure runs. The third is more easily modifiable, with some logic for constructing runs on the fly, however constructing experiments is complicated and not all permutations have been tested fully.
+The MolmoSpaces codebase has three entry points for data generation, evaluation, and debugging. The two initial entry points make use of experiment configs to configure runs. The third is more easily modifiable, with some logic for constructing runs on the fly; however, constructing experiments is complicated, and not all permutations have been tested fully.
 
 ```bash
 molmo_spaces/evaluation/eval_main.py  # evaluation
@@ -151,7 +151,7 @@ molmo_spaces/data_generation/main.py  # data generation
 scripts/datagen/run_pipeline.py       # debugging
 ```
 
-This readme contains more information on [experiment configs](#experiment-configs) as well as the other entry-points, for those, please see the [evaluation](#benchmarks-and-evaluations) and [data generation](#data-generation) sections of this readme. 
+This readme contains more information on [experiment configs](#experiment-configs) as well as the other entry points; for those, please see the [evaluation](#benchmarks-and-evaluations) and [data generation](#data-generation) sections of this readme. 
 
 ## MolmoSpaces Assets
 
@@ -169,8 +169,13 @@ Molmospaces provides scenes, objects, robots, and benchmarks. These can be downl
 | benchmark| molmospaces_bench_v2 | MS-Bench v2 | extended benchmark for atomic tasks          |       |
 
 
-Please refer to [here](./docs/assets.md) for instructions to set up data directories, but you shouldn't need to manually manage any dependencies beyond setting the appropriate environment variables. If you are interested only in data generation and evaluation using MujoCo you can skip the rest of this section.
+Please refer to [here](./docs/assets.md) for instructions to set up data directories, but you shouldn't need to manually manage any dependencies beyond setting the appropriate environment variables. If you are interested only in data generation and evaluation using MuJoCo, you can skip the rest of this section.
 
+## Documentation
+
+The documentation for MolmoSpaces can be found [here](https://allenai.github.io/molmospaces/). 
+
+Additional documentation for dependencies are listed below:
 
 | Simulator | Documentation                                                                 |
 |---|-------------------------------------------------------------------------------|
@@ -183,7 +188,7 @@ Please refer to [here](./docs/assets.md) for instructions to set up data directo
 In MolmoSpaces all runs, whether for data generation or evaluation of policies, are defined by experiment configs.
 The base experiment config class is called `MlSpacesExpConfig` and is located in `molmo_spaces/configs/abstract_exp_config.py`, it contains documentation on configuring experiments.
 
-To see a list of all currently defined experiment configs run this:
+To see a list of all currently defined experiment configs, run this:
 ```python
 from molmo_spaces.data_generation.main import auto_import_configs
 from molmo_spaces.data_generation.config_registry import list_available_configs
@@ -217,8 +222,8 @@ For more information, please refer to an instruction in the [benchmark](molmo_sp
 
 ## Data Generation
 
-Our data generation system makes use of pre-defined experiment configs that specify scenes, robots, tasks and more.
-Example experiment configs can be found in e.g. `molmo_spaces/data_generation/config/object_manipulation_datagen_configs.py`
+Our data generation system makes use of predefined experiment configs that specify scenes, robots, tasks, and more.
+Example experiment configs can be found in, e.g., `molmo_spaces/data_generation/config/object_manipulation_datagen_configs.py`
 
 ```bash
 python molmo_spaces/data_generation/main.py FrankaPickOmniCamConfig
@@ -227,9 +232,9 @@ python molmo_spaces/data_generation/main.py FrankaPickOmniCamConfig
 
 ## Teleop Input
 
-To control a robot via phone based teleoperation do the following (only iPhones supported).
+To control a robot via phone-based teleoperation, do the following (only iPhones supported).
 
-1. Install TeleDex from the App Store see [here](https://apps.apple.com/us/app/teledex/id6612039501).
+1. Install TeleDex from the App Store; see [here](https://apps.apple.com/us/app/teledex/id6612039501).
 2. Run the datagen pipeline with the teleop policy
    ```bash
    python molmo_spaces/evaluation/eval_main.py \
@@ -237,7 +242,7 @@ To control a robot via phone based teleoperation do the following (only iPhones 
     --benchmark_dir assets/bench/path-to-benchmark.json \
     --task_horizon_steps 1000
     ```
-3. Scan the QR-Code that shows up using the app (or manually enter the ip:port). Example terminal output:
+3. Scan the QR code that shows up using the app (or manually enter the IP port). Example terminal output:
    ```bash
    TeleDex Session Starting on port 8888...
    Session Started. Details:
@@ -247,19 +252,19 @@ To control a robot via phone based teleoperation do the following (only iPhones 
    ```
 4. Start teleoperating!
 
-- Click the Toggle to Grasp
-- Click the Button to go to the next episode
+- Click the toggle to grasp.
+- Click the button to go to the next episode.
 
 
-## Related Repositorys:
+## Related Repositories:
 
 The repositories related to this project can be found here:
 
 | Repository | Purpose |
 |---|---|
-| [ai2_robot_infra](https://github.com/allenai/ai2_robot_infra) | Real robot infrastructure and utilities, for experiments |
+| [ai2_robot_infra](https://github.com/allenai/ai2_robot_infra) | Real robot infrastructure and utilities for experiments |
 | [MolmoBot](https://github.com/allenai/MolmoBot) | MolmoBot policy code |
-| [curobo](https://github.com/allenai/curobo) | Ai2 Curobo brnach |
+| [curobo](https://github.com/allenai/curobo) | Ai2 cuRobo branch |
 
 
 ## Development
@@ -294,7 +299,7 @@ pybind11-stubgen mujoco -o ./typings/
 ```
 
 ### Mujoco Viewer Tips
-1. Documentation for the viewer can be found [here](https://mujoco.readthedocs.io/en/stable/programming/samples.html#sasimulate), there are many keyboard shortcuts.
+1. Documentation for the viewer can be found [here](https://mujoco.readthedocs.io/en/stable/programming/samples.html#sasimulate) there are many keyboard shortcuts.
 2. If you have red boxes on top of your objects, go to the left panel and toggle `Group Enable > Site groups >  Site 0`
 3. Interact with objects by double-clicking > Ctrl + right mouse drag. (only with active viewers, not passive ones)
 
@@ -303,7 +308,7 @@ pybind11-stubgen mujoco -o ./typings/
 
 Robot base conventions: +x=forward, +y=left, +z=up
 
-Robot parallel-jaw gripper conventions: +z=forward, fingers open along y axis
+Robot parallel-jaw gripper conventions: +z=forward, fingers open along the y axis
 
 <img src="docs/images/robot_axis_conventions.png" width="480px">
 
@@ -317,7 +322,7 @@ The artifacts are intended for research and educational use in accordance with [
 
 ## Data Attributions
 
-The xml files have been modified from the original versions provided by the following sources:
+The XML files have been modified from the original versions provided by the following sources:
 - [mujoco_menagerie / franka_fr3](https://github.com/google-deepmind/mujoco_menagerie/tree/main/franka_fr3) - Developed by Franka Robotics
 - [mujoco_menagerie / robotiq_2f85_v4](https://github.com/google-deepmind/mujoco_menagerie/tree/main/robotiq_2f85_v4) - Copyright (c) 2013, ROS-Industrial
 - [Rainbow Robotics / rby1-sdk](https://github.com/RainbowRobotics/rby1-sdk) - Copyright 2024-2025 Rainbow Robotics
