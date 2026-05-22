@@ -170,7 +170,7 @@
                                         <body name="camera_left_color_frame">
                                           <body name="camera_left_color_optical_frame" quat="0.5 -0.5 0.5 -0.5">
                                             <geom name="left_wrist_image_plane" type="box" size="0.1183 0.0665 0.001" pos="0 0 0.12" material="cam_left_wrist_mat" contype="0" conaffinity="0" group="2" density="0" />
-                                            <camera name="left_wrist_color" fovy="58" quat="0 1 0 0" />
+                                            <camera name="left_wrist_color" fovy="57.94" quat="0 1 0 0" />
                                           </body>
                                         </body>
                                       </body>
@@ -313,7 +313,7 @@
                                         <body name="camera_right_color_frame">
                                           <body name="camera_right_color_optical_frame" quat="0.5 -0.5 0.5 -0.5">
                                             <geom name="right_wrist_image_plane" type="box" size="0.1183 0.0665 0.001" pos="0 0 0.12" material="cam_right_wrist_mat" contype="0" conaffinity="0" group="2" density="0" />
-                                            <camera name="right_wrist_color" fovy="58" quat="0 1 0 0" />
+                                            <camera name="right_wrist_color" fovy="57.89" quat="0 1 0 0" />
                                           </body>
                                         </body>
                                       </body>
@@ -394,12 +394,12 @@
                 <body name="head_zed_left_camera_frame" pos="0 0.0315 0">
                   <body name="head_zed_left_camera_frame_optical" quat="0.5 -0.5 0.5 -0.5">
                     <geom name="head_zed_image_plane" type="box" size="0.3112 0.1751 0.001" pos="0 0 0.25" material="cam_head_zed_mat" contype="0" conaffinity="0" group="2" density="0" />
-                    <camera name="head_zed_left" fovy="70" quat="0 1 0 0" />
+                    <camera name="head_zed_left" fovy="52.33" quat="0 1 0 0" />
                   </body>
                 </body>
                 <body name="head_zed_right_camera_frame" pos="0 -0.0315 0">
                   <body name="head_zed_right_camera_frame_optical" quat="0.5 -0.5 0.5 -0.5">
-                    <camera name="head_zed_right" fovy="70" quat="0 1 0 0" />
+                    <camera name="head_zed_right" fovy="52.33" quat="0 1 0 0" />
                   </body>
                 </body>
               </body>
