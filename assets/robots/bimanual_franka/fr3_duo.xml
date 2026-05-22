@@ -80,9 +80,9 @@
     <material name="visual_right_knuckle_right_knuckle_right_knuckle__material_0" specular="0.4000000000000001" shininess="0.001" rgba="0.80000000 0.80000000 0.80000000 1.0" />
     <material name="visual_robotiq_base_robotiq_base_robotiq_base__material_0" texture="visual_robotiq_base_robotiq_base_robotiq_base__material_0" specular="0.4000000000000001" shininess="0.001" />
     <material name="d405_black" rgba="0.02 0.02 0.02 1" />
-    <material name="cam_left_wrist_mat" rgba="0.02 0.02 0.02 1" />
-    <material name="cam_right_wrist_mat" rgba="0.02 0.02 0.02 1" />
-    <material name="cam_head_zed_mat" rgba="0.02 0.02 0.02 1" />
+    <material name="cam_left_wrist_mat" rgba="0 0 0 0" />
+    <material name="cam_right_wrist_mat" rgba="0 0 0 0" />
+    <material name="cam_head_zed_mat" rgba="0 0 0 0" />
   </asset>
   <worldbody>
     <body name="base">
@@ -384,6 +384,7 @@
           <inertial pos="0 0 0" quat="0.528325 -0.0289488 -0.0065557 0.848523" mass="0.350865" diaginertia="0.00308057 0.00301706 0.000150319" />
           <geom type="mesh" group="3" mass="0" mesh="collision_franka_head" />
           <geom name="visual_geom_2" type="mesh" contype="0" conaffinity="0" group="2" density="0" mesh="franka_head" material="visual_franka_head_franka_head_franka_head__material_0" />
+          <camera name="ego_camera" pos="0.05 -0.02 0.4" quat="-0.612375 -0.35355 0.35355 0.612375" fovy="85"/>
           <body name="head_camera_mounting_point" pos="0.0498 -0.02 0.2345" quat="0.93667 0 0.350214 0">
             <inertial pos="0 0 0" mass="0.001" diaginertia="1e-07 1e-07 1e-07" />
             <body name="head_zed_camera_link" pos="0 -0.01 0">
@@ -409,23 +410,29 @@
     </body>
   </worldbody>
   <actuator>
-    <general name="left_fr3v2_joint1" joint="left_fr3v2_joint1" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" />
-    <general name="left_fr3v2_joint2" joint="left_fr3v2_joint2" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" />
-    <general name="left_fr3v2_joint3" joint="left_fr3v2_joint3" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" />
-    <general name="left_fr3v2_joint4" joint="left_fr3v2_joint4" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" />
-    <general name="left_fr3v2_joint5" joint="left_fr3v2_joint5" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" />
-    <general name="left_fr3v2_joint6" joint="left_fr3v2_joint6" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" />
-    <general name="left_fr3v2_joint7" joint="left_fr3v2_joint7" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" />
-    <general name="right_fr3v2_joint1" joint="right_fr3v2_joint1" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" />
-    <general name="right_fr3v2_joint2" joint="right_fr3v2_joint2" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" />
-    <general name="right_fr3v2_joint3" joint="right_fr3v2_joint3" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" />
-    <general name="right_fr3v2_joint4" joint="right_fr3v2_joint4" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" />
-    <general name="right_fr3v2_joint5" joint="right_fr3v2_joint5" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" />
-    <general name="right_fr3v2_joint6" joint="right_fr3v2_joint6" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" />
-    <general name="right_fr3v2_joint7" joint="right_fr3v2_joint7" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" />
-    <general name="left_robotiq_85_left_knuckle_joint" joint="left_robotiq_85_left_knuckle_joint" biastype="affine" gainprm="100" biasprm="0 -100 -10" />
-    <general name="right_robotiq_85_left_knuckle_joint" joint="right_robotiq_85_left_knuckle_joint" biastype="affine" gainprm="100" biasprm="0 -100 -10" />
+    <general name="left_fr3v2_joint1" joint="left_fr3v2_joint1" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" ctrlrange="-2.90074 2.90074" />
+    <general name="left_fr3v2_joint2" joint="left_fr3v2_joint2" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" ctrlrange="-1.83609 1.83609" />
+    <general name="left_fr3v2_joint3" joint="left_fr3v2_joint3" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" ctrlrange="-2.90074 2.90074" />
+    <general name="left_fr3v2_joint4" joint="left_fr3v2_joint4" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" ctrlrange="-3.07702 -0.116937" />
+    <general name="left_fr3v2_joint5" joint="left_fr3v2_joint5" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" ctrlrange="-2.8763 2.8763" />
+    <general name="left_fr3v2_joint6" joint="left_fr3v2_joint6" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" ctrlrange="0.439823 4.62163" />
+    <general name="left_fr3v2_joint7" joint="left_fr3v2_joint7" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" ctrlrange="-3.05083 3.05083" />
+    <general name="right_fr3v2_joint1" joint="right_fr3v2_joint1" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" ctrlrange="-2.90074 2.90074" />
+    <general name="right_fr3v2_joint2" joint="right_fr3v2_joint2" biastype="affine" gainprm="4500" biasprm="0 -4500 -450" ctrlrange="-1.83609 1.83609" />
+    <general name="right_fr3v2_joint3" joint="right_fr3v2_joint3" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" ctrlrange="-2.90074 2.90074" />
+    <general name="right_fr3v2_joint4" joint="right_fr3v2_joint4" biastype="affine" gainprm="3500" biasprm="0 -3500 -350" ctrlrange="-3.07702 -0.116937" />
+    <general name="right_fr3v2_joint5" joint="right_fr3v2_joint5" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" ctrlrange="-2.8763 2.8763" />
+    <general name="right_fr3v2_joint6" joint="right_fr3v2_joint6" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" ctrlrange="0.439823 4.62163" />
+    <general name="right_fr3v2_joint7" joint="right_fr3v2_joint7" biastype="affine" gainprm="2000" biasprm="0 -2000 -200" ctrlrange="-3.05083 3.05083" />
+    <general name="left_robotiq_85_left_knuckle_joint" joint="left_robotiq_85_left_knuckle_joint" biastype="affine" gainprm="100" biasprm="0 -100 -10" ctrlrange="0 0.8" />
+    <general name="right_robotiq_85_left_knuckle_joint" joint="right_robotiq_85_left_knuckle_joint" biastype="affine" gainprm="100" biasprm="0 -100 -10" ctrlrange="0 0.8" />
   </actuator>
+  <contact>
+    <exclude name="left_left_tip_excl" body1="left_robotiq_85_left_finger_tip_link" body2="left_robotiq_85_left_inner_knuckle_link"/>
+    <exclude name="left_right_tip_excl" body1="left_robotiq_85_right_finger_tip_link" body2="left_robotiq_85_right_inner_knuckle_link"/>
+    <exclude name="right_left_tip_excl" body1="right_robotiq_85_left_finger_tip_link" body2="right_robotiq_85_left_inner_knuckle_link"/>
+    <exclude name="right_right_tip_excl" body1="right_robotiq_85_right_finger_tip_link" body2="right_robotiq_85_right_inner_knuckle_link"/>
+  </contact>
   <equality>
     <joint name="left_robotiq_85_right_knuckle_joint_mimic" joint1="left_robotiq_85_right_knuckle_joint" joint2="left_robotiq_85_left_knuckle_joint" polycoef="0 -1 0 0 0" />
     <joint name="left_robotiq_85_left_inner_knuckle_joint_mimic" joint1="left_robotiq_85_left_inner_knuckle_joint" joint2="left_robotiq_85_left_knuckle_joint" polycoef="0 1 0 0 0" />
