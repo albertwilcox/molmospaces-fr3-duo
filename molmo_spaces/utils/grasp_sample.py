@@ -357,12 +357,18 @@ def get_all_grasp_poses(
         # frame by +90 deg about Z within the gripper_base. The cached droid
         # grasp DB was calibrated to the older convention where the grasp_site
         # frame was aligned with the gripper_base (finger-open axis along +X).
-        # Post-multiplying by Rz(-90 deg) converts the cached grasp targets
-        # (expressed in the old TCP convention) into the new grasp_site frame.
-        GRIP_BASE_TCP = pos_quat_to_pose_mat(
-            [0, 0, 0],
-            R.from_euler("z", -90, degrees=True).as_quat(scalar_first=True),
-        )
+        # For the bimanual robot we post-multiply by Rz(-90 deg) to convert
+        # the cached grasp targets into the new grasp_site frame. For all
+        # other droid-gripper robots (e.g. single-arm Franka), the grasp_site
+        # convention is unchanged and GRIP_BASE_TCP is identity.
+        robot_view = policy.task._env.current_robot.robot_view
+        if type(robot_view).__name__ == "BimanualFrankaRobotView":
+            GRIP_BASE_TCP = pos_quat_to_pose_mat(
+                [0, 0, 0],
+                R.from_euler("z", -90, degrees=True).as_quat(scalar_first=True),
+            )
+        else:
+            GRIP_BASE_TCP = np.eye(4)
 
     # Convert all cached grasps to world frame
     grasp_poses_world = object_pose @ cached_grasps @ GRIP_BASE_TCP
@@ -412,12 +418,16 @@ def compute_grasp_pose(
         RUM_BASE_TCP = pos_quat_to_pose_mat(np.array([0.0, 0, 0.12]), [1, 0, 0, 0])
         GRIP_BASE_TCP = RUM_BASE_TCP @ ROT_Z_90
     elif gripper == "droid":
-        # See note in get_all_grasp_poses(): the fr3_duo grasp_site is rotated
-        # +90 deg about Z relative to the cached-grasp TCP convention.
-        GRIP_BASE_TCP = pos_quat_to_pose_mat(
-            [0, 0, 0],
-            R.from_euler("z", -90, degrees=True).as_quat(scalar_first=True),
-        )
+        # See note in get_all_grasp_poses(): only the bimanual fr3_duo xml
+        # rotates grasp_site by +90 deg about Z; single-arm droid-gripper
+        # robots keep the original convention.
+        if type(robot_view).__name__ == "BimanualFrankaRobotView":
+            GRIP_BASE_TCP = pos_quat_to_pose_mat(
+                [0, 0, 0],
+                R.from_euler("z", -90, degrees=True).as_quat(scalar_first=True),
+            )
+        else:
+            GRIP_BASE_TCP = np.eye(4)
 
     # get the current TCP position
     tcp_pose_arr = policy.task.sensor_suite.sensors["tcp_pose"].get_observation(

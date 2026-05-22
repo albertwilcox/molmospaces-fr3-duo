@@ -41,11 +41,13 @@ DEPTH_MAX = 0.55  # 55cm maximum valid depth (D405 spec: 50cm, extended for marg
 
 # Video codec configuration for depth videos
 # Change these settings in one place to affect all depth video saving
-DEPTH_VIDEO_CODEC = (
-    "libx264rgb"  # RGB H.264 codec (no YUV conversion - avoids chroma subsampling artifacts)
-)
-DEPTH_VIDEO_PIXELFORMAT = "rgb24"  # RGB pixel format (preserves RG channel depth encoding)
-DEPTH_VIDEO_CRF = "23"  # High quality lossy (18 = visually lossless, 23 = smaller files)
+DEPTH_VIDEO_CODEC = "libx264"  # H.264 codec (YUV420p output for VAE compatibility)
+DEPTH_VIDEO_PIXELFORMAT = "yuv420p"  # Standard pixel format for VAE pipeline
+DEPTH_VIDEO_CRF = "18"  # Visually lossless — preserves linear depth precision
+
+# Maximum depth for VAE-ready MP4 encoding (linear uint8 mapping).
+# Depths beyond this are clamped to 255. 2m covers typical indoor robot workspace.
+VAE_MAX_DEPTH_M = 2.0
 
 
 def encode_depth_to_rgb(depth_meters: np.ndarray) -> np.ndarray:
@@ -617,12 +619,11 @@ def save_depth_video(
         f"range [{depth_min:.3f}m, {depth_max:.3f}m]"
     )
 
-    # Save depth as uint16 lossless + turbo colormap MP4 for visualization.
+    # Save depth as uint16 lossless + VAE-ready linear grayscale MP4.
     # uint16 encoding: depth_meters * 1000 -> depth_mm, clamped to [0, 65535]mm = [0, 65.535m]
     # Resolution: 1mm per step. Stored as 16-bit PNG frames in a zip archive.
     from PIL import Image
     import zipfile, io
-    import matplotlib.cm as cm
 
     DEPTH_SCALE = 1000.0  # meters to millimeters
     video_path = Path(video_path)
@@ -639,29 +640,31 @@ def save_depth_video(
             zf.writestr(f"{i:06d}.png", buf.getvalue())
     logger.debug(f"Saved {len(depth_frames)} uint16 depth frames to {zip_path}")
 
-    # --- 2. Save turbo colormap MP4 for visual inspection ---
+    # --- 2. Save VAE-ready MP4: linear grayscale, 3-channel, clipped at VAE_MAX_DEPTH_M ---
+    # Linear mapping preserves metric proportionality (unlike turbo colormap):
+    #   0 m             → uint8 0   → VAE float -1.0
+    #   VAE_MAX_DEPTH_M → uint8 255 → VAE float +1.0
+    # Replicated to 3 identical channels because the frozen Wan 2.1 VAE expects RGB input.
     mp4_path = video_path.with_suffix(".mp4") if video_path.suffix != ".mp4" else video_path
-    depth_vis_max = 3.0
     encoded_frames = []
     for frame in depth_frames:
-        norm = np.clip(frame / depth_vis_max, 0, 1)
-        norm = 1.0 - norm  # invert: close=bright
-        colored = (cm.turbo(norm)[:, :, :3] * 255).astype(np.uint8)
-        colored[frame <= 0] = 0
-        encoded_frames.append(colored)
+        depth_u8 = np.clip(
+            frame / VAE_MAX_DEPTH_M * 255.0, 0, 255
+        ).astype(np.uint8)
+        # Replicate single channel to 3 channels for VAE compatibility
+        encoded_frames.append(np.stack([depth_u8, depth_u8, depth_u8], axis=-1))
     encoded_frames = np.array(encoded_frames)
 
     codec_kwargs = {
         "codec": DEPTH_VIDEO_CODEC,
-        "pixelformat": DEPTH_VIDEO_PIXELFORMAT,
-        "output_params": ["-crf", DEPTH_VIDEO_CRF],
+        "output_params": ["-crf", DEPTH_VIDEO_CRF, "-pix_fmt", DEPTH_VIDEO_PIXELFORMAT],
     }
     try:
         writer = imageio.get_writer(str(mp4_path), format="ffmpeg", fps=fps, **codec_kwargs)
         for frame in encoded_frames:
             writer.append_data(frame)
         writer.close()
-        logger.debug(f"Saved depth colormap video to {mp4_path}")
+        logger.debug(f"Saved depth VAE-ready video to {mp4_path}")
     except (ImportError, OSError, ValueError, RuntimeError) as e:
         logger.warning(f"FFmpeg writer failed ({type(e).__name__}: {e}), falling back to mimwrite")
         imageio.mimwrite(str(mp4_path), encoded_frames, format="mp4", fps=fps, **codec_kwargs)
@@ -718,7 +721,11 @@ def load_depth_video(
         if frame_rgb.shape[-1] != 3:
             raise ValueError(f"Expected RGB frame with 3 channels, got shape {frame_rgb.shape}")
 
-        decoded_depth = decode_depth_from_rgb(frame_rgb, validate=True)
+        # Linear grayscale decode: take first channel, reverse the linear mapping.
+        # uint8 0 → 0 m, uint8 255 → VAE_MAX_DEPTH_M. All 3 channels are identical
+        # by construction in save_depth_video().
+        depth_u8 = frame_rgb[:, :, 0]
+        decoded_depth = depth_u8.astype(np.float32) / 255.0 * VAE_MAX_DEPTH_M
         decoded_frames.append(decoded_depth)
 
     reader.close()

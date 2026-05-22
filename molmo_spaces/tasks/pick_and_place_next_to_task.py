@@ -130,15 +130,25 @@ class PickAndPlaceNextToTask(PickAndPlaceTask):
                 ]
                 on_same_surface = receptacle_supporting_body == pickup_obj_supporting_body
             else:
-                # Plato: If either object has no supporting geom, they're not on the same surface
-                # Aristotle: Hold my beer...
-                om = self.env.object_managers[i]
-                b2g = om.get_body_to_geoms()
-                p_sup_p = om.approximate_supporting_geoms(pickup_obj.body_id, b2g)
-                r_sup_p = om.approximate_supporting_geoms(place_receptacle.body_id, b2g)
-                p_sups = {p[1] for p in p_sup_p}
-                r_sups = {p[1] for p in r_sup_p}
-                on_same_surface = len(p_sups & r_sups) > 0  # False
+                # approximate_supporting_geoms is O(N_bodies * N_mesh_geoms) — too
+                # expensive to run every step.  It only matters for the success
+                # metric, so defer it to the last few steps of the episode where the
+                # object should already be placed.  During mid-episode steps just
+                # report False (conservative — won't mis-report success).
+                near_episode_end = (
+                    hasattr(self, "_task_horizon")
+                    and self.episode_step_count >= self._task_horizon - 5
+                )
+                if near_episode_end:
+                    om = self.env.object_managers[i]
+                    b2g = om.get_body_to_geoms()
+                    p_sup_p = om.approximate_supporting_geoms(pickup_obj.body_id, b2g)
+                    r_sup_p = om.approximate_supporting_geoms(place_receptacle.body_id, b2g)
+                    p_sups = {p[1] for p in p_sup_p}
+                    r_sups = {p[1] for p in r_sup_p}
+                    on_same_surface = len(p_sups & r_sups) > 0
+                else:
+                    on_same_surface = False
 
             # Has the place receptacle moved too much?
             start_pose = pos_quat_to_pose_mat(

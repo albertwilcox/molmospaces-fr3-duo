@@ -1,3 +1,4 @@
+import faulthandler
 import gc
 import logging
 import multiprocessing as mp
@@ -5,9 +6,12 @@ import os
 import pprint
 import random
 import signal
+import sys
 import threading
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -192,6 +196,84 @@ def setup_viewer(
     return viewer
 
 
+class BackgroundSaver:
+    """Offloads ``save_house_trajectories`` calls to a background thread.
+
+    MP4 encoding (the ``save_batch_prep`` phase) is CPU-heavy but releases the
+    GIL through native ffmpeg/imageio code, so running it on a single
+    background thread lets the worker continue sampling the next house
+    immediately while the previous house's data is being written.
+
+    Usage::
+
+        saver = BackgroundSaver(logger)
+        # ... in the house loop ...
+        saver.submit(save_house_trajectories, *args, **kwargs)
+        # After the loop:
+        saver.shutdown()          # blocks until all pending saves finish
+    """
+
+    def __init__(self, logger) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bg-save")
+        self._pending: list[Future] = []
+        self._logger = logger
+
+    # ------------------------------------------------------------------
+    def submit(self, fn, *args, **kwargs) -> None:
+        """Submit *fn* for background execution and track the future."""
+        # Reap already-finished futures to keep the list bounded and surface
+        # any exceptions from previous saves early.
+        self._reap()
+        future = self._executor.submit(fn, *args, **kwargs)
+        self._pending.append(future)
+
+    # ------------------------------------------------------------------
+    def shutdown(self, heartbeat_callback=None, poll_interval: float = 5.0) -> None:
+        """Wait for every pending save to complete and shut down the pool.
+
+        If ``heartbeat_callback`` is provided, it is invoked every
+        ``poll_interval`` seconds while waiting so the parent watchdog
+        does not kill this worker mid-flush.
+        """
+        for fut in self._pending:
+            if heartbeat_callback is None:
+                try:
+                    fut.result()
+                except Exception:
+                    self._logger.error(
+                        "Background save failed:\n" + traceback.format_exc()
+                    )
+                continue
+            # Poll-and-heartbeat loop.
+            while True:
+                heartbeat_callback()
+                try:
+                    fut.result(timeout=poll_interval)
+                    break
+                except FuturesTimeout:
+                    continue
+                except Exception:
+                    self._logger.error(
+                        "Background save failed:\n" + traceback.format_exc()
+                    )
+                    break
+        self._pending.clear()
+        self._executor.shutdown(wait=True)
+
+    # ------------------------------------------------------------------
+    def _reap(self) -> None:
+        """Remove finished futures, logging any errors."""
+        still_pending: list[Future] = []
+        for fut in self._pending:
+            if fut.done():
+                exc = fut.exception()
+                if exc is not None:
+                    self._logger.error(f"Background save raised: {exc}")
+            else:
+                still_pending.append(fut)
+        self._pending = still_pending
+
+
 def save_house_trajectories(
     worker_logger,
     house_raw_histories: list,
@@ -370,6 +452,7 @@ def house_processing_worker(
     preloaded_policy: BasePolicy | None = None,
     filter_for_successful_trajectories: bool = False,
     runner_class=None,
+    heartbeat=None,
 ):
     """
     Standalone worker function that processes work items sequentially from a shared counter.
@@ -399,6 +482,25 @@ def house_processing_worker(
     # Create worker-specific logger
     worker_logger = get_worker_logger(worker_id)
 
+    # Signal to parent that we're alive (initial heartbeat)
+    if heartbeat is not None:
+        heartbeat.value = time.monotonic()
+
+    # Enable faulthandler for hang detection — dumps all thread stacks to a file
+    # if the worker doesn't reset the timer within the timeout period.
+    _hang_timeout = int(os.environ.get("MOLMOSPACES_HANG_TIMEOUT", "0"))
+    _hang_dump_file = None
+    if _hang_timeout > 0:
+        _hang_dump_path = Path(exp_config.output_dir) / f"hang_dump_worker_{worker_id}.txt"
+        _hang_dump_file = open(_hang_dump_path, "w")  # noqa: SIM115
+        faulthandler.dump_traceback_later(
+            _hang_timeout, repeat=True, file=_hang_dump_file, exit=False
+        )
+        worker_logger.info(
+            f"Worker {worker_id}: hang detection enabled — "
+            f"stack dump every {_hang_timeout}s of inactivity → {_hang_dump_path}"
+        )
+
     # Create per-worker profiler for timing analysis
     if hasattr(exp_config, "datagen_profiler") and exp_config.datagen_profiler:
         datagen_profiler = DatagenProfiler(logger=worker_logger, enabled=True)
@@ -413,6 +515,10 @@ def house_processing_worker(
     task_sampler = exp_config.task_sampler_config.task_sampler_class(exp_config)
     # Set profiler on task sampler for sub-timing within sample_task
     task_sampler.set_datagen_profiler(datagen_profiler)
+
+    # Background saver offloads MP4 encoding / HDF5 writes to a dedicated
+    # thread so the worker can start sampling the next house immediately.
+    background_saver = BackgroundSaver(worker_logger)
 
     # Use context manager for worker-specific stdout redirection
     with worker_stdout_context(worker_logger, worker_id):
@@ -439,7 +545,24 @@ def house_processing_worker(
                     f"(item {item_idx}/{len(work_items)})"
                 )
 
+                # Update heartbeat so parent knows we're alive
+                if heartbeat is not None:
+                    heartbeat.value = time.monotonic()
+
+                # Reset hang detection timer for each house
+                if _hang_timeout > 0:
+                    faulthandler.dump_traceback_later(
+                        _hang_timeout, repeat=True, file=_hang_dump_file, exit=False
+                    )
+
                 # Process this work item
+                # Build a heartbeat callback so process_single_house
+                # can ping the watchdog after every episode.
+                _hb_cb = None
+                if heartbeat is not None:
+                    def _hb_cb():
+                        heartbeat.value = time.monotonic()
+
                 house_success_count, house_total_count, irrecoverable = (
                     runner_class.process_single_house(
                         worker_id,
@@ -457,8 +580,14 @@ def house_processing_worker(
                         batch_num=batch_num,
                         total_batches=total_batches,
                         datagen_profiler=datagen_profiler,
+                        background_saver=background_saver,
+                        heartbeat_callback=_hb_cb,
                     )
                 )
+
+                # Update heartbeat after house completion
+                if heartbeat is not None:
+                    heartbeat.value = time.monotonic()
 
                 # Update global counters
                 with counter_lock:
@@ -487,6 +616,24 @@ def house_processing_worker(
 
             worker_logger.info(f"Worker {worker_id} completed processing assigned work items")
         finally:
+            # Cancel hang detection timer
+            if _hang_timeout > 0:
+                faulthandler.cancel_dump_traceback_later()
+                if _hang_dump_file is not None:
+                    _hang_dump_file.close()
+
+            # Wait for any in-flight background saves to finish before
+            # tearing down the worker (and its logger / profiler).
+            # Heartbeat while waiting so the parent watchdog doesn't kill us
+            # mid-flush.
+            worker_logger.info(f"Worker {worker_id} waiting for background saves to complete...")
+            if heartbeat is not None:
+                def _shutdown_hb_cb() -> None:
+                    heartbeat.value = time.monotonic()
+                background_saver.shutdown(heartbeat_callback=_shutdown_hb_cb)
+            else:
+                background_saver.shutdown()
+
             # Log final profiling summary for this worker
             if datagen_profiler is not None:
                 datagen_profiler.log_worker_summary()
@@ -841,6 +988,8 @@ class ParallelRolloutRunner:
         batch_num: int | None = None,
         total_batches: int | None = None,
         datagen_profiler: DatagenProfiler | None = None,
+        background_saver: BackgroundSaver | None = None,
+        heartbeat_callback=None,
     ) -> tuple[int, int, bool]:
         """
         Process all episodes for a single house using customizable hooks.
@@ -1145,6 +1294,11 @@ class ParallelRolloutRunner:
                     if datagen_profiler is not None:
                         datagen_profiler.end("episode_total")
 
+                # Update heartbeat after each episode so the watchdog
+                # knows we're still making progress within a long house.
+                if heartbeat_callback is not None:
+                    heartbeat_callback()
+
                 # Cleanup resources
                 cleanup_episode_resources(
                     task=task,
@@ -1174,20 +1328,30 @@ class ParallelRolloutRunner:
             )
             return house_success_count, house_total_count, True
 
-        # Save trajectories
-        save_house_trajectories(
+        # Save trajectories (offload to background thread when available so the
+        # worker can start the next house immediately instead of blocking on
+        # MP4 encoding which typically takes 80-120 s per house).
+        _do_save = background_saver.submit if background_saver is not None else lambda fn, *a, **kw: fn(*a, **kw)
+        # When saving in the background, don't share the datagen_profiler across
+        # threads — its start/end calls are not thread-safe and would race with
+        # the next house's episode profiling.  Wall-clock times are still logged.
+        _save_profiler = None if background_saver is not None else datagen_profiler
+
+        _do_save(
+            save_house_trajectories,
             worker_logger,
             house_raw_histories,
             house_output_dir,
             exp_config,
             batch_suffix,
-            datagen_profiler,
+            _save_profiler,
             batch_num,
             total_batches,
         )
 
         # Save debug trajectories
-        save_house_trajectories(
+        _do_save(
+            save_house_trajectories,
             worker_logger,
             house_debug_raw_histories,
             house_debug_dir,
@@ -1250,38 +1414,165 @@ class ParallelRolloutRunner:
 
         # Launch worker processes
         if self.config.num_workers > 1:
-            processes = []
-            for worker_id in range(self.config.num_workers):
+            worker_args = (
+                self.config,
+                self.work_items,
+                self.shutdown_event,
+                self.counter_lock,
+                self.house_counter,
+                self.success_count,
+                self.total_count,
+                self.completed_houses,
+                self.skipped_houses,
+                self.max_allowed_sequential_task_sampler_failures,
+                self.max_allowed_sequential_rollout_failures,
+                self.max_allowed_sequential_irrecoverable_failures,
+                preloaded_policy,
+                self.config.filter_for_successful_trajectories,
+                type(self),  # Pass the runner class to enable customization via subclassing
+            )
+
+            # Watchdog configuration from environment
+            _watchdog_timeout = int(os.environ.get("MOLMOSPACES_WATCHDOG_TIMEOUT", "1800"))  # 30 min default
+            _max_respawns = int(os.environ.get("MOLMOSPACES_MAX_RESPAWNS", "50"))
+            _total_respawns = 0
+
+            # Per-worker heartbeat timestamps (shared memory)
+            heartbeats = [
+                mp_context.Value("d", time.monotonic())
+                for _ in range(self.config.num_workers)
+            ]
+
+            def _spawn_worker(wid: int, heartbeat) -> mp_context.Process:
                 p = mp_context.Process(
                     target=house_processing_worker,
-                    args=(
-                        worker_id,
-                        self.config,
-                        self.work_items,
-                        self.shutdown_event,
-                        self.counter_lock,
-                        self.house_counter,
-                        self.success_count,
-                        self.total_count,
-                        self.completed_houses,
-                        self.skipped_houses,
-                        self.max_allowed_sequential_task_sampler_failures,
-                        self.max_allowed_sequential_rollout_failures,
-                        self.max_allowed_sequential_irrecoverable_failures,
-                        preloaded_policy,
-                        self.config.filter_for_successful_trajectories,
-                        type(self),  # Pass the runner class to enable customization via subclassing
-                    ),
+                    args=(wid, *worker_args, heartbeat),
                 )
                 p.start()
-                processes.append(p)
+                return p
 
-            # Periodic logging loop that monitors progress while workers run
+            next_worker_id = self.config.num_workers
+            processes: list[mp_context.Process] = []
+            for worker_id in range(self.config.num_workers):
+                processes.append(_spawn_worker(worker_id, heartbeats[worker_id]))
+
+            self.logger.info(
+                f"Watchdog: timeout={_watchdog_timeout}s, max_respawns={_max_respawns}"
+            )
+
+            # Periodic logging loop that monitors progress while workers run.
+            # Also detects dead workers and respawns replacements so that the
+            # target concurrency is maintained even when MuJoCo segfaults kill
+            # individual workers.
             last_log_time = start_time
             log_interval = 60  # Log every 60 seconds
 
             while any(p.is_alive() for p in processes):
-                # Check if it's time to log
+                # --- Watchdog: kill hung workers ---
+                now_mono = time.monotonic()
+                for slot_idx, p in enumerate(processes):
+                    if not p.is_alive():
+                        continue
+                    if slot_idx >= len(heartbeats):
+                        continue
+                    last_hb = heartbeats[slot_idx].value
+                    stale_seconds = now_mono - last_hb
+                    if _watchdog_timeout > 0 and stale_seconds > _watchdog_timeout:
+                        self.logger.error(
+                            f"Watchdog: worker slot {slot_idx} (pid={p.pid}) "
+                            f"has not heartbeated in {stale_seconds:.0f}s "
+                            f"(timeout={_watchdog_timeout}s). Killing it."
+                        )
+                        try:
+                            os.kill(p.pid, signal.SIGKILL)
+                        except OSError:
+                            pass  # already dead
+
+                # --- Respawn dead workers ---
+                # Only respawn if there are still houses left to process
+                # and we haven't exceeded the respawn cap.
+                has_remaining_houses = self.house_counter.value < len(self.house_indices)
+                can_respawn = has_remaining_houses and _total_respawns < _max_respawns
+                # `processes` and `heartbeats` are index-aligned: heartbeats[i]
+                # belongs to processes[i].  When a worker is removed without
+                # being respawned, BOTH lists must drop the same slot,
+                # otherwise live workers get matched against dead workers'
+                # never-updated heartbeats and the watchdog kills them.
+                new_processes: list[mp_context.Process] = []
+                new_heartbeats: list = []
+                for slot_idx, p in enumerate(processes):
+                    hb_for_slot = heartbeats[slot_idx]
+                    if p.is_alive():
+                        new_processes.append(p)
+                        new_heartbeats.append(hb_for_slot)
+                    elif p.exitcode is not None and p.exitcode != 0 and can_respawn:
+                        # Worker died abnormally — respawn a replacement.
+                        _total_respawns += 1
+                        self.logger.warning(
+                            f"Worker (pid={p.pid}) died with exit code {p.exitcode}. "
+                            f"Spawning replacement worker {next_worker_id} "
+                            f"(respawn {_total_respawns}/{_max_respawns})."
+                        )
+                        p.join(timeout=1)
+                        p.close()
+                        hb = mp_context.Value("d", time.monotonic())
+                        new_processes.append(_spawn_worker(next_worker_id, hb))
+                        new_heartbeats.append(hb)
+                        next_worker_id += 1
+                        if _total_respawns >= _max_respawns:
+                            self.logger.error(
+                                f"Respawn cap reached ({_max_respawns}). "
+                                "No more workers will be respawned."
+                            )
+                            can_respawn = False
+                    elif p.exitcode is not None and p.exitcode != 0 and not can_respawn:
+                        reason = "no remaining houses" if not has_remaining_houses else "respawn cap reached"
+                        self.logger.warning(
+                            f"Worker (pid={p.pid}) died with exit code {p.exitcode}. "
+                            f"NOT respawning ({reason})."
+                        )
+                        p.join(timeout=1)
+                        p.close()
+                        # Drop from BOTH lists.
+                    elif p.exitcode is not None and p.exitcode == 0 and can_respawn:
+                        # Worker exited "normally" but houses remain — this
+                        # happens when a worker self-terminates after hitting
+                        # max_allowed_sequential_irrecoverable_failures.
+                        # Treat it as a respawn so the queue actually drains.
+                        _total_respawns += 1
+                        self.logger.warning(
+                            f"Worker (pid={p.pid}) exited with code 0 but "
+                            f"{len(self.house_indices) - self.house_counter.value} houses remain. "
+                            f"Spawning replacement worker {next_worker_id} "
+                            f"(respawn {_total_respawns}/{_max_respawns})."
+                        )
+                        p.join(timeout=1)
+                        p.close()
+                        hb = mp_context.Value("d", time.monotonic())
+                        new_processes.append(_spawn_worker(next_worker_id, hb))
+                        new_heartbeats.append(hb)
+                        next_worker_id += 1
+                        if _total_respawns >= _max_respawns:
+                            self.logger.error(
+                                f"Respawn cap reached ({_max_respawns}). "
+                                "No more workers will be respawned."
+                            )
+                            can_respawn = False
+                    elif p.exitcode is not None and p.exitcode == 0:
+                        # Worker exited normally and either the queue is
+                        # drained or the respawn cap is reached.
+                        p.join(timeout=1)
+                        p.close()
+                        # Drop from BOTH lists.
+                    else:
+                        # Still in the list but not alive and no exitcode yet —
+                        # keep it so we re-check next iteration.
+                        new_processes.append(p)
+                        new_heartbeats.append(hb_for_slot)
+                processes = new_processes
+                heartbeats = new_heartbeats
+
+                # --- Periodic logging ---
                 current_time = time.time()
                 if self.wandb_enabled and (current_time - last_log_time) >= log_interval:
                     try:
@@ -1324,13 +1615,21 @@ class ParallelRolloutRunner:
                         self.logger.warning(f"WandB periodic logging failed: {e}")
 
                 # Sleep briefly before checking again
-
                 time.sleep(5)
+
+            self.logger.info(f"All workers done. Total respawns: {_total_respawns}")
 
             # Wait for all processes to complete
             for p in processes:
-                p.join()
-                p.close()
+                if hasattr(p, 'pid') and p.pid is not None:
+                    try:
+                        p.join(timeout=10)
+                    except Exception:
+                        pass
+                    try:
+                        p.close()
+                    except Exception:
+                        pass
 
         else:
             # Single-worker mode runs in the main process
