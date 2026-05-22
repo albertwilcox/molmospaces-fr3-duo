@@ -151,7 +151,7 @@
                                   <inertial pos="0 2.274e-05 0.0323229" quat="0.707251 -0.000590537 0.000590296 0.706962" mass="0.663202" diaginertia="0.000588023 0.000516178 0.000394627" />
                                   <geom type="mesh" group="3" mass="0" mesh="collision_robotiq_base" />
                                   <geom name="visual_geom_14" type="mesh" contype="0" conaffinity="0" group="2" density="0" mesh="robotiq_base" material="visual_robotiq_base_robotiq_base_robotiq_base__material_0" />
-                                  <site name="left_grasp_site" pos="0 0 0.095" quat="0.7071068 0 0 0.7071068"/>
+                                  <site name="left_grasp_site" pos="0 0 0.095"/>
                                   <body name="left_camera_mounting_point" pos="0 0.03 0.03" quat="0.500398 -0.499602 -0.5 -0.5">
                                     <body name="camera_left_bottom_screw_frame">
                                       <body name="camera_left_link" pos="0.01085 0.009 0.021">
@@ -294,7 +294,7 @@
                                   <inertial pos="0 2.274e-05 0.0323229" quat="0.707251 -0.000590537 0.000590296 0.706962" mass="0.663202" diaginertia="0.000588023 0.000516178 0.000394627" />
                                   <geom type="mesh" group="3" mass="0" mesh="collision_robotiq_base" />
                                   <geom name="visual_geom_31" type="mesh" contype="0" conaffinity="0" group="2" density="0" mesh="robotiq_base" material="visual_robotiq_base_robotiq_base_robotiq_base__material_0" />
-                                  <site name="right_grasp_site" pos="0 0 0.095" quat="0.7071068 0 0 0.7071068"/>
+                                  <site name="right_grasp_site" pos="0 0 0.095"/>
                                   <body name="right_camera_mounting_point" pos="0 0.03 0.03" quat="0.500398 -0.499602 -0.5 -0.5">
                                     <body name="camera_right_bottom_screw_frame">
                                       <body name="camera_right_link" pos="0.01085 0.009 0.021">

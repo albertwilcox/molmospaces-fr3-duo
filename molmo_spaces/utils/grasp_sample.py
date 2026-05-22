@@ -353,14 +353,11 @@ def get_all_grasp_poses(
         RUM_BASE_TCP = pos_quat_to_pose_mat(np.array([0.0, 0, 0.12]), [1, 0, 0, 0])
         GRIP_BASE_TCP = RUM_BASE_TCP @ ROT_Z_90
     elif gripper == "droid":
-        # The bimanual FR3 + Robotiq 85 xml (fr3_duo.xml) rotates the grasp_site
-        # frame by +90 deg about Z within the gripper_base. The cached droid
-        # grasp DB was calibrated to the older convention where the grasp_site
-        # frame was aligned with the gripper_base (finger-open axis along +X).
-        # For the bimanual robot we post-multiply by Rz(-90 deg) to convert
-        # the cached grasp targets into the new grasp_site frame. For all
-        # other droid-gripper robots (e.g. single-arm Franka), the grasp_site
-        # convention is unchanged and GRIP_BASE_TCP is identity.
+        # The bimanual fr3_duo xml mounts the Robotiq-85 gripper such that its
+        # finger-open axis is rotated +90 deg about Z relative to the cached
+        # grasp database's convention (Franka-hand finger frame). For all
+        # other droid-gripper robots (e.g. single-arm Franka), the convention
+        # is unchanged and GRIP_BASE_TCP is identity.
         robot_view = policy.task._env.current_robot.robot_view
         if type(robot_view).__name__ == "BimanualFrankaRobotView":
             GRIP_BASE_TCP = pos_quat_to_pose_mat(
@@ -418,9 +415,9 @@ def compute_grasp_pose(
         RUM_BASE_TCP = pos_quat_to_pose_mat(np.array([0.0, 0, 0.12]), [1, 0, 0, 0])
         GRIP_BASE_TCP = RUM_BASE_TCP @ ROT_Z_90
     elif gripper == "droid":
-        # See note in get_all_grasp_poses(): only the bimanual fr3_duo xml
-        # rotates grasp_site by +90 deg about Z; single-arm droid-gripper
-        # robots keep the original convention.
+        # See note in get_all_grasp_poses(): only the bimanual fr3_duo gripper
+        # mounting requires Rz(-90) to align cached grasps with the actual
+        # finger frame; single-arm droid-gripper robots are identity.
         if type(robot_view).__name__ == "BimanualFrankaRobotView":
             GRIP_BASE_TCP = pos_quat_to_pose_mat(
                 [0, 0, 0],

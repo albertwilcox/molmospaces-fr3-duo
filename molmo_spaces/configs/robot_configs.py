@@ -441,12 +441,19 @@ class BimanualFrankaConfig(BaseRobotConfig):
     robot_xml_path: Path = Path("fr3_duo.xml")
     base_size: list[float] | None = [0.4, 0.5, 0.7]
     init_qpos: dict[str, list[float]] = {
-        "left_arm": [0, -0.7853, 0, -2.35619, 0, 1.57079, 0.0],
-        "right_arm": [0, -0.7853, 0, -2.35619, 0, 1.57079, 0.0],
+        "left_arm": [-1.298, -0.579, 1.538, -2.334, 1.503, 1.577, 0.514],
+        "right_arm": [1.166, -0.629, -1.439, -2.334, -1.541, 1.555, -0.628],
         "left_gripper": [0.0, 0.0],
         "right_gripper": [0.0, 0.0],
     }
-    init_qpos_noise_range: dict[str, list[float]] | None = None
+    # Per-joint half-widths for uniform randomization around init_qpos.
+    # Mirrors FrankaRobotConfig: weights selected to keep TCP displacement <=10cm.
+    init_qpos_noise_range: dict[str, list[float]] | None = {
+        "left_arm": [0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175],
+        "right_arm": [0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175],
+        "left_gripper": [0.0, 0.0],
+        "right_gripper": [0.0, 0.0],
+    }
     command_mode: dict[str, str] = {
         "arm": "joint_position",
         "gripper": "joint_position",
