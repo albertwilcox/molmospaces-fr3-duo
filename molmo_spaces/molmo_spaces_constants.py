@@ -627,6 +627,17 @@ def get_robot_path(robot_name) -> Path:
     """
     robot_dirs = os.listdir(ROBOTS_DIR) if ROBOTS_DIR.is_dir() else []
     if robot_name not in robot_dirs or not (ROBOTS_DIR / robot_name).is_dir():
+        # Fork-local robots (e.g. bimanual_franka) live in the source tree under
+        # assets/robots/<robot_name>/ and are not registered with the resource
+        # manager. Symlink them into ROBOTS_DIR so downstream lookups work.
+        local_src = ABS_PATH_OF_TOP_LEVEL_MOLMO_SPACES_DIR / "assets" / "robots" / robot_name
+        if local_src.is_dir():
+            ROBOTS_DIR.mkdir(parents=True, exist_ok=True)
+            target = ROBOTS_DIR / robot_name
+            if not target.exists():
+                os.symlink(local_src, target)
+            return target
+
         logging.info(
             f"Robot {robot_name} not found in {ROBOTS_DIR}. Attempting direct installation."
         )

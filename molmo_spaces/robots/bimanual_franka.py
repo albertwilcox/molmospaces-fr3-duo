@@ -35,8 +35,6 @@ class BimanualFrankaRobot(Robot):
         self._parallel_kinematics = DummyParallelKinematics(
             config.robot_config,
             self._kinematics,
-            mg_id="left_gripper",
-            unlocked_mg_ids=["left_arm"],
         )
 
         # Determine controller classes based on command mode
@@ -130,15 +128,16 @@ class BimanualFrankaRobot(Robot):
         cls,
         robot_config: "BimanualFrankaConfig",
         spec: MjSpec,
-        robot_spec: MjSpec,
         prefix: str,
         pos: list[float],
         quat: list[float],
         randomize_textures: bool = False,
+        strip_meshes: bool = False,
     ) -> None:
         robot_config = cast("BimanualFrankaConfig", robot_config)
         add_base = robot_config.base_size is not None
         pos = pos + [0.0] if len(pos) == 2 else pos
+        robot_spec = cls._load_robot_spec(robot_config, strip_meshes=strip_meshes)
 
         # Create mocap body — name must not collide with the robot's own "base" body
         robot_body = spec.worldbody.add_body(
