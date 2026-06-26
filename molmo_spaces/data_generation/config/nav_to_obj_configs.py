@@ -8,7 +8,10 @@ for use in the data generation pipeline.
 from pathlib import Path
 
 from molmo_spaces.configs import BasePolicyConfig, BaseRobotConfig
-from molmo_spaces.configs.base_nav_to_obj_config import NavToObjBaseConfig
+from molmo_spaces.configs.base_nav_to_obj_config import (
+    MobileFrankaNavToObjConfig,
+    NavToObjBaseConfig,
+)
 from molmo_spaces.configs.camera_configs import RBY1MjcfCameraSystem
 from molmo_spaces.configs.policy_configs import AStarNavToObjPolicyConfig
 from molmo_spaces.configs.robot_configs import RBY1Config
@@ -69,3 +72,18 @@ class NavToObjDataGenConfig(NavToObjBaseConfig):
     @property
     def tag(self) -> str:
         return "rby1_nav_to_obj_datagen"
+
+
+@register_config("MobileFrankaNavToObjDataGenConfig")
+class MobileFrankaNavToObjDataGenConfig(MobileFrankaNavToObjConfig):
+    """Data generation config for single-arm Mobile Franka navigation to object."""
+
+    output_dir: Path = ASSETS_DIR / "experiment_output" / "datagen" / "mobile_franka_nav_to_obj_v1"
+    wandb_project: str = "molmo-spaces-data-generation"
+
+    def model_post_init(self, __context) -> None:
+        """Initialize and validate configuration after Pydantic model initialization"""
+        super().model_post_init(__context)
+
+        if not self.task_sampler_config.house_inds:
+            self.task_sampler_config.house_inds = list(range(4))

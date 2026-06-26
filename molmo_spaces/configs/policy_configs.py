@@ -380,6 +380,11 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     path_min_dist_to_target_center: float = (
         0.8  # Skip approaching target center below this distance
     )
+    nav_goal_distance_threshold: float = (
+        0.5  # Standoff (m) used by NavGoalSampler when placing the goal pose near
+        # the target. Smaller => the robot stops closer to the object (e.g. within
+        # grasping range); larger => it stops further out.
+    )
     plan_max_retries: int = 3  # Allowed number of planning retries in episode
 
     # TODO the replanning criterion is weak, as it does not rely on actual collision,
@@ -393,6 +398,26 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     plan_stick_to_original_target: bool = (
         False  # Allows replanning to other possible valid targets when False
     )
+
+    # --- Robustness: goal-visibility gate (feasibility check #1) ---------------
+    # When True, sampled navigation goals are accepted only if the target object
+    # is actually visible (segmentation fraction above ``visibility_min_fraction``)
+    # from the candidate goal pose, checked by rendering the nav camera at that
+    # pose. This rejects "reached-but-blind" goals before the rollout starts,
+    # which are the dominant nav failure mode. Default False preserves behaviour.
+    nav_check_goal_visibility: bool = False
+    visibility_camera_name: str = "nav_camera"  # registry camera used for the check
+    visibility_min_fraction: float = 0.0  # min seg fraction (>) to accept a goal
+    nav_goal_max_attempts: int = 5  # candidate goals to try before giving up
+
+    # --- Robustness: clearance-aware smoothing (feasibility check #2) ----------
+    # When True, B-spline-smoothed waypoints whose footprint clearance drops to or
+    # below ``nav_smooth_min_clearance`` (metres beyond the inflated footprint) are
+    # snapped back onto the clearance-safe A* polyline. This stops the smoother
+    # from cutting corners into obstacles, the dominant cause of the 6-15 cm
+    # execution stalls. Default False preserves historical behaviour.
+    nav_smooth_clearance_repair: bool = False
+    nav_smooth_min_clearance: float = 0.05
 
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""

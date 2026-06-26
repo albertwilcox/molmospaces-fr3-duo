@@ -238,8 +238,10 @@ class NavToObjTask(BaseMujocoTask):
         """Check if the nearest navigation object is visible from head camera."""
         nearest_obj = self.get_nearest_nav_object(index)
 
-        # Use 'head_camera' (registry name), not 'robot_0/head_camera' (MJCF name)
-        visibility = self._env.check_visibility("head_camera", nearest_obj.name)
+        # Use the registry camera name (e.g. 'head_camera' / 'nav_camera'),
+        # not the MJCF name (e.g. 'robot_0/head_camera').
+        camera_name = self.config.task_config.visibility_camera_name
+        visibility = self._env.check_visibility(camera_name, nearest_obj.name)
         return visibility > 0.0  # Any non-zero visibility fraction
 
     def get_reward(self) -> np.ndarray:

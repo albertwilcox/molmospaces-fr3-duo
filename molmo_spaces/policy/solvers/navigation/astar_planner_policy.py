@@ -5,6 +5,8 @@ from scipy.interpolate import splev, splprep
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 
+import mujoco
+
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 from molmo_spaces.env.data_views import MlSpacesObject
 from molmo_spaces.planner.astar_planner import AStarPlanner
@@ -12,6 +14,7 @@ from molmo_spaces.policy.base_policy import PlannerPolicy
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.tasks.util_samplers.navgoal_sampler import NavGoalSampler
 from molmo_spaces.utils.linalg_utils import normalize_ang_error
+from molmo_spaces.utils.pose import pos_quat_to_pose_mat
 
 log = logging.getLogger(__name__)
 
@@ -132,7 +135,10 @@ class AStarPlannerPolicy(PlannerPolicy):
     def nav_goal_sampler(self) -> NavGoalSampler:
         if self._nav_goal_sampler is None:
             self._nav_goal_sampler = NavGoalSampler(
-                self.nav_planner.map, check_target_in_view=False, camera_name="head_camera"
+                self.nav_planner.map,
+                check_target_in_view=False,
+                camera_name="head_camera",
+                distance_threshold=self.config.policy_config.nav_goal_distance_threshold,
             )
 
         return self._nav_goal_sampler
@@ -142,15 +148,102 @@ class AStarPlannerPolicy(PlannerPolicy):
         if self._target_pos_quat is None:
             self.nav_goal_sampler.set_target(self.target_object)
             self.nav_goal_sampler.set_robot_view(self.robot_view)
-            for attempt in range(5):
-                self._target_pos_quat = self.nav_goal_sampler.sample()
-                if self._target_pos_quat is not None:
+            cfg = self.config.policy_config
+            for attempt in range(cfg.nav_goal_max_attempts):
+                candidate = self.nav_goal_sampler.sample()
+                if candidate is None:
+                    continue
+                if cfg.nav_check_goal_visibility and not self._goal_is_visible(*candidate):
                     log.info(
-                        f"[A* PLAN] Target position quaternion: {self._target_pos_quat} after {attempt} attempts"
+                        f"[A* PLAN] Rejected goal on attempt {attempt}: target not in view"
                     )
-                    break
+                    continue
+                self._target_pos_quat = candidate
+                log.info(
+                    f"[A* PLAN] Target position quaternion: {self._target_pos_quat} after {attempt} attempts"
+                )
+                break
 
         return self._target_pos_quat
+
+    def _goal_is_visible(self, position: np.ndarray, quaternion: np.ndarray) -> bool:
+        """Feasibility check (#1): would the target be visible from a candidate
+        goal pose?
+
+        Temporarily moves the base to the candidate pose, refreshes the nav-camera
+        frame, and renders a segmentation frame to measure how much of the target
+        is in view (reusing the same visibility definition the task uses to judge
+        success). Rejects "reached-but-blind" goals. The base pose is always
+        restored.
+        """
+        cfg = self.config.policy_config
+        target = self.target_object
+        if target is None:
+            return True
+
+        env = self.task.env
+        robot_view = self.robot_view
+        cam_name = cfg.visibility_camera_name
+
+        saved_pose = robot_view.base.pose.copy()
+        try:
+            robot_view.base.pose = pos_quat_to_pose_mat(position, quaternion)
+            mujoco.mj_forward(robot_view.mj_model, robot_view.mj_data)
+            env.camera_manager.registry.update_all_cameras(env)
+
+            visibility = env.check_visibility(cam_name, target.name)
+            if isinstance(visibility, dict):
+                visibility = visibility.get(target.name, 0.0)
+            return float(visibility) > cfg.visibility_min_fraction
+        except Exception as exc:  # never let the feasibility gate crash planning
+            log.warning(f"[A* PLAN] Visibility check errored ({exc}); accepting goal")
+            return True
+        finally:
+            robot_view.base.pose = saved_pose
+            mujoco.mj_forward(robot_view.mj_model, robot_view.mj_data)
+            try:
+                env.camera_manager.registry.update_all_cameras(env)
+            except Exception:
+                pass
+
+    def _world_clearance(self, xy: np.ndarray) -> float:
+        """Clearance (metres beyond the inflated footprint) at a world (x, y)
+        point, read from the planner's distance transform."""
+        planner = self.nav_planner
+        dt = planner.dt
+        px = planner.map.pos_m_to_px(np.array([xy[0], xy[1], 0.0]))
+        row = int(np.clip(np.floor(px[0] / planner.downscale), 0, dt.shape[0] - 1))
+        col = int(np.clip(np.floor(px[1] / planner.downscale), 0, dt.shape[1] - 1))
+        return float(dt[row, col] * planner.grid_spacing)
+
+    @staticmethod
+    def _nearest_point_on_polyline(point: np.ndarray, polyline: np.ndarray) -> np.ndarray:
+        """Nearest point to ``point`` on the polyline defined by ``polyline``."""
+        point = np.asarray(point, dtype=float)
+        best = np.asarray(polyline[0], dtype=float)
+        best_d2 = np.inf
+        for i in range(len(polyline) - 1):
+            a = np.asarray(polyline[i], dtype=float)
+            b = np.asarray(polyline[i + 1], dtype=float)
+            ab = b - a
+            denom = float(ab @ ab)
+            t = 0.0 if denom == 0.0 else float(np.clip((point - a) @ ab / denom, 0.0, 1.0))
+            proj = a + t * ab
+            d2 = float((point - proj) @ (point - proj))
+            if d2 < best_d2:
+                best_d2 = d2
+                best = proj
+        return best
+
+    def _repair_clearance(self, points: np.ndarray, safe_polyline: np.ndarray) -> np.ndarray:
+        """Snap any low-clearance smoothed point back onto the clearance-safe A*
+        polyline, leaving safe points untouched (clearance-aware smoothing, #2)."""
+        min_clear = self.config.policy_config.nav_smooth_min_clearance
+        repaired = np.asarray(points, dtype=float).copy()
+        for i in range(len(repaired)):
+            if self._world_clearance(repaired[i]) <= min_clear:
+                repaired[i] = self._nearest_point_on_polyline(repaired[i], safe_polyline)
+        return repaired
 
     def stop_plan(self, waypoints: np.ndarray) -> np.ndarray:
         r = self.config.policy_config.path_min_dist_to_target_center
@@ -220,7 +313,7 @@ class AStarPlannerPolicy(PlannerPolicy):
     def max_angle_waypoints(self, angles: np.ndarray) -> np.ndarray:
         assert angles.shape == (2, 1)
 
-        angle = float(abs(normalize_ang_error(angles[1] - angles[0])))
+        angle = float(abs(normalize_ang_error((angles[1] - angles[0]).item())))
         num_points = int(np.ceil(angle / self.config.policy_config.path_max_inter_waypoint_angle))
         if num_points <= 1:
             # Enofrce always at least one orientation correction
@@ -506,6 +599,17 @@ class AStarSmoothPlannerPolicy(AStarPlannerPolicy):
         # Tangent angle (radians)
         thetas = np.arctan2(dy_du, dx_du)
         # TODO handle large theta deltas
+
+        if self.config.policy_config.nav_smooth_clearance_repair:
+            # Clearance-aware smoothing (#2): pull any smoothed point that the
+            # spline pushed too close to (or into) an obstacle back onto the
+            # clearance-safe A* polyline, then recompute tangents from the
+            # repaired points so orientations stay consistent.
+            smoothed = np.stack([x_new, y_new], axis=1)
+            smoothed = self._repair_clearance(smoothed, world_waypoints)
+            x_new, y_new = smoothed[:, 0], smoothed[:, 1]
+            tangents = np.gradient(smoothed, axis=0)
+            thetas = np.arctan2(tangents[:, 1], tangents[:, 0])
 
         combined_waypoints = []
 

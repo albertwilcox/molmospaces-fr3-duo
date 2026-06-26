@@ -733,6 +733,30 @@ class RobotView(ABC):
         """
         return self._move_groups[mg_id]
 
+    def get_joint_position(self, move_group_ids: list[str]) -> np.ndarray:
+        """Get the current joint positions of the given move groups, concatenated."""
+        return np.concatenate(
+            [
+                self.get_move_group(move_group_id).joint_pos.copy()
+                for move_group_id in move_group_ids
+            ]
+        )
+
+    def is_close_to(
+        self, move_group_ids: list[str], target_pose: list, threshold: float = 0.05
+    ) -> bool:
+        """Check if the current joint positions of the move groups are close to the target pose."""
+        return self.distance_to(move_group_ids, target_pose) < threshold
+
+    def distance_to(self, move_group_ids: list[str], target_pose: list) -> float:
+        """Planar [x, y, theta] distance between the move groups and a target pose."""
+        assert len(target_pose) == 3, f"Expected [x, y, theta] pose, got {target_pose}"
+        current_joint_pos = self.get_joint_position(move_group_ids)
+        x_delta = current_joint_pos[0] - target_pose[0]
+        y_delta = current_joint_pos[1] - target_pose[1]
+        theta_delta = normalize_ang_error(current_joint_pos[2] - target_pose[2])
+        return float(np.linalg.norm(np.array([x_delta, y_delta, theta_delta])))
+
     def get_gripper(self, gripper_group_id: str):
         """Get a gripper by its ID.
 

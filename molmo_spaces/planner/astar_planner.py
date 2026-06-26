@@ -24,6 +24,13 @@ class AStarPlannerConfig(Config):
     agent_radius: float = 0.5
     px_per_m: int = 200
 
+    # Obstacle-clearance preference for A*. Edge cost ~ clearance**(-weight_exp),
+    # so a larger value makes the planner more strongly prefer routes that keep
+    # clear of walls/furniture (hugging corridor centres, swinging wider around
+    # obstacles) at the expense of slightly longer paths. weight_exp=2 is the
+    # historical default; raise it to steer around obstacles more conservatively.
+    weight_exp: int = 2
+
 
 class AStarPlanner(Planner):
     def __init__(
@@ -130,7 +137,9 @@ class AStarPlanner(Planner):
     @property
     def graph(self):
         if self._graph is None:
-            self._graph = dtutils.make_grid_graph(self.downscaled_grid, self.dt, weight_exp=2)
+            self._graph = dtutils.make_grid_graph(
+                self.downscaled_grid, self.dt, weight_exp=self.config.weight_exp
+            )
 
         return self._graph
 

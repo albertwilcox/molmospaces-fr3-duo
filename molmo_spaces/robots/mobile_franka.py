@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 import mujoco
 import numpy as np
 from mujoco import MjData, MjSpec, mjtGeom
+from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.controllers.abstract import Controller
 from molmo_spaces.controllers.joint_pos import JointPosController
@@ -222,6 +223,11 @@ class MobileFrankaRobot(Robot):
             trntype=mujoco.mjtTrn.mjTRN_JOINT,
             biastype=mujoco.mjtBias.mjBIAS_AFFINE,
         )
+        # The yaw target is an absolute heading in [-pi, pi]. Without an explicit
+        # ctrlrange the actuator defaults to a [0, 0] limit, which makes the
+        # position controller clip every heading command to 0 (the base can then
+        # never turn toward a waypoint). Match the RBY1 holonomic base (+/- pi).
+        theta_act.ctrlrange = np.array([-np.pi, np.pi])
         theta_act.gainprm[0] = theta_act_params["kp"]
         theta_act.biasprm[1] = -theta_act_params["kp"]
         # use damping ratio if available, otherwise use kd (which should be negative in biasprm)

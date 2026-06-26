@@ -183,6 +183,10 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     # Task parameters
     succ_pos_threshold: float = 1.5  # meters  # Success distance threshold in meters
 
+    # Name of the camera (registry name) used for the object-visibility success check.
+    # Defaults to the RBY1 head camera; mobile-base embodiments override this.
+    visibility_camera_name: str = "head_camera"
+
     # Rendering settings
     enable_rendering: bool = True  # Whether to enable environment rendering for visual sensors
 
