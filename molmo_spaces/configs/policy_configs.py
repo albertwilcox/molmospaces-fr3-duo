@@ -419,15 +419,39 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     nav_smooth_clearance_repair: bool = False
     nav_smooth_min_clearance: float = 0.05
 
+    # --- Robustness: success-threshold-aware goal selection (stage 1) ----------
+    # When sampling the standoff goal pose, prefer the candidate whose final base
+    # pose lands within ``succ_pos_threshold - nav_goal_success_margin`` of the
+    # object centre, so a cleanly-tracked path actually satisfies the success
+    # criterion instead of parking just outside the success ring. ``nav_goal_max_attempts``
+    # candidates are drawn and the closest-to-centre feasible one is kept.
+    nav_goal_success_margin: float = 0.1  # metres of slack inside succ_pos_threshold
+
+    # --- Closed-loop pure-pursuit tracker (stage 2) ----------------------------
+    # When True, the policy follows the A*/smoothed reference path with a
+    # closed-loop look-ahead "carrot" computed from the CURRENT base pose every
+    # step, instead of the open-loop advance-on-proximity waypoint consumption.
+    # This is robust to controller lag / waypoints the position servo cannot hit
+    # exactly (the dominant nav stall mode): progress is measured by arc-length
+    # projection onto the path, so the base never wedges on an unreachable setpoint.
+    use_pure_pursuit: bool = False
+    pursuit_lookahead_m: float = 0.4  # look-ahead distance along the path
+    pursuit_goal_tol_m: float = 0.12  # arc-length remaining (m) that counts as "at end"
+    pursuit_final_align_tol_rad: float = float(np.deg2rad(8))  # final-facing tolerance
+    pursuit_max_stall_steps: int = 30  # steps without arc-length progress before aborting
+
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""
         super().model_post_init(__context)
         if self.policy_cls is None:
             from molmo_spaces.policy.solvers.navigation.astar_planner_policy import (
                 AStarSmoothPlannerPolicy,
+                PurePursuitNavToObjPolicy,
             )
 
-            self.policy_cls = AStarSmoothPlannerPolicy
+            self.policy_cls = (
+                PurePursuitNavToObjPolicy if self.use_pure_pursuit else AStarSmoothPlannerPolicy
+            )
 
 
 class DummyPolicyConfig(BasePolicyConfig):

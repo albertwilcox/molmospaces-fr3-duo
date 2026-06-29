@@ -149,20 +149,37 @@ class AStarPlannerPolicy(PlannerPolicy):
             self.nav_goal_sampler.set_target(self.target_object)
             self.nav_goal_sampler.set_robot_view(self.robot_view)
             cfg = self.config.policy_config
+            succ_thr = self.config.task_config.succ_pos_threshold
+            margin = getattr(cfg, "nav_goal_success_margin", 0.0)
+            target_xy = np.asarray(self.target_object.position)[:2]
+
+            # Stage 1: draw several standoff candidates and keep the one closest
+            # to the object centre, accepting early once a candidate lands inside
+            # the success ring (succ_pos_threshold - margin). This converts the
+            # "arrived but parked just outside the success distance" near-misses
+            # into successes, and otherwise still picks the best reachable pose.
+            best_candidate = None
+            best_center_dist = np.inf
             for attempt in range(cfg.nav_goal_max_attempts):
                 candidate = self.nav_goal_sampler.sample()
                 if candidate is None:
                     continue
                 if cfg.nav_check_goal_visibility and not self._goal_is_visible(*candidate):
-                    log.info(
-                        f"[A* PLAN] Rejected goal on attempt {attempt}: target not in view"
-                    )
+                    log.info(f"[A* PLAN] Rejected goal on attempt {attempt}: target not in view")
                     continue
-                self._target_pos_quat = candidate
+                center_dist = float(np.linalg.norm(np.asarray(candidate[0])[:2] - target_xy))
+                if center_dist < best_center_dist:
+                    best_center_dist = center_dist
+                    best_candidate = candidate
+                if center_dist <= max(succ_thr - margin, 0.0):
+                    break
+
+            if best_candidate is not None:
+                self._target_pos_quat = best_candidate
                 log.info(
-                    f"[A* PLAN] Target position quaternion: {self._target_pos_quat} after {attempt} attempts"
+                    f"[A* PLAN] Selected goal {best_center_dist:.2f}m from target centre"
+                    f" (success threshold {succ_thr:.2f}m)"
                 )
-                break
 
         return self._target_pos_quat
 
@@ -629,3 +646,142 @@ class AStarSmoothPlannerPolicy(AStarPlannerPolicy):
             combined_waypoints.append(np.concatenate((final_pos, theta)))
 
         return np.array(combined_waypoints)
+
+
+class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
+    """Closed-loop pure-pursuit follower over the A*/smoothed reference path.
+
+    Reuses the parent's global planning, success-threshold-aware goal selection
+    and B-spline smoothing, but replaces the open-loop, advance-on-proximity
+    waypoint consumption (``current_waypoint``) with a look-ahead "carrot"
+    computed from the *current* base pose every step:
+
+      1. Project the current base (x, y) onto the smoothed reference polyline and
+         measure the arc-length travelled.
+      2. Place a carrot ``pursuit_lookahead_m`` further along the path and command
+         the holonomic base toward it (heading = bearing to the carrot).
+      3. Near the end, hold the final point and rotate to face the target, then
+         finish; abort if arc-length stops progressing for ``pursuit_max_stall_steps``.
+
+    Because progress is measured by arc-length projection rather than by reaching
+    discrete setpoints, the base never wedges on a waypoint the position servo
+    cannot hit exactly -- the dominant open-loop stall mode.
+    """
+
+    def reset(self):
+        super().reset()
+        self._ref_xy = None
+        self._final_face_theta = None
+        self._cum = None
+        self._max_s_reached = 0.0
+        self._stall_steps = 0
+
+    def build_policy_plan(self, world_waypoints):
+        # Build the parent's (x, y, theta) plan, then derive the spatial reference
+        # polyline the carrot follower tracks (dedupe the in-place rotation phases
+        # that keep x,y constant) and cache its cumulative arc-length.
+        plan = super().build_policy_plan(world_waypoints)
+        xy = np.asarray(plan)[:, :2]
+        keep = np.concatenate([[True], np.any(np.abs(np.diff(xy, axis=0)) > 1e-6, axis=1)])
+        ref_xy = xy[keep]
+        if len(ref_xy) < 2:
+            ref_xy = xy[:1] if len(xy) else np.zeros((1, 2))
+        self._ref_xy = ref_xy
+        self._final_face_theta = float(np.asarray(plan)[-1, 2])
+        seg = np.linalg.norm(np.diff(self._ref_xy, axis=0), axis=1)
+        self._seg = seg
+        self._cum = np.concatenate([[0.0], np.cumsum(seg)])
+        self._max_s_reached = 0.0
+        self._stall_steps = 0
+        return plan
+
+    def _current_yaw(self) -> float:
+        return float(R.from_matrix(self.robot_view.base.pose[:3, :3]).as_euler("xyz")[2])
+
+    def _project_arclength(self, point: np.ndarray) -> float:
+        """Arc-length of the closest point on the reference polyline to ``point``."""
+        path = self._ref_xy
+        best_s, best_d2 = 0.0, np.inf
+        for i in range(len(path) - 1):
+            a = path[i]
+            ab = path[i + 1] - a
+            denom = float(ab @ ab)
+            t = 0.0 if denom == 0.0 else float(np.clip((point - a) @ ab / denom, 0.0, 1.0))
+            proj = a + t * ab
+            d2 = float((point - proj) @ (point - proj))
+            if d2 < best_d2:
+                best_d2 = d2
+                best_s = float(self._cum[i] + t * self._seg[i])
+        return best_s
+
+    def _point_at_arclength(self, s: float) -> np.ndarray:
+        """Interpolate the reference polyline at arc-length ``s``."""
+        cum = self._cum
+        s = float(np.clip(s, 0.0, cum[-1]))
+        i = int(np.searchsorted(cum, s) - 1)
+        i = int(np.clip(i, 0, len(self._seg) - 1))
+        seg = self._seg[i]
+        t = 0.0 if seg == 0.0 else (s - cum[i]) / seg
+        return self._ref_xy[i] + t * (self._ref_xy[i + 1] - self._ref_xy[i])
+
+    def get_action(self, observation):
+        # Trigger (lazy) planning + goal selection via the parent machinery.
+        if self.nav_plan is None or self._ref_xy is None or len(self._ref_xy) < 2:
+            log.warning(
+                f"[PurePursuit DONE] No plan/path available at step {self.task.num_steps_taken()}"
+            )
+            return self._build_done_action()
+
+        cfg = self.config.policy_config
+        total = float(self._cum[-1])
+        cur_xy = self.robot_view.base.pose[:2, 3]
+        s_proj = self._project_arclength(cur_xy)
+        remaining = total - s_proj
+
+        # Arc-length stall detection (the base is wedged / not advancing).
+        if s_proj > self._max_s_reached + 1e-3:
+            self._max_s_reached = s_proj
+            self._stall_steps = 0
+        else:
+            self._stall_steps += 1
+
+        # Terminal phase: at the path end, hold position and align to face target.
+        if remaining <= cfg.pursuit_goal_tol_m:
+            final_xy = self._ref_xy[-1]
+            ang_err = abs(normalize_ang_error(self._final_face_theta - self._current_yaw()))
+            if ang_err <= cfg.pursuit_final_align_tol_rad:
+                log.info(
+                    f"[PurePursuit DONE] Reached path end in {self.task.num_steps_taken()} steps"
+                    f" ({self._reached_waypoints} carrots advanced)."
+                )
+                return self._build_done_action()
+            # Bound the final-alignment phase: if the base cannot achieve the
+            # facing tolerance (e.g. yaw servo limit), give up after the stall
+            # budget instead of spinning in place to the task horizon. ``_stall_steps``
+            # increments every terminal step (arc-length no longer advances), so it
+            # naturally bounds this phase.
+            if self._stall_steps > cfg.pursuit_max_stall_steps:
+                log.warning(
+                    f"[PurePursuit DONE] Reached path end but could not align"
+                    f" (|ang err|={ang_err:.2f}rad) after {self._stall_steps} steps;"
+                    f" finishing at step {self.task.num_steps_taken()}."
+                )
+                return self._build_done_action()
+            return {"done": False, "base": np.array([final_xy[0], final_xy[1], self._final_face_theta])}
+
+        if self._stall_steps > cfg.pursuit_max_stall_steps:
+            log.warning(
+                f"[PurePursuit DONE] Terminating: no arc-length progress for"
+                f" {self._stall_steps} steps at {remaining:.2f}m remaining."
+            )
+            return self._build_done_action()
+
+        # Look-ahead carrot along the path; command the base toward it.
+        carrot = self._point_at_arclength(s_proj + cfg.pursuit_lookahead_m)
+        delta = carrot - cur_xy
+        if np.linalg.norm(delta) > 1e-6:
+            heading = float(np.arctan2(delta[1], delta[0]))
+        else:
+            heading = self._final_face_theta
+        self._reached_waypoints += 1
+        return {"done": False, "base": np.array([carrot[0], carrot[1], heading])}

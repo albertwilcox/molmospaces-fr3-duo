@@ -187,6 +187,20 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     # Defaults to the RBY1 head camera; mobile-base embodiments override this.
     visibility_camera_name: str = "head_camera"
 
+    # When True, a nav episode only counts as success if the target is BOTH within
+    # ``succ_pos_threshold`` AND visible from ``visibility_camera_name``. When False,
+    # success is judged on distance alone (the visibility check is skipped). This
+    # exists to suppress false-negative failures caused by an uncalibrated /
+    # mis-framed nav camera; callers that disable it should warn loudly at launch.
+    require_object_visible: bool = True
+
+    # When True, the success distance is measured to the object's SURFACE (centre
+    # distance minus the object's in-plane bounding reach) instead of its centre.
+    # This avoids penalising large objects, whose closest collision-free base pose
+    # can lie beyond ``succ_pos_threshold`` from the centre even when the robot is
+    # right at the object. Default False (historical centre-distance behaviour).
+    succ_use_surface_distance: bool = False
+
     # Rendering settings
     enable_rendering: bool = True  # Whether to enable environment rendering for visual sensors
 

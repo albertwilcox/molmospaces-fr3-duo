@@ -184,6 +184,9 @@ class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
         plan_fail_after_waypoint_steps=25,
         nav_goal_distance_threshold=0.25,
         path_min_dist_to_target_center=0.4,
+        # Closed-loop carrot follower: robust to controller lag / unreachable
+        # setpoints, which was the dominant open-loop nav stall mode.
+        use_pure_pursuit=True,
     )
 
     task_sampler_config: NavToObjTaskSamplerConfig = NavToObjTaskSamplerConfig(

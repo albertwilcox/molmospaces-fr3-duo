@@ -232,7 +232,17 @@ class NavToObjTask(BaseMujocoTask):
         # Get the nearest object dynamically
         nearest_obj = self.get_nearest_nav_object(index)
 
-        return np.linalg.norm(nearest_obj.position[:2] - robot_base_pos[:2])
+        center_dist = float(np.linalg.norm(nearest_obj.position[:2] - robot_base_pos[:2]))
+        if not self.config.task_config.succ_use_surface_distance:
+            return center_dist
+
+        # Surface distance: subtract the object's in-plane reach so that being
+        # right at a large object counts as "arrived" even if its centre is far.
+        # ``aabb_size`` is the half-extent (local frame, initial pose); the larger
+        # in-plane half-side is a robust effective radius (~0 for small objects, so
+        # this is a no-op there). Clamp at 0 (never report negative distance).
+        effective_radius = float(np.max(np.asarray(nearest_obj.aabb_size)[:2]))
+        return max(0.0, center_dist - effective_radius)
 
     def check_object_visible(self, index: int) -> bool:
         """Check if the nearest navigation object is visible from head camera."""
@@ -256,8 +266,15 @@ class NavToObjTask(BaseMujocoTask):
             # Calculate distance-based reward (negative distance)
             distance = self.calculate_distance(i)
 
-            # Success: robot is close enough AND object is visible (visual navigation)
-            if not self.check_object_visible(i):
+            # Success: robot is close enough AND (optionally) the object is visible.
+            # The visibility check can be disabled via ``require_object_visible`` to
+            # avoid false negatives from an uncalibrated nav camera (see config).
+            object_visible = (
+                self.check_object_visible(i)
+                if self.config.task_config.require_object_visible
+                else True
+            )
+            if not object_visible:
                 reward = 0.0
             else:
                 # Linearly scale reward from 1 → 0 as distance goes from 0 → threshold
