@@ -547,13 +547,16 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             if self._phase in (PICK, PLACE):
                 try:
                     manip_action = self._manip_policy.get_action(observation)
-                except ValueError as e:
-                    # A mid-execution retry re-plans the trajectory (base-locked
-                    # IK from the parked pose) and can raise if the object/base
-                    # shifted enough to make it infeasible. Fail this phase
-                    # gracefully instead of aborting the whole episode.
+                except (ValueError, AssertionError) as e:
+                    # A mid-execution retry re-plans the base-locked trajectory
+                    # and can raise ValueError if the object/base shifted enough
+                    # to make it infeasible; primitive-execution invariants can
+                    # also trip an AssertionError (e.g. a degenerate 0-length
+                    # segment). Fail this phase gracefully (the episode is then
+                    # discarded by the datagen worker) instead of crashing.
                     log.warning(
-                        f"[MOBILE PNP FSM] {self._phase} re-plan failed mid-execution: {e}"
+                        f"[MOBILE PNP FSM] {self._phase} aborted mid-execution: "
+                        f"{type(e).__name__}: {e}"
                     )
                     self._phase = DONE
                     continue
