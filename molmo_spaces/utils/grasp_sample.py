@@ -490,17 +490,26 @@ def compute_grasp_pose(
                     n_checks_done += len(grasps)
                     feasible_mask = policy.check_feasible_ik(grasps)
                     if np.any(feasible_mask).item():
-                        found_feasible = True
                         feasible_grasps = grasps[feasible_mask]
+                        feasible_ids = noncolliding_close_grasp_ids[i : i + ik_batch_size][
+                            feasible_mask
+                        ]
                         for idx in range(len(feasible_grasps)):
                             if policy.check_feasible_ik(
                                 feasible_grasps[idx]
                             ):  # NOTE(yejin): for some reason, 0th index sometime returns false
                                 grasp_pose_world = feasible_grasps[idx]
-                                grasp_idx = noncolliding_close_grasp_ids[i : i + ik_batch_size][
-                                    feasible_mask
-                                ][idx]
+                                grasp_idx = feasible_ids[idx]
+                                # Only mark feasible once a grasp survives the
+                                # (possibly stricter, e.g. base-locked) scalar
+                                # confirmation -- the batch pre-filter can be
+                                # optimistic, so a batch hit does NOT guarantee a
+                                # scalar-feasible grasp. Setting found_feasible on
+                                # the batch alone left grasp_idx=None and crashed.
+                                found_feasible = True
                                 break
+                    if found_feasible:
+                        break
 
             log.info(
                 f"Feasibility-checked {n_checks_done} grasps in {ik_check_time.value:.3f}s, found feasible grasp: {found_feasible}"
