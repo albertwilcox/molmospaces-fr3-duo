@@ -316,6 +316,7 @@ def get_all_grasp_poses(
         "pick_and_place",
         "pick_and_place_next_to",
         "pick_and_place_color",
+        "mobile_pick_and_place",
     ]:
         thor_dict = scene_metadata["objects"].get(pickup_obj.name, None) if scene_metadata else None
         thor_name = thor_dict["asset_id"] if thor_dict else get_thor_name(model, pickup_obj)
