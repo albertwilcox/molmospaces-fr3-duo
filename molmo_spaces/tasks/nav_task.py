@@ -24,6 +24,87 @@ class NavToObjTask(BaseMujocoTask):
 
         self.nav_objs = self._get_nav_objects()
 
+        # Planned pre-grasp goal pose published by the navigation policy (world
+        # frame). Populated via :meth:`set_planned_nav_goal`; consumed by the
+        # goal-pose-reaching success criterion (``succ_use_goal_pose``). ``None``
+        # until the policy commits to a goal (falls back to distance success).
+        self._planned_goal_xy: np.ndarray | None = None
+        self._planned_goal_yaw: float | None = None
+
+    def set_planned_nav_goal(self, position: np.ndarray, quaternion: np.ndarray) -> None:
+        """Record the pre-grasp goal pose the navigation policy committed to.
+
+        Called by the A* / pure-pursuit policy whenever it (re)selects a goal.
+        ``position`` is a world-frame (x, y, z); ``quaternion`` is world-frame
+        [w, x, y, z]. Only the planar (x, y) and yaw are retained — the success
+        criterion is a planar base-pose match. Safe to call every step.
+
+        NOTE: the pure-pursuit follower supersedes this with
+        :meth:`set_planned_nav_goal_pose` using the true tracked plan endpoint and
+        facing, which is in the base-frame convention that matches the robot pose.
+        """
+        pos = np.asarray(position, dtype=float).reshape(-1)
+        quat = np.asarray(quaternion, dtype=float).reshape(-1)
+        self._planned_goal_xy = pos[:2].copy()
+        # Yaw about world +z from a [w, x, y, z] quaternion.
+        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+        self._planned_goal_yaw = float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+    def set_planned_nav_goal_pose(self, xy: np.ndarray, yaw: float) -> None:
+        """Record the planar pre-grasp goal pose directly (x, y, yaw).
+
+        Preferred over :meth:`set_planned_nav_goal`: the pure-pursuit follower
+        passes the exact plan endpoint it tracks and the ``_final_face_theta`` it
+        aligns to, both in the same base-frame convention as the robot base pose,
+        so the goal-reach and heading-error checks are convention-consistent.
+        """
+        xy = np.asarray(xy, dtype=float).reshape(-1)
+        self._planned_goal_xy = xy[:2].copy()
+        self._planned_goal_yaw = float(yaw)
+
+    def _robot_base_xy_yaw(self, index: int) -> tuple[np.ndarray, float]:
+        robot = self._env.robots[index]
+        pose = robot.robot_view.base.pose
+        xy = np.asarray(pose[:2, 3], dtype=float)
+        yaw = float(np.arctan2(pose[1, 0], pose[0, 0]))
+        return xy, yaw
+
+    def distance_to_goal(self, index: int) -> float:
+        """Planar distance (m) from the robot base to the planned goal pose.
+
+        Returns ``inf`` when no goal has been published, so callers treat an
+        un-published goal as "not reached".
+        """
+        if self._planned_goal_xy is None:
+            return float("inf")
+        xy, _ = self._robot_base_xy_yaw(index)
+        return float(np.linalg.norm(xy - self._planned_goal_xy))
+
+    def goal_yaw_error(self, index: int) -> float:
+        """Absolute wrapped heading error (rad) between the base and the goal."""
+        if self._planned_goal_yaw is None:
+            return float("inf")
+        _, yaw = self._robot_base_xy_yaw(index)
+        err = self._planned_goal_yaw - yaw
+        return float(abs(np.arctan2(np.sin(err), np.cos(err))))
+
+    def planned_goal_surface_distance(self, index: int) -> float:
+        """Surface distance (m) from the planned goal pose to the target object.
+
+        Mirrors :meth:`calculate_distance`'s surface convention but measured from
+        the *goal* pose rather than the robot, so the validity guard can reject
+        goals whose standoff exceeds ``max_pregrasp_standoff_m``. Returns ``inf``
+        if no goal is published.
+        """
+        if self._planned_goal_xy is None:
+            return float("inf")
+        nearest_obj = self.get_nearest_nav_object(index)
+        center_dist = float(np.linalg.norm(np.asarray(nearest_obj.position)[:2] - self._planned_goal_xy))
+        if not self.config.task_config.succ_use_surface_distance:
+            return center_dist
+        effective_radius = float(np.max(np.asarray(nearest_obj.aabb_size)[:2]))
+        return max(0.0, center_dist - effective_radius)
+
     def _reconstruct_candidate_list_if_needed(self, env: BaseMujocoEnv) -> None:
         """Reconstruct candidate list from category for eval mode.
 
@@ -263,17 +344,31 @@ class NavToObjTask(BaseMujocoTask):
         rewards = []
 
         for i in range(self._env.n_batch):
-            # Calculate distance-based reward (negative distance)
-            distance = self.calculate_distance(i)
-
-            # Success: robot is close enough AND (optionally) the object is visible.
-            # The visibility check can be disabled via ``require_object_visible`` to
-            # avoid false negatives from an uncalibrated nav camera (see config).
             object_visible = (
                 self.check_object_visible(i)
                 if self.config.task_config.require_object_visible
                 else True
             )
+
+            if self.config.task_config.succ_use_goal_pose and self._planned_goal_xy is not None:
+                # Goal-pose-reaching success (pre-grasp semantics): the robot must
+                # arrive at the planned pre-grasp goal pose, and that goal must be a
+                # valid pre-grasp (within ``max_pregrasp_standoff_m`` of the object
+                # surface). Decoupled from object-centre distance so on-furniture
+                # targets, whose closest navigable pose is the furniture edge, are
+                # judged on positioning quality rather than an unreachable distance.
+                tc = self.config.task_config
+                goal_standoff = self.planned_goal_surface_distance(i)
+                reached = (
+                    self.distance_to_goal(i) <= tc.succ_goal_pos_threshold
+                    and self.goal_yaw_error(i) <= tc.succ_goal_yaw_threshold
+                    and goal_standoff <= tc.max_pregrasp_standoff_m
+                )
+                rewards.append(1.0 if (reached and object_visible) else 0.0)
+                continue
+
+            # Distance-to-object success (legacy / when no goal is published).
+            distance = self.calculate_distance(i)
             if not object_visible:
                 reward = 0.0
             else:
@@ -297,7 +392,15 @@ class NavToObjTask(BaseMujocoTask):
         if not success:
             distance = self.calculate_distance(0)
             object_visible = self.check_object_visible(0)
-            log.info(f"[Nav fail] Distance: {distance:.2f}m, Object visible: {object_visible}")
+            if self.config.task_config.succ_use_goal_pose and self._planned_goal_xy is not None:
+                log.info(
+                    f"[Nav fail] goal_dist={self.distance_to_goal(0):.2f}m "
+                    f"yaw_err={self.goal_yaw_error(0):.2f}rad "
+                    f"goal_standoff={self.planned_goal_surface_distance(0):.2f}m "
+                    f"obj_dist={distance:.2f}m visible={object_visible}"
+                )
+            else:
+                log.info(f"[Nav fail] Distance: {distance:.2f}m, Object visible: {object_visible}")
 
         return success
 

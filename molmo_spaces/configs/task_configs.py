@@ -201,6 +201,23 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     # right at the object. Default False (historical centre-distance behaviour).
     succ_use_surface_distance: bool = False
 
+    # --- Goal-pose-reaching success (pre-grasp semantics) ----------------------
+    # When True, nav success is judged on whether the robot REACHED ITS PLANNED
+    # PRE-GRASP GOAL POSE, decoupled from object-centre distance. This is the
+    # correct criterion for mobile manipulation: for a target on furniture the
+    # closest navigable pose is the furniture *edge* (the pre-grasp standoff), so
+    # the robot can never get within ``succ_pos_threshold`` of the object centre
+    # even though it is perfectly positioned to grasp. The navigation policy
+    # publishes the goal pose it committed to via ``set_planned_nav_goal`` and
+    # success requires the base to arrive within ``succ_goal_pos_threshold`` and
+    # ``succ_goal_yaw_threshold`` of it. A validity guard rejects goals whose
+    # surface standoff to the object exceeds ``max_pregrasp_standoff_m`` (a target
+    # with no reachable pre-grasp pose is a genuine failure, not a free success).
+    succ_use_goal_pose: bool = False
+    succ_goal_pos_threshold: float = 0.30  # metres; base->goal planar tolerance
+    succ_goal_yaw_threshold: float = float(np.deg2rad(20))  # heading tolerance
+    max_pregrasp_standoff_m: float = 1.75  # max object-surface standoff for a valid goal
+
     # Rendering settings
     enable_rendering: bool = True  # Whether to enable environment rendering for visual sensors
 

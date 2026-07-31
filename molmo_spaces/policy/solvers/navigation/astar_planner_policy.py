@@ -176,6 +176,11 @@ class AStarPlannerPolicy(PlannerPolicy):
 
             if best_candidate is not None:
                 self._target_pos_quat = best_candidate
+                # Publish the committed pre-grasp goal to the task so the
+                # goal-pose-reaching success criterion (succ_use_goal_pose) can
+                # judge arrival on this pose rather than object-centre distance.
+                if hasattr(self.task, "set_planned_nav_goal"):
+                    self.task.set_planned_nav_goal(best_candidate[0], best_candidate[1])
                 log.info(
                     f"[A* PLAN] Selected goal {best_center_dist:.2f}m from target centre"
                     f" (success threshold {succ_thr:.2f}m)"
@@ -693,6 +698,12 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._cum = np.concatenate([[0.0], np.cumsum(seg)])
         self._max_s_reached = 0.0
         self._stall_steps = 0
+        # Publish the ACTUAL pre-grasp goal pose the follower drives to (plan
+        # endpoint + final facing) so the task's goal-pose-reaching success
+        # criterion judges arrival on the pose really tracked -- not the raw goal
+        # sampler quaternion, whose facing convention differs from the base frame.
+        if hasattr(self.task, "set_planned_nav_goal_pose") and len(self._ref_xy):
+            self.task.set_planned_nav_goal_pose(self._ref_xy[-1], self._final_face_theta)
         return plan
 
     def _current_yaw(self) -> float:
