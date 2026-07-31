@@ -47,6 +47,12 @@ class ObjectManipulationPlannerPolicyConfig(BasePolicyConfig):
     grasp_z_offset: float = 0.03  # Lower distance from pregrasp to grasp
     place_z_offset: float = 0.07  # Lower distance from preplace to place
     end_z_offset: float = 0.05  # Height above place target for final pose
+    # Fallback place-target search over the receptacle top when the receptacle
+    # centre is out of the (base-locked) arm's reach: sample an n x n grid over
+    # the top footprint (shrunk by the object half-extent + this margin) and
+    # place at the reachable point nearest the base.
+    place_edge_margin_m: float = 0.03
+    place_search_grid_n: int = 5
 
     # Speed settings
     speed_slow: float = 0.08  # m/s for precise movements
@@ -439,6 +445,14 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     pursuit_goal_tol_m: float = 0.12  # arc-length remaining (m) that counts as "at end"
     pursuit_final_align_tol_rad: float = float(np.deg2rad(8))  # final-facing tolerance
     pursuit_max_stall_steps: int = 30  # steps without arc-length progress before aborting
+    # Budget for the terminal in-place rotation, counted separately from the
+    # mid-path stall budget. A holonomic base's absolute-heading position servo
+    # slews at a bounded rate, so a large final turn (up to ~pi) needs many more
+    # steps than the mid-path stall budget allows; sharing the stall budget made
+    # the base give up mid-turn with a large heading error, which then dooms the
+    # downstream grasp/place (the arm cannot reach an object the base is not
+    # facing). Sized to complete a ~pi in-place rotation.
+    pursuit_final_align_max_steps: int = 90
 
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""

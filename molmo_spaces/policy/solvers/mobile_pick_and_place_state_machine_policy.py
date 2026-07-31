@@ -248,6 +248,49 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
             ),
         ]
 
+    def _nearest_reachable_place_pose(
+        self,
+        place_pose: np.ndarray,
+        receptacle_center: np.ndarray,
+        receptacle_size: np.ndarray,
+        pickup_obj_size: np.ndarray,
+    ) -> np.ndarray | None:
+        """Search the receptacle top surface for the IK-reachable place point
+        closest to the base, keeping the object fully on the receptacle.
+
+        Returns a 4x4 place pose (orientation/height preserved from ``place_pose``)
+        or ``None`` if no candidate on the surface is reachable.
+        """
+        # Shrink the searchable footprint by the object's half-extent (plus a small
+        # margin) so the placed object stays within the receptacle top.
+        margin = self.policy_config.place_edge_margin_m
+        half_x = max(receptacle_size[0] / 2 - pickup_obj_size[0] / 2 - margin, 0.0)
+        half_y = max(receptacle_size[1] / 2 - pickup_obj_size[1] / 2 - margin, 0.0)
+        n = self.policy_config.place_search_grid_n
+        xs = np.linspace(-half_x, half_x, n) + receptacle_center[0]
+        ys = np.linspace(-half_y, half_y, n) + receptacle_center[1]
+        base_xy = self.robot_view.base.pose[:2, 3]
+
+        candidates = []
+        for x in xs:
+            for y in ys:
+                candidates.append((x, y))
+        # Nearest-to-base first: most likely inside the arm workspace.
+        candidates.sort(key=lambda p: (p[0] - base_xy[0]) ** 2 + (p[1] - base_xy[1]) ** 2)
+
+        for x, y in candidates:
+            candidate = place_pose.copy()
+            candidate[0, 3] = x
+            candidate[1, 3] = y
+            if self.check_feasible_ik(candidate):
+                log.info(
+                    "[MOBILE PNP FSM] Placing at nearest reachable receptacle point "
+                    f"({x:.2f}, {y:.2f}) instead of centre "
+                    f"({receptacle_center[0]:.2f}, {receptacle_center[1]:.2f})."
+                )
+                return candidate
+        return None
+
     def _get_placement_poses(
         self,
         grasp_pose_world: np.ndarray,
@@ -284,7 +327,21 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
         place_pose[2, 3] = receptacle_top_z + pickup_obj_clearance_offset
         place_pose[:3, 3] += centering
         if not self.check_feasible_ik(place_pose):
-            raise ValueError("IK failed for place pose (parked base out of reach)")
+            # The receptacle centre can sit past the arm's reach when the base is
+            # parked at the closest navigable cell (large tables/counters). Rather
+            # than give up, place at the nearest IK-reachable point on the
+            # receptacle top surface: any point within the top footprint (shrunk
+            # by the object's half-extent so it still lands on the receptacle)
+            # satisfies the "object on receptacle" success predicate. Prefer the
+            # candidate closest to the base (most central to the arm workspace).
+            place_pose = self._nearest_reachable_place_pose(
+                place_pose=place_pose,
+                receptacle_center=place_receptacle_aabb_center,
+                receptacle_size=place_receptacle_aabb_size,
+                pickup_obj_size=pickup_obj_aabb_size,
+            )
+            if place_pose is None:
+                raise ValueError("IK failed for place pose (parked base out of reach)")
 
         base_z_offset = self.policy_config.place_z_offset
         preplace_pose = place_pose.copy()
@@ -488,7 +545,18 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 continue
 
             if self._phase in (PICK, PLACE):
-                manip_action = self._manip_policy.get_action(observation)
+                try:
+                    manip_action = self._manip_policy.get_action(observation)
+                except ValueError as e:
+                    # A mid-execution retry re-plans the trajectory (base-locked
+                    # IK from the parked pose) and can raise if the object/base
+                    # shifted enough to make it infeasible. Fail this phase
+                    # gracefully instead of aborting the whole episode.
+                    log.warning(
+                        f"[MOBILE PNP FSM] {self._phase} re-plan failed mid-execution: {e}"
+                    )
+                    self._phase = DONE
+                    continue
                 manip_done = manip_action.pop("done", False)
                 manip_failed = manip_action.pop("success", None) is False
                 # Never command the base during manipulation: drop the key so

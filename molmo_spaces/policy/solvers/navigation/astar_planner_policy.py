@@ -680,6 +680,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._cum = None
         self._max_s_reached = 0.0
         self._stall_steps = 0
+        self._terminal_steps = 0
 
     def build_policy_plan(self, world_waypoints):
         # Build the parent's (x, y, theta) plan, then derive the spatial reference
@@ -698,6 +699,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._cum = np.concatenate([[0.0], np.cumsum(seg)])
         self._max_s_reached = 0.0
         self._stall_steps = 0
+        self._terminal_steps = 0
         # Publish the ACTUAL pre-grasp goal pose the follower drives to (plan
         # endpoint + final facing) so the task's goal-pose-reaching success
         # criterion judges arrival on the pose really tracked -- not the raw goal
@@ -758,6 +760,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
 
         # Terminal phase: at the path end, hold position and align to face target.
         if remaining <= cfg.pursuit_goal_tol_m:
+            self._terminal_steps += 1
             final_xy = self._ref_xy[-1]
             ang_err = abs(normalize_ang_error(self._final_face_theta - self._current_yaw()))
             if ang_err <= cfg.pursuit_final_align_tol_rad:
@@ -766,15 +769,14 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
                     f" ({self._reached_waypoints} carrots advanced)."
                 )
                 return self._build_done_action()
-            # Bound the final-alignment phase: if the base cannot achieve the
-            # facing tolerance (e.g. yaw servo limit), give up after the stall
-            # budget instead of spinning in place to the task horizon. ``_stall_steps``
-            # increments every terminal step (arc-length no longer advances), so it
-            # naturally bounds this phase.
-            if self._stall_steps > cfg.pursuit_max_stall_steps:
+            # Bound the final-alignment phase with its OWN budget (not the mid-path
+            # stall budget): the absolute-heading position servo slews at a bounded
+            # rate, so a large in-place turn needs many steps. Giving up too early
+            # parks the base facing away from the target and dooms the grasp/place.
+            if self._terminal_steps > cfg.pursuit_final_align_max_steps:
                 log.warning(
                     f"[PurePursuit DONE] Reached path end but could not align"
-                    f" (|ang err|={ang_err:.2f}rad) after {self._stall_steps} steps;"
+                    f" (|ang err|={ang_err:.2f}rad) after {self._terminal_steps} align steps;"
                     f" finishing at step {self.task.num_steps_taken()}."
                 )
                 return self._build_done_action()
