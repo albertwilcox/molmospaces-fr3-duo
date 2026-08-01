@@ -59,6 +59,14 @@ class MobilePickAndPlaceTaskConfig(PickAndPlaceTaskConfig):
     succ_goal_yaw_threshold: float = float(np.deg2rad(25))
     max_pregrasp_standoff_m: float = 1.75
 
+    # Feasibility-verified base poses recorded by the sampler (7D x,y,z,qw,qx,qy,qz,
+    # world frame). ``robot_base_pose`` (inherited) is the grasp-feasible pose near
+    # the pickup object; ``place_robot_base_pose`` is the place-feasible pose near
+    # the receptacle. The FSM navigates the base to these instead of re-sampling
+    # the closest navigable cell, transferring the fixed-base pipeline's
+    # feasibility guarantee to the mobile pipeline.
+    place_robot_base_pose: list[float] | None = None
+
 
 class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     """Sampler config: reuse the pick-and-place object/receptacle selection but

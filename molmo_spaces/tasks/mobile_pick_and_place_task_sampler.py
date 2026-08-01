@@ -67,6 +67,45 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         pickup_obj_goal_pose[2] += 0.05
         task_cfg.pickup_obj_goal_pose = pickup_obj_goal_pose.tolist()
 
+    def _sample_place_robot_base_pose(self, env: CPUMujocoEnv) -> None:
+        """Record a place-feasible base pose near the receptacle.
+
+        Mirrors :meth:`_sample_and_place_robot` for the receptacle: place the
+        mobile base at a collision-free, receptacle-facing standoff (floor
+        height) and record it in ``task_config.place_robot_base_pose`` so the FSM
+        can navigate the base there for the PLACE phase, instead of parking at the
+        closest navigable cell (which leaves the receptacle past the arm's reach).
+        On failure the field is left ``None`` and the FSM falls back to sampling.
+        """
+        task_cfg = self.config.task_config
+        sampler_cfg = self.config.task_sampler_config
+        om = env.object_managers[env.current_batch_index]
+        receptacle = om.get_object_by_name(task_cfg.place_receptacle_name)
+        robot_view = env.current_robot.robot_view
+
+        placed = env.place_robot_near(
+            robot_view=robot_view,
+            target=receptacle,
+            max_tries=sampler_cfg.max_robot_placement_attempts,
+            sampling_radius_range=sampler_cfg.manip_standoff_radius_range,
+            robot_safety_radius=sampler_cfg.robot_safety_radius,
+            preserve_z=sampler_cfg.mobile_base_z,
+            face_target=True,
+            check_camera_visibility=False,
+        )
+        if placed:
+            task_cfg.place_robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
+            log.info(
+                f"[MOBILE PNP] Recorded place-feasible base pose near "
+                f"'{receptacle.name}' at {robot_view.base.pose[:2, 3]}."
+            )
+        else:
+            task_cfg.place_robot_base_pose = None
+            log.warning(
+                f"[MOBILE PNP] Could not place robot near receptacle "
+                f"'{receptacle.name}'; PLACE nav will fall back to goal sampling."
+            )
+
     def _place_robot_at_nav_start(self, env: CPUMujocoEnv) -> None:
         """Move the mobile base to a far, navigable start pose facing anywhere.
 
@@ -104,6 +143,10 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         # Select pickup object + place receptacle and populate the task config
         # (this also places the robot near the object for grasp feasibility).
         self._configure_pick_and_place(env)
+
+        # Record a place-feasible base pose near the receptacle (while the scene
+        # is settled) so the FSM can navigate there for the PLACE phase.
+        self._sample_place_robot_base_pose(env)
 
         # Now relocate the base to a navigable start pose far from the object.
         self._place_robot_at_nav_start(env)

@@ -47,6 +47,13 @@ class MobilePickAndPlaceTask(PickAndPlaceTask):
         self._nav_target_name: str = self.config.task_config.pickup_obj_name
         self.nav_objs: list[list[MlSpacesObject]] = self._build_nav_objs(self._nav_target_name)
 
+        # Optional feasibility-verified nav goal the FSM asks navigation to drive
+        # to (a (position[3], quaternion[4]) tuple, world frame). When set, the
+        # nav policy targets this exact pose instead of re-sampling a standoff
+        # goal at the closest navigable cell; if it turns out to be unreachable,
+        # the nav policy transparently falls back to goal sampling.
+        self._nav_goal_override: tuple[np.ndarray, np.ndarray] | None = None
+
     # ------------------------------------------------------------------ #
     # Navigation target management                                        #
     # ------------------------------------------------------------------ #
@@ -61,12 +68,32 @@ class MobilePickAndPlaceTask(PickAndPlaceTask):
         """Point navigation at ``object_name`` (pickup object or receptacle).
 
         Rebuilds ``nav_objs`` and clears any previously published goal pose so
-        the navigation sub-policy re-plans from scratch for the new target.
+        the navigation sub-policy re-plans from scratch for the new target. Any
+        feasibility-verified goal override is also cleared; the FSM re-sets it (if
+        available for the new target) immediately after calling this.
         """
         self._nav_target_name = object_name
         self.nav_objs = self._build_nav_objs(object_name)
         self._planned_goal_xy = None
         self._planned_goal_yaw = None
+        self._nav_goal_override = None
+
+    @property
+    def nav_goal_override(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Feasibility-verified (position, quaternion) nav goal, or ``None``."""
+        return self._nav_goal_override
+
+    def set_nav_goal_override(self, pose_7d: list[float] | np.ndarray | None) -> None:
+        """Set the nav goal to a recorded feasibility-verified base pose.
+
+        ``pose_7d`` is a 7D ``(x, y, z, qw, qx, qy, qz)`` world pose (as recorded
+        by the sampler); ``None`` clears the override.
+        """
+        if pose_7d is None:
+            self._nav_goal_override = None
+            return
+        pose = np.asarray(pose_7d, dtype=float).reshape(-1)
+        self._nav_goal_override = (pose[:3].copy(), pose[3:7].copy())
 
     def reset(self):
         result = super().reset()

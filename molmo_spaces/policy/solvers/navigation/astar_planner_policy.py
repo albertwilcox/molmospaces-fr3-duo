@@ -92,6 +92,7 @@ class AStarPlannerPolicy(PlannerPolicy):
         self._candidate_objs = None
         self._skipped_candidates = set()
         self._replan_after = None
+        self._nav_goal_override_tried = False
         self.nav_planner.blacklist.clear()
 
     @property
@@ -146,6 +147,23 @@ class AStarPlannerPolicy(PlannerPolicy):
     @property
     def target_pos_quat(self):
         if self._target_pos_quat is None:
+            # Feasibility-verified goal override (Avenue A): if the task provides a
+            # base pose the sampler already proved is manip-feasible, drive to it
+            # instead of re-sampling a standoff goal at the closest navigable cell.
+            # Used at most once per nav phase; if unreachable, ``nav_plan`` clears
+            # ``_target_pos_quat`` and this falls through to goal sampling below.
+            override = getattr(self.task, "nav_goal_override", None)
+            if override is not None and not getattr(self, "_nav_goal_override_tried", False):
+                self._nav_goal_override_tried = True
+                self._target_pos_quat = (np.asarray(override[0]), np.asarray(override[1]))
+                if hasattr(self.task, "set_planned_nav_goal"):
+                    self.task.set_planned_nav_goal(override[0], override[1])
+                log.info(
+                    f"[A* PLAN] Using feasibility-verified nav goal override at "
+                    f"({override[0][0]:.2f}, {override[0][1]:.2f})"
+                )
+                return self._target_pos_quat
+
             self.nav_goal_sampler.set_target(self.target_object)
             self.nav_goal_sampler.set_robot_view(self.robot_view)
             cfg = self.config.policy_config

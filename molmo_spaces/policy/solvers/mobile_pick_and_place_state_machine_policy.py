@@ -482,6 +482,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
     def reset(self) -> None:
         self._phase = NAV_TO_OBJ
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
+        # Drive to the grasp-feasibility-verified base pose the sampler recorded
+        # (Avenue A), not the closest navigable cell.
+        self.task.set_nav_goal_override(getattr(self.config.task_config, "robot_base_pose", None))
         self._nav_policy.reset()
         log.info("[MOBILE PNP FSM] reset → phase NAV_TO_OBJ")
 
@@ -576,6 +579,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
                 if self._phase == PICK:
                     self.task.set_nav_target(self.config.task_config.place_receptacle_name)
+                    # Drive to the place-feasibility-verified base pose near the
+                    # receptacle (Avenue A); None => fall back to goal sampling.
+                    self.task.set_nav_goal_override(
+                        getattr(self.config.task_config, "place_robot_base_pose", None)
+                    )
                     self._nav_policy.reset()
                     self._phase = NAV_TO_RECEPTACLE
                     log.info("[MOBILE PNP FSM] PICK done → phase NAV_TO_RECEPTACLE")
