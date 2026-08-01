@@ -568,57 +568,113 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
     # ------------------------------------------------------------------ #
     # Phase transitions                                                   #
     # ------------------------------------------------------------------ #
-    def _snap_base_to_feasible_pose(self, pose_7d: list[float] | None) -> None:
-        """Snap the (frozen) base exactly onto the sampler's feasibility-verified
-        pose before manipulation.
+    def _snap_base_pose(self, pose_mat: np.ndarray) -> None:
+        """Snap the (frozen) base to ``pose_mat`` and hold it there.
 
-        Navigation parks the base *near* the verified pose but off by the A* grid
-        resolution plus residual heading error, which is enough to push the
-        target past the arm's reach. Because the base is held stationary through
-        the whole manip phase, snapping its qpos AND actuator setpoint to the
-        exact verified pose makes manipulation start from a pose the sampler
-        already proved is IK-feasible, without altering the (already-completed)
-        navigation trajectory. No-op when no verified pose is available.
+        Sets base qpos AND the holonomic actuator setpoint (else the position
+        servo drives the base back to the stale nav setpoint during manip), then
+        forwards so kinematics/IK see the new base pose.
         """
-        if pose_7d is None:
-            return
         robot_view = self.task.env.current_robot.robot_view
-        pose_mat = pos_quat_to_pose_mat(np.asarray(pose_7d, dtype=float))
         robot_view.base.pose = pose_mat
-        # Hold the holonomic base here (else the position servo drives it back to
-        # the stale nav setpoint during manipulation).
-        x, y = pose_mat[0, 3], pose_mat[1, 3]
+        x, y = float(pose_mat[0, 3]), float(pose_mat[1, 3])
         theta = float(np.arctan2(pose_mat[1, 0], pose_mat[0, 0]))
         robot_view.base.ctrl = np.array([x, y, theta])
         mujoco.mj_forward(self.task.env.current_model, self.task.env.current_data)
-        log.info(f"[MOBILE PNP FSM] Snapped base to verified pose ({x:.2f}, {y:.2f}).")
+
+    def _manip_base_candidates(
+        self, target_name: str, verified_pose_7d: list[float] | None
+    ) -> list[np.ndarray]:
+        """Candidate base poses for manipulating ``target_name``.
+
+        The sampler's feasibility-verified pose (if any) is tried first, then a
+        ring of receptacle/object-facing standoffs, ordered by proximity to the
+        current parked base so the snap (and any resulting data discontinuity) is
+        as small as possible.
+        """
+        om = self.task.env.object_managers[self.task.env.current_batch_index]
+        target = om.get_object_by_name(target_name)
+        target_xy = np.asarray(target.position)[:2]
+        robot_view = self.task.env.current_robot.robot_view
+        base_pose = robot_view.base.pose
+        base_xy = base_pose[:2, 3]
+        base_z = float(base_pose[2, 3])
+
+        candidates: list[np.ndarray] = []
+        if verified_pose_7d is not None:
+            candidates.append(pos_quat_to_pose_mat(np.asarray(verified_pose_7d, dtype=float)))
+
+        radii = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
+        n_ang = 12
+        ring: list[np.ndarray] = []
+        for r in radii:
+            for k in range(n_ang):
+                a = 2 * np.pi * k / n_ang
+                bx = float(target_xy[0] + r * np.cos(a))
+                by = float(target_xy[1] + r * np.sin(a))
+                theta = float(np.arctan2(target_xy[1] - by, target_xy[0] - bx))
+                c, s = np.cos(theta), np.sin(theta)
+                m = np.eye(4)
+                m[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                m[0, 3], m[1, 3], m[2, 3] = bx, by, base_z
+                ring.append(m)
+        # Prefer standoffs closest to where navigation already parked the base.
+        ring.sort(key=lambda m: (m[0, 3] - base_xy[0]) ** 2 + (m[1, 3] - base_xy[1]) ** 2)
+        candidates.extend(ring)
+        return candidates
+
+    def _search_manip_base_pose(
+        self, phase: str, target_name: str, verified_pose_7d: list[float] | None
+    ) -> bool:
+        """Snap the base to candidate standoffs and keep the first from which the
+        real manip primitives build (IK-feasible against the live scene).
+
+        This replaces open-loop reliance on the navigation parking pose: because
+        the base is frozen during manipulation, we are free to place it at any
+        standoff from which the grasp/place is actually reachable, using the true
+        held-object orientation rather than a pre-sampled guess.
+        """
+        self._manip_policy.phase = phase
+        candidates = self._manip_base_candidates(target_name, verified_pose_7d)
+        for i, base_pose in enumerate(candidates):
+            self._snap_base_pose(base_pose)
+            try:
+                self._manip_policy.reset(reset_retries=True)
+            except ValueError:
+                continue
+            log.info(
+                f"[MOBILE PNP FSM] {phase} base found (candidate {i}/{len(candidates)}) at "
+                f"({base_pose[0, 3]:.2f}, {base_pose[1, 3]:.2f})."
+            )
+            return True
+        log.warning(
+            f"[MOBILE PNP FSM] {phase} build failed: no reachable base standoff for "
+            f"'{target_name}' among {len(candidates)} candidates."
+        )
+        return False
 
     def _enter_pick(self) -> bool:
-        """Build the pick primitives from the parked base. Returns False if the
-        object is unreachable from where navigation parked."""
-        self._snap_base_to_feasible_pose(getattr(self.config.task_config, "robot_base_pose", None))
-        self._manip_policy.phase = PICK
-        try:
-            self._manip_policy.reset()
-        except ValueError as e:
-            log.warning(f"[MOBILE PNP FSM] PICK build failed (unreachable): {e}")
-            return False
-        log.info("[MOBILE PNP FSM] NAV_TO_OBJ done → phase PICK")
-        return True
+        """Park the base at a reachable standoff and build the pick primitives.
+        Returns False if the object is unreachable from every candidate."""
+        ok = self._search_manip_base_pose(
+            PICK,
+            self.config.task_config.pickup_obj_name,
+            getattr(self.config.task_config, "robot_base_pose", None),
+        )
+        if ok:
+            log.info("[MOBILE PNP FSM] NAV_TO_OBJ done → phase PICK")
+        return ok
 
     def _enter_place(self) -> bool:
-        """Build the place primitives from the parked base over the receptacle."""
-        self._snap_base_to_feasible_pose(
-            getattr(self.config.task_config, "place_robot_base_pose", None)
+        """Park the base at a reachable standoff and build the place primitives."""
+        ok = self._search_manip_base_pose(
+            PLACE,
+            self.config.task_config.place_receptacle_name,
+            getattr(self.config.task_config, "place_robot_base_pose", None),
         )
-        self._manip_policy.phase = PLACE
-        try:
-            self._manip_policy.reset(reset_retries=True)
-        except ValueError as e:
-            log.warning(f"[MOBILE PNP FSM] PLACE build failed (unreachable): {e}")
-            return False
-        log.info("[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE")
-        return True
+        if ok:
+            log.info("[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE")
+        return ok
 
     def _done_action(self) -> dict[str, Any]:
         gripper_ids = self.task.env.current_robot.robot_view.get_gripper_movegroup_ids()

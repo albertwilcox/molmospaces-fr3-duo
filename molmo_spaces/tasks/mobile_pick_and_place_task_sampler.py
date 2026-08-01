@@ -15,13 +15,11 @@ Composition strategy:
 import logging
 
 import mujoco
-import numpy as np
 
 from molmo_spaces.env.env import CPUMujocoEnv
 from molmo_spaces.tasks.mobile_pick_and_place_task import MobilePickAndPlaceTask
 from molmo_spaces.tasks.pick_and_place_task_sampler import PickAndPlaceTaskSampler
 from molmo_spaces.tasks.task_sampler_errors import RobotPlacementError
-from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 from molmo_spaces.utils.pose import pose_mat_to_7d
 
 log = logging.getLogger(__name__)
@@ -69,54 +67,15 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         pickup_obj_goal_pose[2] += 0.05
         task_cfg.pickup_obj_goal_pose = pickup_obj_goal_pose.tolist()
 
-    def _place_pose_reachable(self, env: CPUMujocoEnv, receptacle) -> bool:
-        """Return True if the arm can IK-reach a placement point over the
-        receptacle top from the robot's *current* base pose.
-
-        Mirrors the pickup grasp-feasibility gate for the place side: a base
-        pose that is collision-free but leaves the receptacle past the arm's
-        reach is useless, so we require a reachable place point before recording
-        the pose. The placement point is the receptacle-top centre; a small yaw
-        sweep of a tool-down orientation is tried (the place primitive has yaw
-        freedom), and both grippers are considered (bimanual).
-        """
-        robot = env.current_robot
-        kin = robot.kinematics
-        robot_view = robot.robot_view
-        base_pose = robot_view.base.pose
-        q0 = robot_view.get_qpos_dict()
-
-        center, size = body_aabb(env.current_data.model, env.current_data, receptacle.object_id)
-        top_z = center[2] + size[2] / 2
-        # Small clearance above the top surface, matching the place primitive.
-        target_xyz = np.array([center[0], center[1], top_z + 0.05])
-
-        for gripper_mg_id in robot_view.get_gripper_movegroup_ids():
-            for yaw in np.linspace(0.0, 2 * np.pi, 8, endpoint=False):
-                c, s = np.cos(yaw), np.sin(yaw)
-                # Tool z-axis pointing down; x rotated by yaw about vertical.
-                rot = np.array([[c, s, 0.0], [s, -c, 0.0], [0.0, 0.0, -1.0]])
-                target = np.eye(4)
-                target[:3, :3] = rot
-                target[:3, 3] = target_xyz
-                jp = kin.ik(gripper_mg_id, target, None, q0, base_pose=base_pose)
-                if jp is not None:
-                    return True
-        return False
-
     def _sample_place_robot_base_pose(self, env: CPUMujocoEnv) -> None:
-        """Record a place-feasible base pose near the receptacle.
+        """Record a collision-free, receptacle-facing base pose as a *hint* for
+        the place phase.
 
-        Mirrors :meth:`_sample_and_place_robot` for the receptacle: place the
-        mobile base at a collision-free, receptacle-facing standoff (floor
-        height) and record it in ``task_config.place_robot_base_pose`` so the FSM
-        can navigate the base there for the PLACE phase, instead of parking at the
-        closest navigable cell (which leaves the receptacle past the arm's reach).
-
-        Each candidate base pose is additionally gated on place-IK reachability
-        (:meth:`_place_pose_reachable`) so the recorded pose can actually reach a
-        placement point on the receptacle top. On failure the field is left
-        ``None`` and the FSM falls back to sampling.
+        This is only a starting candidate: the FSM performs a proper place-time
+        base search (using the true held-object orientation) and will fall back
+        to a ring of standoffs if this hint is not IK-feasible. We therefore keep
+        the sampling cheap (collision-free placement only). On failure the field
+        is left ``None`` and the FSM's ring search supplies candidates.
         """
         task_cfg = self.config.task_config
         sampler_cfg = self.config.task_sampler_config
@@ -124,34 +83,28 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         receptacle = om.get_object_by_name(task_cfg.place_receptacle_name)
         robot_view = env.current_robot.robot_view
 
-        max_outer = sampler_cfg.max_robot_placement_attempts
-        for _ in range(max_outer):
-            placed = env.place_robot_near(
-                robot_view=robot_view,
-                target=receptacle,
-                max_tries=sampler_cfg.max_robot_placement_attempts,
-                sampling_radius_range=sampler_cfg.manip_standoff_radius_range,
-                robot_safety_radius=sampler_cfg.robot_safety_radius,
-                preserve_z=sampler_cfg.mobile_base_z,
-                face_target=True,
-                check_camera_visibility=False,
-            )
-            if not placed:
-                break
-            mujoco.mj_forward(env.current_model, env.current_data)
-            if self._place_pose_reachable(env, receptacle):
-                task_cfg.place_robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
-                log.info(
-                    f"[MOBILE PNP] Recorded place-feasible (IK-reachable) base pose near "
-                    f"'{receptacle.name}' at {robot_view.base.pose[:2, 3]}."
-                )
-                return
-
-        task_cfg.place_robot_base_pose = None
-        log.warning(
-            f"[MOBILE PNP] Could not place robot at an IK-reachable pose near receptacle "
-            f"'{receptacle.name}'; PLACE nav will fall back to goal sampling."
+        placed = env.place_robot_near(
+            robot_view=robot_view,
+            target=receptacle,
+            max_tries=sampler_cfg.max_robot_placement_attempts,
+            sampling_radius_range=sampler_cfg.manip_standoff_radius_range,
+            robot_safety_radius=sampler_cfg.robot_safety_radius,
+            preserve_z=sampler_cfg.mobile_base_z,
+            face_target=True,
+            check_camera_visibility=False,
         )
+        if placed:
+            task_cfg.place_robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
+            log.info(
+                f"[MOBILE PNP] Recorded place-hint base pose near "
+                f"'{receptacle.name}' at {robot_view.base.pose[:2, 3]}."
+            )
+        else:
+            task_cfg.place_robot_base_pose = None
+            log.warning(
+                f"[MOBILE PNP] Could not place robot near receptacle '{receptacle.name}'; "
+                f"PLACE will rely on the FSM ring search."
+            )
 
     def _place_robot_at_nav_start(self, env: CPUMujocoEnv) -> None:
         """Move the mobile base to a far, navigable start pose facing anywhere.
