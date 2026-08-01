@@ -41,6 +41,7 @@ from molmo_spaces.policy.solvers.object_manipulation.pick_and_place_planner_poli
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 from molmo_spaces.utils.grasp_sample import add_grasp_collision_bodies, compute_grasp_pose
+from molmo_spaces.utils.pose import pos_quat_to_pose_mat
 
 log = logging.getLogger(__name__)
 
@@ -567,9 +568,35 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
     # ------------------------------------------------------------------ #
     # Phase transitions                                                   #
     # ------------------------------------------------------------------ #
+    def _snap_base_to_feasible_pose(self, pose_7d: list[float] | None) -> None:
+        """Snap the (frozen) base exactly onto the sampler's feasibility-verified
+        pose before manipulation.
+
+        Navigation parks the base *near* the verified pose but off by the A* grid
+        resolution plus residual heading error, which is enough to push the
+        target past the arm's reach. Because the base is held stationary through
+        the whole manip phase, snapping its qpos AND actuator setpoint to the
+        exact verified pose makes manipulation start from a pose the sampler
+        already proved is IK-feasible, without altering the (already-completed)
+        navigation trajectory. No-op when no verified pose is available.
+        """
+        if pose_7d is None:
+            return
+        robot_view = self.task.env.current_robot.robot_view
+        pose_mat = pos_quat_to_pose_mat(np.asarray(pose_7d, dtype=float))
+        robot_view.base.pose = pose_mat
+        # Hold the holonomic base here (else the position servo drives it back to
+        # the stale nav setpoint during manipulation).
+        x, y = pose_mat[0, 3], pose_mat[1, 3]
+        theta = float(np.arctan2(pose_mat[1, 0], pose_mat[0, 0]))
+        robot_view.base.ctrl = np.array([x, y, theta])
+        mujoco.mj_forward(self.task.env.current_model, self.task.env.current_data)
+        log.info(f"[MOBILE PNP FSM] Snapped base to verified pose ({x:.2f}, {y:.2f}).")
+
     def _enter_pick(self) -> bool:
         """Build the pick primitives from the parked base. Returns False if the
         object is unreachable from where navigation parked."""
+        self._snap_base_to_feasible_pose(getattr(self.config.task_config, "robot_base_pose", None))
         self._manip_policy.phase = PICK
         try:
             self._manip_policy.reset()
@@ -581,6 +608,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
     def _enter_place(self) -> bool:
         """Build the place primitives from the parked base over the receptacle."""
+        self._snap_base_to_feasible_pose(
+            getattr(self.config.task_config, "place_robot_base_pose", None)
+        )
         self._manip_policy.phase = PLACE
         try:
             self._manip_policy.reset(reset_retries=True)
