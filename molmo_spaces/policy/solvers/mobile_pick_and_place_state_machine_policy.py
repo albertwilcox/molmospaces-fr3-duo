@@ -758,6 +758,17 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # it along with every base teleport so the search doesn't drop it.
         carry = self.config.task_config.pickup_obj_name if phase == PLACE else None
         candidates = self._manip_base_candidates(target_name, verified_pose_7d)
+        # Rotate the candidate order by how many times this segment has already
+        # been retried, so each retry commits to a genuinely DIFFERENT standoff
+        # (base position + approach angle). Without this, the ring re-sorts by
+        # proximity to the restored parked base and re-selects the same first
+        # candidate every retry, reproducing the exact grasp that just failed
+        # ("Object is not in grasp!"). A fresh approach angle is the cheapest way
+        # to convert a marginal base-locked grasp into a secure one.
+        attempt = self._retry_counts.get(phase, 0)
+        if candidates and attempt:
+            k = attempt % len(candidates)
+            candidates = candidates[k:] + candidates[:k]
         # A candidate whose grasp pose alone is IK-feasible can still fail mid
         # execution: with the base frozen, an intermediate waypoint (pregrasp
         # standoff, lift) may be out of the arm's base-locked reach, which shows
