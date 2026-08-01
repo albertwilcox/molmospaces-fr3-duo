@@ -41,7 +41,7 @@ from molmo_spaces.policy.solvers.object_manipulation.pick_and_place_planner_poli
 from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 from molmo_spaces.utils.grasp_sample import add_grasp_collision_bodies, compute_grasp_pose
-from molmo_spaces.utils.pose import pos_quat_to_pose_mat
+from molmo_spaces.utils.pose import pos_quat_to_pose_mat, pose_mat_to_pos_quat
 
 log = logging.getLogger(__name__)
 
@@ -466,18 +466,34 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
         # --- Manipulation sub-policy -------------------------------------- #
         manip_policy_config = self.policy_config.manip_policy_config
+        # The FSM probes several candidate base standoffs by actually building
+        # the grasp/place primitives. Exhaustively IK-checking every non-colliding
+        # grasp (~256) costs ~120s for an INFEASIBLE pose (a feasible pose exits
+        # early), which makes the candidate search intractable. Cap the check so a
+        # bad standoff is rejected in a few seconds; grasps are cost-ordered, so a
+        # genuinely feasible pose still finds a grasp within the cap.
+        manip_policy_config = manip_policy_config.model_copy(
+            update={"grasp_feasibility_max_grasps": 32}
+        )
         self._manip_config = config.model_copy(update={"policy_config": manip_policy_config})
         self._manip_policy = _MobileManipPlannerPolicy(self._manip_config, task)
 
         self._phase: str = NAV_TO_OBJ
 
+        # Base pose to pin during manipulation (set by the base search).
+        self._locked_base_pose: np.ndarray | None = None
+
+        # Grasp lock: keep the held object rigidly fixed to the gripper during
+        # transport navigation so it doesn't slip out under base acceleration.
+        self._grasp_offset: np.ndarray | None = None
+        self._grasp_mg_id: str | None = None
         # --- Subtask checkpoint / retry ----------------------------------- #
         # Cache the full MuJoCo state at the start of each nav+manip segment so
         # a failed subtask can restore the last good state and retry (with a
         # freshly-sampled parking pose) instead of discarding the whole episode.
         self._checkpoints: dict[str, np.ndarray] = {}
         self._retry_counts: dict[str, int] = {}
-        self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 2)
+        self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 1)
 
     # Segment = (navigate to a target, then manipulate). A failure anywhere in
     # a segment restores the segment-start checkpoint and re-runs the segment.
@@ -555,6 +571,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._phase = NAV_TO_OBJ
         self._checkpoints = {}
         self._retry_counts = {}
+        self._locked_base_pose = None
+        self._grasp_offset = None
+        self._grasp_mg_id = None
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
         # Drive to the grasp-feasibility-verified base pose the sampler recorded
         # (Avenue A), not the closest navigable cell.
@@ -568,19 +587,111 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
     # ------------------------------------------------------------------ #
     # Phase transitions                                                   #
     # ------------------------------------------------------------------ #
-    def _snap_base_pose(self, pose_mat: np.ndarray) -> None:
+    def _tcp_world_pose(self) -> np.ndarray | None:
+        """World pose of the active gripper TCP (leaf frame), or None."""
+        mg_id = self._grasp_mg_id
+        if mg_id is None:
+            return None
+        return self.task.env.current_robot.robot_view.get_move_group(mg_id).leaf_frame_to_world
+
+    def _capture_grasp_lock(self) -> None:
+        """After a successful pick, record the held object's pose in the TCP
+        frame so it can be rigidly re-asserted during transport navigation."""
+        mg_id = getattr(self._manip_policy, "active_gripper_mg_id", None)
+        if mg_id is None:
+            mg_id = self.task.env.current_robot.robot_view.get_gripper_movegroup_ids()[0]
+        self._grasp_mg_id = mg_id
+        tcp = self._tcp_world_pose()
+        obj_pose = self._held_object_pose()
+        if tcp is None or obj_pose is None:
+            self._grasp_offset = None
+            return
+        self._grasp_offset = np.linalg.inv(tcp) @ obj_pose
+        log.info("[MOBILE PNP FSM] captured grasp lock (object fixed to gripper for transport).")
+
+    def _held_object_pose(self) -> np.ndarray | None:
+        model = self.task.env.current_model
+        data = self.task.env.current_data
+        om = self.task.env.object_managers[self.task.env.current_batch_index]
+        obj = om.get_object_by_name(self.config.task_config.pickup_obj_name)
+        jnt_id = int(model.body_jntadr[obj.body_id])
+        if jnt_id == -1 or model.jnt_type[jnt_id] != mujoco.mjtJoint.mjJNT_FREE:
+            return None
+        qadr = int(model.jnt_qposadr[jnt_id])
+        return pos_quat_to_pose_mat(data.qpos[qadr : qadr + 3], data.qpos[qadr + 3 : qadr + 7])
+
+    def _apply_grasp_lock(self) -> None:
+        """Re-assert the held object's pose relative to the current TCP so it
+        stays physically between the fingers (preventing inertial slip-out during
+        transport). The object remains between the fingers, so the gripper's
+        finger gap is preserved and the ``is not in grasp`` check still passes."""
+        if self._grasp_offset is None:
+            return
+        tcp = self._tcp_world_pose()
+        if tcp is None:
+            return
+        model = self.task.env.current_model
+        data = self.task.env.current_data
+        om = self.task.env.object_managers[self.task.env.current_batch_index]
+        obj = om.get_object_by_name(self.config.task_config.pickup_obj_name)
+        jnt_id = int(model.body_jntadr[obj.body_id])
+        if jnt_id == -1 or model.jnt_type[jnt_id] != mujoco.mjtJoint.mjJNT_FREE:
+            return
+        qadr = int(model.jnt_qposadr[jnt_id])
+        dofadr = int(model.jnt_dofadr[jnt_id])
+        pos, quat = pose_mat_to_pos_quat(tcp @ self._grasp_offset)
+        data.qpos[qadr : qadr + 3] = pos
+        data.qpos[qadr + 3 : qadr + 7] = quat
+        data.qvel[dofadr : dofadr + 6] = 0.0
+
+    def _snap_base_pose(self, pose_mat: np.ndarray, carry_object_name: str | None = None) -> None:
         """Snap the (frozen) base to ``pose_mat`` and hold it there.
 
         Sets base qpos AND the holonomic actuator setpoint (else the position
         servo drives the base back to the stale nav setpoint during manip), then
         forwards so kinematics/IK see the new base pose.
+
+        The base teleport is instantaneous, so anything held only by gripper
+        friction (``carry_object_name``) does NOT follow and would be left behind
+        (dropped) unless we move it too. When carrying, we rigidly transform the
+        held object by the same world SE2 delta as the base so it stays in hand.
         """
         robot_view = self.task.env.current_robot.robot_view
+        model = self.task.env.current_model
+        data = self.task.env.current_data
+
+        old_base = robot_view.base.pose.copy()
         robot_view.base.pose = pose_mat
         x, y = float(pose_mat[0, 3]), float(pose_mat[1, 3])
         theta = float(np.arctan2(pose_mat[1, 0], pose_mat[0, 0]))
         robot_view.base.ctrl = np.array([x, y, theta])
-        mujoco.mj_forward(self.task.env.current_model, self.task.env.current_data)
+
+        # Zero base velocities so re-asserting qpos each step doesn't fight
+        # residual momentum (which would jostle the arm / held object).
+        base = robot_view.base
+        joint_ids = getattr(base, "_joint_ids", None)
+        if joint_ids is not None:
+            for jid in joint_ids:
+                dofadr = int(model.jnt_dofadr[jid])
+                data.qvel[dofadr] = 0.0
+
+        if carry_object_name is not None:
+            delta = pose_mat @ np.linalg.inv(old_base)
+            om = self.task.env.object_managers[self.task.env.current_batch_index]
+            obj = om.get_object_by_name(carry_object_name)
+            jnt_id = int(model.body_jntadr[obj.body_id])
+            if jnt_id != -1 and model.jnt_type[jnt_id] == mujoco.mjtJoint.mjJNT_FREE:
+                qadr = int(model.jnt_qposadr[jnt_id])
+                new_obj_pose = delta @ pos_quat_to_pose_mat(
+                    data.qpos[qadr : qadr + 3], data.qpos[qadr + 3 : qadr + 7]
+                )
+                pos, quat = pose_mat_to_pos_quat(new_obj_pose)
+                data.qpos[qadr : qadr + 3] = pos
+                data.qpos[qadr + 3 : qadr + 7] = quat
+                dofadr = int(model.jnt_dofadr[jnt_id])
+                data.qvel[dofadr : dofadr + 6] = 0.0
+
+        mujoco.mj_forward(model, data)
 
     def _manip_base_candidates(
         self, target_name: str, verified_pose_7d: list[float] | None
@@ -604,8 +715,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         if verified_pose_7d is not None:
             candidates.append(pos_quat_to_pose_mat(np.asarray(verified_pose_7d, dtype=float)))
 
-        radii = (0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
-        n_ang = 12
+        # Standoffs near the arm's comfortable reach (closer is generally more
+        # reachable). Kept small and bounded so the feasibility probe stays cheap.
+        radii = (0.38, 0.46, 0.54)
+        n_ang = 8
         ring: list[np.ndarray] = []
         for r in radii:
             for k in range(n_ang):
@@ -620,7 +733,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 ring.append(m)
         # Prefer standoffs closest to where navigation already parked the base.
         ring.sort(key=lambda m: (m[0, 3] - base_xy[0]) ** 2 + (m[1, 3] - base_xy[1]) ** 2)
-        candidates.extend(ring)
+        # Bound the probe budget: verified hint + a handful of nearest standoffs.
+        candidates.extend(ring[:11])
         return candidates
 
     def _search_manip_base_pose(
@@ -635,13 +749,20 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         held-object orientation rather than a pre-sampled guess.
         """
         self._manip_policy.phase = phase
+        # During PLACE the pickup object is held only by gripper friction; carry
+        # it along with every base teleport so the search doesn't drop it.
+        carry = self.config.task_config.pickup_obj_name if phase == PLACE else None
         candidates = self._manip_base_candidates(target_name, verified_pose_7d)
         for i, base_pose in enumerate(candidates):
-            self._snap_base_pose(base_pose)
+            self._snap_base_pose(base_pose, carry_object_name=carry)
             try:
                 self._manip_policy.reset(reset_retries=True)
             except ValueError:
                 continue
+            # Pin the (holonomic) base here for the whole manip phase: unlike the
+            # bolted fixed-base robot, the mobile base drifts under arm/grasp
+            # reaction forces, shifting the grasp enough to miss the object.
+            self._locked_base_pose = base_pose.copy()
             log.info(
                 f"[MOBILE PNP FSM] {phase} base found (candidate {i}/{len(candidates)}) at "
                 f"({base_pose[0, 3]:.2f}, {base_pose[1, 3]:.2f})."
@@ -666,14 +787,39 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         return ok
 
     def _enter_place(self) -> bool:
-        """Park the base at a reachable standoff and build the place primitives."""
+        """Build the place primitives from the *navigated* base pose.
+
+        Unlike PICK (empty gripper), teleport-searching standoffs during PLACE
+        jostles the held object out of the force grasp, so we avoid it: the base
+        has already been navigated to the receptacle-facing place hint, and the
+        planner's ``_nearest_reachable_place_pose`` fallback handles receptacles
+        whose centre sits past the arm's reach. We therefore build in place at the
+        current pose. Only if that is infeasible do we try a few nearby standoffs
+        (carrying the held object along), accepting the small jostle as a last
+        resort before falling back to a segment retry (fresh navigation).
+        """
+        self._manip_policy.phase = PLACE
+        current = self.task.env.current_robot.robot_view.base.pose.copy()
+        try:
+            self._manip_policy.reset(reset_retries=True)
+            self._locked_base_pose = current
+            log.info(
+                "[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE "
+                f"(built at navigated pose ({current[0, 3]:.2f}, {current[1, 3]:.2f}))."
+            )
+            return True
+        except ValueError:
+            log.info(
+                "[MOBILE PNP FSM] PLACE not feasible at navigated pose; "
+                "trying nearby standoffs (carrying object)."
+            )
         ok = self._search_manip_base_pose(
             PLACE,
             self.config.task_config.place_receptacle_name,
             getattr(self.config.task_config, "place_robot_base_pose", None),
         )
         if ok:
-            log.info("[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE")
+            log.info("[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE (nearby standoff).")
         return ok
 
     def _done_action(self) -> dict[str, Any]:
@@ -690,6 +836,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # emitting stale (e.g. final navigation) commands.
         for _ in range(len(self.get_all_phases()) + 2):
             if self._phase in (NAV_TO_OBJ, NAV_TO_RECEPTACLE):
+                # While transporting a grasped object, keep it rigidly fixed to
+                # the gripper so base acceleration can't fling it out of the hand.
+                if self._phase == NAV_TO_RECEPTACLE:
+                    self._apply_grasp_lock()
                 nav_action = self._nav_policy.get_action(observation)
                 nav_done = nav_action.pop("done", False)
                 if not nav_done:
@@ -708,10 +858,28 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         if not self._retry_segment(PLACE):
                             self._phase = DONE
                         continue
+                    # Keep the transport grasp lock active through the PLACE
+                    # preplace move (arm repositioning above the receptacle while
+                    # holding); it is released at the final lowering/open segment
+                    # inside the PICK/PLACE branch so the object can be set down.
                     self._phase = PLACE
                 continue
 
             if self._phase in (PICK, PLACE):
+                # Re-pin the holonomic base each step: it otherwise drifts under
+                # arm/grasp reaction forces (the bolted fixed-base robot cannot),
+                # shifting the grasp/place enough to miss. Pinning qpos+ctrl every
+                # step makes the base effectively rigid for the manip phase.
+                if self._locked_base_pose is not None:
+                    self._snap_base_pose(self._locked_base_pose)
+                # Hold the object rigidly through the PLACE preplace repositioning,
+                # then release it at the lowering/open segment so it can be set
+                # down. Releasing earlier let it slip out at preplace entry.
+                if self._phase == PLACE and self._grasp_offset is not None:
+                    if self._manip_policy.get_phase() == "preplace":
+                        self._apply_grasp_lock()
+                    else:
+                        self._grasp_offset = None
                 try:
                     manip_action = self._manip_policy.get_action(observation)
                 except (ValueError, AssertionError) as e:
@@ -747,6 +915,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     # Pick succeeded: cache the held-object state so the place
                     # segment can be retried without redoing navigation+pick.
                     self._checkpoints[PLACE] = self._capture_state()
+                    # Lock the object to the gripper for the transport nav.
+                    self._capture_grasp_lock()
                     self.task.set_nav_target(self.config.task_config.place_receptacle_name)
                     # Drive to the place-feasibility-verified base pose near the
                     # receptacle (Avenue A); None => fall back to goal sampling.
