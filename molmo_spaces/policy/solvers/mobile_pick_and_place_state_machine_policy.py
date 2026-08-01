@@ -487,6 +487,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # transport navigation so it doesn't slip out under base acceleration.
         self._grasp_offset: np.ndarray | None = None
         self._grasp_mg_id: str | None = None
+        # Set once the object has been set down at PLACE; a failure afterwards
+        # (e.g. a retreat IK hiccup) must NOT retry, which would teleport the
+        # already-placed object back into the gripper and undo the success.
+        self._place_released: bool = False
         # --- Subtask checkpoint / retry ----------------------------------- #
         # Cache the full MuJoCo state at the start of each nav+manip segment so
         # a failed subtask can restore the last good state and retry (with a
@@ -574,6 +578,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._locked_base_pose = None
         self._grasp_offset = None
         self._grasp_mg_id = None
+        self._place_released = False
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
         # Drive to the grasp-feasibility-verified base pose the sampler recorded
         # (Avenue A), not the closest navigable cell.
@@ -843,6 +848,17 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 nav_action = self._nav_policy.get_action(observation)
                 nav_done = nav_action.pop("done", False)
                 if not nav_done:
+                    if self._phase == NAV_TO_RECEPTACLE:
+                        # Actively hold the arm + gripper at their post-pick
+                        # (grasp-closed, lifted) setpoints during transport.
+                        # Commanding only the base lets the gripper servo relax,
+                        # so the object ends up held only by the qpos lock and the
+                        # fingers close to empty -> "not in grasp" at PLACE entry.
+                        robot_view = self.task.env.current_robot.robot_view
+                        gripper_ids = robot_view.get_gripper_movegroup_ids()
+                        hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
+                        hold[_BASE_MG_ID] = nav_action[_BASE_MG_ID]
+                        return hold
                     # Drive only the base; arm stays stowed / holding, gripper
                     # holds its state (absent keys => held stationary).
                     return {_BASE_MG_ID: nav_action[_BASE_MG_ID]}
@@ -879,7 +895,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     if self._manip_policy.get_phase() == "preplace":
                         self._apply_grasp_lock()
                     else:
+                        # Reached the lowering/open segment: the object is being
+                        # set down. Stop the grasp lock and mark it released so a
+                        # later failure won't retry and undo the placement.
                         self._grasp_offset = None
+                        self._place_released = True
                 try:
                     manip_action = self._manip_policy.get_action(observation)
                 except (ValueError, AssertionError) as e:
@@ -893,7 +913,17 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         f"[MOBILE PNP FSM] {self._phase} aborted mid-execution: "
                         f"{type(e).__name__}: {e}"
                     )
-                    if not self._retry_segment(self._phase):
+                    # If the object is already placed, never retry: a retry
+                    # restores the checkpoint and teleports the placed object back
+                    # into the gripper, destroying a successful placement. Finish
+                    # and let the task judge success on the placed object.
+                    if self._phase == PLACE and self._place_released:
+                        log.info(
+                            "[MOBILE PNP FSM] PLACE post-release failure ignored "
+                            "(object already set down) → phase DONE"
+                        )
+                        self._phase = DONE
+                    elif not self._retry_segment(self._phase):
                         self._phase = DONE
                     continue
                 manip_done = manip_action.pop("done", False)
@@ -907,7 +937,13 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
                 if manip_failed:
                     log.warning(f"[MOBILE PNP FSM] manipulation phase {self._phase} FAILED")
-                    if not self._retry_segment(self._phase):
+                    if self._phase == PLACE and self._place_released:
+                        log.info(
+                            "[MOBILE PNP FSM] PLACE post-release failure ignored "
+                            "(object already set down) → phase DONE"
+                        )
+                        self._phase = DONE
+                    elif not self._retry_segment(self._phase):
                         self._phase = DONE
                     continue
 
