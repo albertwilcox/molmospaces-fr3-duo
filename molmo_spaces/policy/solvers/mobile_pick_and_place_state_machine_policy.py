@@ -497,7 +497,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # freshly-sampled parking pose) instead of discarding the whole episode.
         self._checkpoints: dict[str, np.ndarray] = {}
         self._retry_counts: dict[str, int] = {}
-        self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 1)
+        self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 2)
 
     # Segment = (navigate to a target, then manipulate). A failure anywhere in
     # a segment restores the segment-start checkpoint and re-runs the segment.
@@ -758,21 +758,65 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # it along with every base teleport so the search doesn't drop it.
         carry = self.config.task_config.pickup_obj_name if phase == PLACE else None
         candidates = self._manip_base_candidates(target_name, verified_pose_7d)
-        for i, base_pose in enumerate(candidates):
-            self._snap_base_pose(base_pose, carry_object_name=carry)
-            try:
-                self._manip_policy.reset(reset_retries=True)
-            except ValueError:
-                continue
-            # Pin the (holonomic) base here for the whole manip phase: unlike the
-            # bolted fixed-base robot, the mobile base drifts under arm/grasp
-            # reaction forces, shifting the grasp enough to miss the object.
-            self._locked_base_pose = base_pose.copy()
-            log.info(
-                f"[MOBILE PNP FSM] {phase} base found (candidate {i}/{len(candidates)}) at "
-                f"({base_pose[0, 3]:.2f}, {base_pose[1, 3]:.2f})."
-            )
-            return True
+        # A candidate whose grasp pose alone is IK-feasible can still fail mid
+        # execution: with the base frozen, an intermediate waypoint (pregrasp
+        # standoff, lift) may be out of the arm's base-locked reach, which shows
+        # up as a run of "IK failed (base-locked)" aborts. So we prefer the first
+        # candidate from which EVERY planned waypoint is base-locked reachable
+        # (strict pass) and only fall back to the first that merely builds
+        # (lenient pass) when no candidate fully clears — never regressing below
+        # the previous accept-first-build behaviour.
+        first_built: int | None = None
+        first_built_pose: np.ndarray | None = None
+        for strict in (True, False):
+            for i, base_pose in enumerate(candidates):
+                if not strict and first_built is not None and i != first_built:
+                    # Lenient pass: we already know the first buildable candidate.
+                    continue
+                self._snap_base_pose(base_pose, carry_object_name=carry)
+                try:
+                    self._manip_policy.reset(reset_retries=True)
+                except ValueError:
+                    continue
+                if strict:
+                    if first_built is None:
+                        first_built = i
+                        first_built_pose = base_pose.copy()
+                    targets = list(self._manip_policy.target_poses.values())
+                    if targets and not all(
+                        bool(self._manip_policy.check_feasible_ik(np.asarray(p)))
+                        for p in targets
+                    ):
+                        continue  # some waypoint unreachable base-locked; skip.
+                # Pin the (holonomic) base here for the whole manip phase: unlike
+                # the bolted fixed-base robot, the mobile base drifts under
+                # arm/grasp reaction forces, shifting the grasp enough to miss.
+                self._locked_base_pose = base_pose.copy()
+                log.info(
+                    f"[MOBILE PNP FSM] {phase} base found "
+                    f"({'all-waypoint' if strict else 'build-only'} candidate "
+                    f"{i}/{len(candidates)}) at "
+                    f"({base_pose[0, 3]:.2f}, {base_pose[1, 3]:.2f})."
+                )
+                return True
+            if first_built is None:
+                # No candidate even builds: the lenient pass cannot help either.
+                break
+            if strict and first_built_pose is not None:
+                # Re-snap/rebuild at the known-buildable candidate for the lenient
+                # accept below (state was left on the last strict-rejected snap).
+                self._snap_base_pose(first_built_pose, carry_object_name=carry)
+                try:
+                    self._manip_policy.reset(reset_retries=True)
+                except ValueError:
+                    break
+                self._locked_base_pose = first_built_pose.copy()
+                log.info(
+                    f"[MOBILE PNP FSM] {phase} base found (build-only fallback "
+                    f"candidate {first_built}/{len(candidates)}) at "
+                    f"({first_built_pose[0, 3]:.2f}, {first_built_pose[1, 3]:.2f})."
+                )
+                return True
         log.warning(
             f"[MOBILE PNP FSM] {phase} build failed: no reachable base standoff for "
             f"'{target_name}' among {len(candidates)} candidates."
