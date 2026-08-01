@@ -22,6 +22,7 @@ import logging
 from typing import Any
 
 import numpy as np
+import mujoco
 from mujoco import MjSpec
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
@@ -469,6 +470,76 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
         self._phase: str = NAV_TO_OBJ
 
+        # --- Subtask checkpoint / retry ----------------------------------- #
+        # Cache the full MuJoCo state at the start of each nav+manip segment so
+        # a failed subtask can restore the last good state and retry (with a
+        # freshly-sampled parking pose) instead of discarding the whole episode.
+        self._checkpoints: dict[str, np.ndarray] = {}
+        self._retry_counts: dict[str, int] = {}
+        self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 2)
+
+    # Segment = (navigate to a target, then manipulate). A failure anywhere in
+    # a segment restores the segment-start checkpoint and re-runs the segment.
+    _SEGMENTS = {
+        PICK: {
+            "nav_phase": NAV_TO_OBJ,
+            "target_attr": "pickup_obj_name",
+            "override_attr": "robot_base_pose",
+        },
+        PLACE: {
+            "nav_phase": NAV_TO_RECEPTACLE,
+            "target_attr": "place_receptacle_name",
+            "override_attr": "place_robot_base_pose",
+        },
+    }
+
+    def _capture_state(self) -> np.ndarray:
+        model = self.task.env.current_model
+        data = self.task.env.current_data
+        size = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_INTEGRATION)
+        state = np.empty(size, dtype=np.float64)
+        mujoco.mj_getState(model, data, state, mujoco.mjtState.mjSTATE_INTEGRATION)
+        return state
+
+    def _restore_state(self, state: np.ndarray) -> None:
+        model = self.task.env.current_model
+        data = self.task.env.current_data
+        mujoco.mj_setState(model, data, state, mujoco.mjtState.mjSTATE_INTEGRATION)
+        mujoco.mj_forward(model, data)
+
+    def _retry_segment(self, seg: str) -> bool:
+        """Restore the segment-start checkpoint and re-run the segment.
+
+        Returns False (episode should go to DONE) when no checkpoint exists or
+        the retry budget for this segment is exhausted.
+        """
+        info = self._SEGMENTS[seg]
+        ckpt = self._checkpoints.get(seg)
+        used = self._retry_counts.get(seg, 0)
+        if ckpt is None or used >= self._max_segment_retries:
+            log.warning(
+                f"[MOBILE PNP FSM] {seg} segment retry unavailable "
+                f"(checkpoint={'yes' if ckpt is not None else 'no'}, used={used}/"
+                f"{self._max_segment_retries})"
+            )
+            return False
+        self._retry_counts[seg] = used + 1
+        self._restore_state(ckpt)
+        task_cfg = self.config.task_config
+        self.task.set_nav_target(getattr(task_cfg, info["target_attr"]))
+        # First retry re-drives to the feasibility-verified override; later
+        # retries drop it to force a freshly-sampled standoff, adding the
+        # variation needed to escape a reproducibly-infeasible parking pose.
+        override = getattr(task_cfg, info["override_attr"], None) if used == 0 else None
+        self.task.set_nav_goal_override(override)
+        self._nav_policy.reset()
+        self._phase = info["nav_phase"]
+        log.info(
+            f"[MOBILE PNP FSM] retrying {seg} segment "
+            f"(attempt {used + 1}/{self._max_segment_retries}) from cached checkpoint"
+        )
+        return True
+
     @property
     def planners(self) -> dict:
         return {}
@@ -481,11 +552,16 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
     def reset(self) -> None:
         self._phase = NAV_TO_OBJ
+        self._checkpoints = {}
+        self._retry_counts = {}
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
         # Drive to the grasp-feasibility-verified base pose the sampler recorded
         # (Avenue A), not the closest navigable cell.
         self.task.set_nav_goal_override(getattr(self.config.task_config, "robot_base_pose", None))
         self._nav_policy.reset()
+        # Cache the pristine post-sample state so the whole pick segment
+        # (navigate-to-object + pick) can be retried from scratch.
+        self._checkpoints[PICK] = self._capture_state()
         log.info("[MOBILE PNP FSM] reset → phase NAV_TO_OBJ")
 
     # ------------------------------------------------------------------ #
@@ -537,12 +613,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
                 if self._phase == NAV_TO_OBJ:
                     if not self._enter_pick():
-                        self._phase = DONE
+                        if not self._retry_segment(PICK):
+                            self._phase = DONE
                         continue
                     self._phase = PICK
                 else:
                     if not self._enter_place():
-                        self._phase = DONE
+                        if not self._retry_segment(PLACE):
+                            self._phase = DONE
                         continue
                     self._phase = PLACE
                 continue
@@ -561,7 +639,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         f"[MOBILE PNP FSM] {self._phase} aborted mid-execution: "
                         f"{type(e).__name__}: {e}"
                     )
-                    self._phase = DONE
+                    if not self._retry_segment(self._phase):
+                        self._phase = DONE
                     continue
                 manip_done = manip_action.pop("done", False)
                 manip_failed = manip_action.pop("success", None) is False
@@ -574,10 +653,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
                 if manip_failed:
                     log.warning(f"[MOBILE PNP FSM] manipulation phase {self._phase} FAILED")
-                    self._phase = DONE
+                    if not self._retry_segment(self._phase):
+                        self._phase = DONE
                     continue
 
                 if self._phase == PICK:
+                    # Pick succeeded: cache the held-object state so the place
+                    # segment can be retried without redoing navigation+pick.
+                    self._checkpoints[PLACE] = self._capture_state()
                     self.task.set_nav_target(self.config.task_config.place_receptacle_name)
                     # Drive to the place-feasibility-verified base pose near the
                     # receptacle (Avenue A); None => fall back to goal sampling.
