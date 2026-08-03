@@ -15,11 +15,14 @@ Composition strategy:
 import logging
 
 import mujoco
+import numpy as np
 
 from molmo_spaces.env.env import CPUMujocoEnv
 from molmo_spaces.tasks.mobile_pick_and_place_task import MobilePickAndPlaceTask
 from molmo_spaces.tasks.pick_and_place_task_sampler import PickAndPlaceTaskSampler
-from molmo_spaces.tasks.task_sampler_errors import RobotPlacementError
+from molmo_spaces.tasks.task_sampler_errors import ObjectPlacementError, RobotPlacementError
+from molmo_spaces.utils.mj_model_and_data_utils import geom_aabb
+from molmo_spaces.utils.mujoco_scene_utils import place_object_near
 from molmo_spaces.utils.pose import pose_mat_to_7d
 
 log = logging.getLogger(__name__)
@@ -138,6 +141,100 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 f"[MOBILE PNP] Robot placed at nav-start pose "
                 f"{robot_view.base.pose[:2, 3]} (target={pickup_obj.name})."
             )
+
+    def _find_floor_geom_id(self, env: CPUMujocoEnv) -> int | None:
+        """Return the geom id of the largest floor/room surface in the scene.
+
+        Used to stand the place receptacle on the floor far from the pickup
+        object (giving a genuine second navigation segment). Returns ``None`` if
+        no floor/room body can be identified, in which case the caller falls
+        back to same-surface placement.
+        """
+        model = env.current_model
+        data = env.current_data
+        om = env.object_managers[env.current_batch_index]
+
+        best_geom: int | None = None
+        best_area = -1.0
+        for body_id in om.top_level_bodies():
+            try:
+                types = om.get_possible_object_types(body_id)
+            except Exception:
+                continue
+            if not any(t in {"room", "floor", "Floor", "Room"} for t in types):
+                continue
+            adr = int(model.body_geomadr[body_id])
+            num = int(model.body_geomnum[body_id])
+            for gid in range(adr, adr + num):
+                try:
+                    _, dims = geom_aabb(model, data, [gid])
+                except Exception:
+                    continue
+                area = float(dims[0] * dims[1])
+                if area > best_area:
+                    best_area = area
+                    best_geom = gid
+        return best_geom
+
+    def _prepare_place_target(
+        self,
+        env: CPUMujocoEnv,
+        place_target_name: str,
+        pickup_obj_name: str,
+        pickup_obj_pos: np.ndarray,
+        supporting_geom_id: int,
+    ) -> bool:
+        """Stand the place receptacle(s) on the floor a real navigation distance
+        from the pickup object, so mobile pick-and-place is genuinely
+        navigate -> grasp -> navigate -> place.
+
+        Falls back to the fixed-base same-surface placement when far-on-floor is
+        disabled or no floor geom can be found.
+        """
+        sampler_cfg = self.config.task_sampler_config
+        if not getattr(sampler_cfg, "far_place_on_floor", False):
+            return super()._prepare_place_target(
+                env, place_target_name, pickup_obj_name, pickup_obj_pos, supporting_geom_id
+            )
+
+        floor_geom_id = self._find_floor_geom_id(env)
+        if floor_geom_id is None:
+            log.warning(
+                "[MOBILE PNP] No floor geom found; falling back to same-surface "
+                "receptacle placement (short place-nav segment)."
+            )
+            return super()._prepare_place_target(
+                env, place_target_name, pickup_obj_name, pickup_obj_pos, supporting_geom_id
+            )
+
+        om = env.object_managers[env.current_batch_index]
+        for receptacle_name in self.active_receptacle_names:
+            if not self._filter_place_target(env, pickup_obj_name, receptacle_name):
+                log.info(f"Place receptacle {receptacle_name} fails filter size")
+                if self.config.task_sampler_config.added_pickup_objects:
+                    self._advance_to_next_added_pickupable(env)
+                return False
+
+            receptacle_id = om.get_object_body_id(receptacle_name)
+            try:
+                place_object_near(
+                    data=env.current_data,
+                    object_id=receptacle_id,
+                    placement_point=pickup_obj_pos,
+                    min_dist=sampler_cfg.far_min_object_to_receptacle_dist,
+                    max_dist=sampler_cfg.far_max_object_to_receptacle_dist,
+                    max_tries=sampler_cfg.max_place_receptacle_sampling_attempts,
+                    supporting_geom_id=floor_geom_id,
+                    z_eps=0.003,
+                )
+            except ObjectPlacementError:
+                log.info(
+                    f"[MOBILE PNP] Failed to stand receptacle {receptacle_name} on the "
+                    f"floor far from the pickup object."
+                )
+                return False
+
+        return True
 
     def _sample_task(self, env: CPUMujocoEnv) -> MobilePickAndPlaceTask:
         # Select pickup object + place receptacle and populate the task config

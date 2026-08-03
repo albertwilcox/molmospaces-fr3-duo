@@ -528,6 +528,78 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         mujoco.mj_setState(model, data, state, mujoco.mjtState.mjSTATE_INTEGRATION)
         mujoco.mj_forward(model, data)
 
+    # ------------------------------------------------------------------ #
+    # Arm-motion safety clamp (kinematic smoothness)                     #
+    # ------------------------------------------------------------------ #
+    def _smooth_arm_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        """Clamp commanded arm joint targets to a natural per-step velocity and
+        keep them inside the joint position limits.
+
+        The manipulation planner solves stateless IK per control step, so between
+        consecutive smooth TCP targets the base-locked IK can jump branches
+        (elbow flip) and emit single-step joint jumps of tens of rad/s, or return
+        solutions outside the joint limits. We clamp each arm move group's
+        commanded delta (relative to the *current measured* joint positions) to
+        ``arm_max_vel_rad_s * dt`` and clip the result inside the joint limits.
+        Normal planned motion is well under the cap, so this only smooths the
+        pathological IK-branch-flip spikes without lagging ordinary moves.
+        """
+        cfg = self.policy_config
+        if not getattr(cfg, "arm_smoothing_enabled", True):
+            return action
+
+        dt = self.config.policy_dt_ms / 1000.0
+        max_step = cfg.arm_max_vel_rad_s * dt
+        margin = cfg.arm_pos_limit_margin_rad
+        robot_view = self._manip_policy.robot_view
+
+        for mg in self._manip_policy._arm_move_group_ids():
+            if mg not in action:
+                continue
+            cmd = np.asarray(action[mg], dtype=np.float64)
+            mgv = robot_view.get_move_group(mg)
+            cur = np.asarray(mgv.joint_pos, dtype=np.float64)
+            if cmd.shape != cur.shape:
+                continue
+            # 1) Velocity clamp: bound the per-step change from the measured pose.
+            delta = np.clip(cmd - cur, -max_step, max_step)
+            cmd = cur + delta
+            # 2) Position clamp: keep inside the joint limits (with a margin).
+            limits = np.asarray(mgv.joint_pos_limits, dtype=np.float64)
+            if limits.shape == (cmd.shape[0], 2):
+                lo = limits[:, 0] + margin
+                hi = limits[:, 1] - margin
+                # Guard against degenerate/inverted ranges after margin.
+                valid = hi >= lo
+                cmd = np.where(valid, np.clip(cmd, lo, hi), cmd)
+            action[mg] = cmd
+        return action
+
+    def _damp_arm_velocity(self) -> None:
+        """Zero the arm joints' velocity so base motion during navigation cannot
+        accumulate momentum in the (position-held) stowed/held arm.
+
+        The holonomic base drives and turns quickly during transit; with the arm
+        only position-held, that base motion drags the arm and can spike the
+        measured joint velocity above the FR3 hardware limit (a visible, unnatural
+        arm jiggle while driving). Re-zeroing the arm dof velocity each nav step
+        (analogous to how :meth:`_snap_base_pose` zeros the base velocity during
+        manipulation) prevents momentum build-up, so the arm rides stowed smoothly
+        instead of jiggling.
+        """
+        model = self.task.env.current_model
+        data = self.task.env.current_data
+        robot_view = self.task.env.current_robot.robot_view
+        for mg in self._manip_policy._arm_move_group_ids():
+            mgv = robot_view.get_move_group(mg)
+            joint_ids = getattr(mgv, "_joint_ids", None)
+            if joint_ids is None:
+                continue
+            for jid in joint_ids:
+                dofadr = int(model.jnt_dofadr[jid])
+                data.qvel[dofadr] = 0.0
+        mujoco.mj_forward(model, data)
+
     def _retry_segment(self, seg: str) -> bool:
         """Restore the segment-start checkpoint and re-run the segment.
 
@@ -903,20 +975,19 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 nav_action = self._nav_policy.get_action(observation)
                 nav_done = nav_action.pop("done", False)
                 if not nav_done:
-                    if self._phase == NAV_TO_RECEPTACLE:
-                        # Actively hold the arm + gripper at their post-pick
-                        # (grasp-closed, lifted) setpoints during transport.
-                        # Commanding only the base lets the gripper servo relax,
-                        # so the object ends up held only by the qpos lock and the
-                        # fingers close to empty -> "not in grasp" at PLACE entry.
-                        robot_view = self.task.env.current_robot.robot_view
-                        gripper_ids = robot_view.get_gripper_movegroup_ids()
-                        hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
-                        hold[_BASE_MG_ID] = nav_action[_BASE_MG_ID]
-                        return hold
-                    # Drive only the base; arm stays stowed / holding, gripper
-                    # holds its state (absent keys => held stationary).
-                    return {_BASE_MG_ID: nav_action[_BASE_MG_ID]}
+                    robot_view = self.task.env.current_robot.robot_view
+                    gripper_ids = robot_view.get_gripper_movegroup_ids()
+                    # Actively hold the arm (+ gripper) at their held setpoints
+                    # during transit and damp any base-motion-induced arm
+                    # velocity, so driving/turning the holonomic base does not
+                    # fling the stowed/held arm (which otherwise shows up as
+                    # unnaturally fast arm motion during navigation). This applies
+                    # to BOTH nav segments; NAV_TO_RECEPTACLE additionally holds
+                    # the grasped object rigidly (grasp lock above).
+                    self._damp_arm_velocity()
+                    hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
+                    hold[_BASE_MG_ID] = nav_action[_BASE_MG_ID]
+                    return hold
 
                 if self._phase == NAV_TO_OBJ:
                     if not self._enter_pick():
@@ -988,7 +1059,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 manip_action.pop(_BASE_MG_ID, None)
 
                 if not manip_done:
-                    return manip_action
+                    return self._smooth_arm_action(manip_action)
 
                 if manip_failed:
                     log.warning(f"[MOBILE PNP FSM] manipulation phase {self._phase} FAILED")

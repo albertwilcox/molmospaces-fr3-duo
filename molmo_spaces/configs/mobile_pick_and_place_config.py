@@ -94,6 +94,17 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # Two receptacles preloaded is plenty for the vertical slice.
     num_place_receptacles: int = 2
 
+    # --- Far-apart place receptacle (genuine second navigation segment) -----
+    # The fixed-base sampler places the receptacle on the *same* support surface
+    # as the pickup object (within ~0.5 m), so the base barely moves between the
+    # grasp and the place. For mobile pick-and-place we instead stand the
+    # receptacle on the floor a real navigation distance away, so the episode is
+    # genuinely navigate -> grasp -> navigate -> place.
+    far_place_on_floor: bool = True
+    # Distance band (m) from the pickup object to stand the place receptacle.
+    far_min_object_to_receptacle_dist: float = 2.0
+    far_max_object_to_receptacle_dist: float = 5.0
+
 
 class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     """Config for the mobile pick-and-place state-machine expert.
@@ -123,6 +134,23 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     nav_standoff_succ_threshold: float = 0.8
     # Camera used by the (default-off) nav goal-visibility gate.
     nav_visibility_camera_name: str = "nav_camera"
+
+    # --- Arm-motion safety clamp (kinematic smoothness) ---------------------
+    # The manipulation planner interpolates the TCP target smoothly in task
+    # space and solves *stateless* IK per control step. Between consecutive
+    # targets the base-locked IK can jump branches (elbow flip), producing
+    # single-step joint jumps of tens of rad/s (far past the FR3 hardware limit
+    # of ~2.6 rad/s) and occasionally solutions outside the joint limits. We
+    # clamp the commanded arm joint deltas to a natural per-step velocity and
+    # keep them inside the joint limits so the executed motion is smooth and
+    # feasible. Normal manipulation moves the arm well under this cap, so the
+    # clamp only smooths the pathological IK-branch-flip spikes.
+    arm_smoothing_enabled: bool = True
+    # Max commanded arm joint speed (rad/s). Well under every FR3 hardware
+    # velocity limit (min 2.62 rad/s) yet above normal planned motion (~0.5).
+    arm_max_vel_rad_s: float = 1.5
+    # Keep commanded joints this far (rad) inside their position limits.
+    arm_pos_limit_margin_rad: float = 0.05
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
