@@ -152,6 +152,28 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # Keep commanded joints this far (rad) inside their position limits.
     arm_pos_limit_margin_rad: float = 0.05
 
+    # --- Base-motion slew limiter (nav smoothness) --------------------------
+    # The pure-pursuit follower emits a base *pose* target a fixed look-ahead
+    # ahead of the current pose; the holonomic base position servo then charges
+    # toward it at whatever speed it can (~2 m/s). That translation/turn drags
+    # the position-held stowed (or grasped) arm hard enough to spike its
+    # measured joint velocity past the FR3 hardware limit (a visible, unnatural
+    # arm jiggle while driving). We slew-limit the base pose command each nav
+    # step: bound the per-step translation and yaw of the *target* relative to
+    # the current base pose, and ramp the translation cap up over the first few
+    # steps of each nav segment so the base accelerates gently instead of
+    # lurching from rest. This keeps genuine navigation intact (the base still
+    # follows the same path, just smoothly) while eliminating the arm fling.
+    base_slew_enabled: bool = True
+    # Max base translation speed during nav (m/s). Real indoor mobile bases
+    # cruise ~1 m/s; the unclamped servo hit ~2 m/s, which flung the arm.
+    base_max_speed_m_s: float = 1.1
+    # Max base yaw rate during nav (rad/s).
+    base_max_yaw_rate_rad_s: float = 1.5
+    # Steps over which the translation speed cap ramps from ~0 to the max at the
+    # start of each nav segment (gentle acceleration).
+    base_accel_ramp_steps: int = 8
+
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
         if self.policy_cls is None:

@@ -54,6 +54,11 @@ DONE = "DONE"
 
 _BASE_MG_ID = "base"
 
+# Base translation (m) above which a ``_snap_base_pose`` teleport is treated as
+# a large discontinuity and the arm dof velocities are zeroed to absorb the
+# resulting kick (small per-step re-pin drift corrections stay below this).
+_LARGE_BASE_SNAP_M = 0.15
+
 
 class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
     """Pick-and-place planner adapted for a mobile base.
@@ -482,6 +487,15 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
         # Base pose to pin during manipulation (set by the base search).
         self._locked_base_pose: np.ndarray | None = None
+        # Per-segment nav step counter for the base acceleration ramp; reset on
+        # entry to each nav segment so the base eases off gently from rest.
+        self._nav_step_in_segment: int = 0
+        # Arm joint targets to pin while navigating, captured on entry to each
+        # nav segment. The raw actuator ctrl can be uninitialised (near-zero) at
+        # episode start, which would command the arm to straighten into a
+        # near-limit extended pose the instant the demo begins; pinning the
+        # captured stow pose keeps the arm safely tucked instead.
+        self._nav_arm_hold: dict[str, np.ndarray] | None = None
 
         # Grasp lock: keep the held object rigidly fixed to the gripper during
         # transport navigation so it doesn't slip out under base acceleration.
@@ -575,30 +589,49 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             action[mg] = cmd
         return action
 
-    def _damp_arm_velocity(self) -> None:
-        """Zero the arm joints' velocity so base motion during navigation cannot
-        accumulate momentum in the (position-held) stowed/held arm.
+    def _slew_base_command(self, base_cmd: np.ndarray) -> np.ndarray:
+        """Slew-limit a base pose command ``[x, y, heading]`` so the holonomic
+        base accelerates and turns gently during navigation.
 
-        The holonomic base drives and turns quickly during transit; with the arm
-        only position-held, that base motion drags the arm and can spike the
-        measured joint velocity above the FR3 hardware limit (a visible, unnatural
-        arm jiggle while driving). Re-zeroing the arm dof velocity each nav step
-        (analogous to how :meth:`_snap_base_pose` zeros the base velocity during
-        manipulation) prevents momentum build-up, so the arm rides stowed smoothly
-        instead of jiggling.
+        The pure-pursuit follower emits a target a fixed look-ahead ahead of the
+        current pose; the base position servo then charges toward it at whatever
+        speed it can (~2 m/s), dragging the position-held stowed/held arm hard
+        enough to spike its joint velocity past the hardware limit. We bound the
+        per-step translation and yaw of the *target* relative to the current base
+        pose (converting the m/s and rad/s caps to per-step deltas via the
+        control ``dt``), and ramp the translation cap up over the first few steps
+        of each nav segment so the base eases off from rest. The base still
+        follows the same path, just smoothly, so navigation is unchanged while
+        the arm no longer gets flung.
         """
-        model = self.task.env.current_model
-        data = self.task.env.current_data
-        robot_view = self.task.env.current_robot.robot_view
-        for mg in self._manip_policy._arm_move_group_ids():
-            mgv = robot_view.get_move_group(mg)
-            joint_ids = getattr(mgv, "_joint_ids", None)
-            if joint_ids is None:
-                continue
-            for jid in joint_ids:
-                dofadr = int(model.jnt_dofadr[jid])
-                data.qvel[dofadr] = 0.0
-        mujoco.mj_forward(model, data)
+        cfg = self.policy_config
+        if not getattr(cfg, "base_slew_enabled", True):
+            return base_cmd
+
+        dt = self.config.policy_dt_ms / 1000.0
+        base_pose = self.task.env.current_robot.robot_view.base.pose
+        cur_xy = np.asarray(base_pose[:2, 3], dtype=np.float64)
+        cur_yaw = float(np.arctan2(base_pose[1, 0], base_pose[0, 0]))
+
+        cmd = np.asarray(base_cmd, dtype=np.float64).copy()
+
+        # Ramp the translation cap up from rest over the first few nav steps.
+        ramp_steps = max(int(cfg.base_accel_ramp_steps), 1)
+        ramp = min(self._nav_step_in_segment + 1, ramp_steps) / ramp_steps
+        max_step = cfg.base_max_speed_m_s * dt * ramp
+        delta = cmd[:2] - cur_xy
+        dist = float(np.linalg.norm(delta))
+        if dist > max_step > 0.0:
+            cmd[:2] = cur_xy + delta * (max_step / dist)
+
+        # Bound the per-step yaw change (wrap to [-pi, pi] first).
+        max_yaw = cfg.base_max_yaw_rate_rad_s * dt
+        dyaw = float(np.arctan2(np.sin(cmd[2] - cur_yaw), np.cos(cmd[2] - cur_yaw)))
+        dyaw = float(np.clip(dyaw, -max_yaw, max_yaw))
+        cmd[2] = cur_yaw + dyaw
+
+        self._nav_step_in_segment += 1
+        return cmd
 
     def _retry_segment(self, seg: str) -> bool:
         """Restore the segment-start checkpoint and re-run the segment.
@@ -626,6 +659,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         override = getattr(task_cfg, info["override_attr"], None) if used == 0 else None
         self.task.set_nav_goal_override(override)
         self._nav_policy.reset()
+        self._nav_step_in_segment = 0
+        self._nav_arm_hold = None
         self._phase = info["nav_phase"]
         log.info(
             f"[MOBILE PNP FSM] retrying {seg} segment "
@@ -645,6 +680,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
     def reset(self) -> None:
         self._phase = NAV_TO_OBJ
+        self._nav_step_in_segment = 0
+        self._nav_arm_hold = None
         self._checkpoints = {}
         self._retry_counts = {}
         self._locked_base_pose = None
@@ -751,6 +788,25 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             for jid in joint_ids:
                 dofadr = int(model.jnt_dofadr[jid])
                 data.qvel[dofadr] = 0.0
+
+        # A LARGE base teleport (e.g. the initial manip-entry snap when nav
+        # parked far from the searched manip pose) instantaneously displaces the
+        # base under the position-held arm, kicking the arm dofs and igniting a
+        # physics blow-up (joint velocities/positions past the hardware limits).
+        # When the snap is large, also zero the arm dof velocities so the
+        # teleport imparts no spurious arm momentum. Small per-step re-pin drift
+        # corrections leave the arm velocity untouched so normal manipulation
+        # motion is unaffected.
+        base_shift = float(np.linalg.norm(pose_mat[:2, 3] - old_base[:2, 3]))
+        if base_shift > _LARGE_BASE_SNAP_M:
+            for mg in self._manip_policy._arm_move_group_ids():
+                mgv = robot_view.get_move_group(mg)
+                arm_jids = getattr(mgv, "_joint_ids", None)
+                if arm_jids is None:
+                    continue
+                for jid in arm_jids:
+                    dofadr = int(model.jnt_dofadr[jid])
+                    data.qvel[dofadr] = 0.0
 
         if carry_object_name is not None:
             delta = pose_mat @ np.linalg.inv(old_base)
@@ -978,15 +1034,29 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     robot_view = self.task.env.current_robot.robot_view
                     gripper_ids = robot_view.get_gripper_movegroup_ids()
                     # Actively hold the arm (+ gripper) at their held setpoints
-                    # during transit and damp any base-motion-induced arm
-                    # velocity, so driving/turning the holonomic base does not
+                    # during transit and slew-limit the base pose command so
+                    # driving/turning the holonomic base is gentle enough not to
                     # fling the stowed/held arm (which otherwise shows up as
                     # unnaturally fast arm motion during navigation). This applies
                     # to BOTH nav segments; NAV_TO_RECEPTACLE additionally holds
                     # the grasped object rigidly (grasp lock above).
-                    self._damp_arm_velocity()
                     hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
-                    hold[_BASE_MG_ID] = nav_action[_BASE_MG_ID]
+                    # Pin the arm to the stow pose captured on entry to this nav
+                    # segment instead of the (possibly uninitialised, near-zero)
+                    # actuator ctrl, which would otherwise straighten the arm out
+                    # into a near-limit extended pose the moment nav starts. The
+                    # position servo then actively holds the tuck and rejects any
+                    # base-motion-induced drift.
+                    if self._nav_arm_hold is None:
+                        self._nav_arm_hold = {
+                            mg: np.asarray(
+                                robot_view.get_move_group(mg).joint_pos, dtype=np.float64
+                            ).copy()
+                            for mg in self._manip_policy._arm_move_group_ids()
+                        }
+                    for mg, qpos in self._nav_arm_hold.items():
+                        hold[mg] = qpos
+                    hold[_BASE_MG_ID] = self._slew_base_command(nav_action[_BASE_MG_ID])
                     return hold
 
                 if self._phase == NAV_TO_OBJ:
@@ -1086,6 +1156,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         getattr(self.config.task_config, "place_robot_base_pose", None)
                     )
                     self._nav_policy.reset()
+                    self._nav_step_in_segment = 0
+                    self._nav_arm_hold = None
                     self._phase = NAV_TO_RECEPTACLE
                     log.info("[MOBILE PNP FSM] PICK done → phase NAV_TO_RECEPTACLE")
                 else:
