@@ -509,7 +509,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # Cache the full MuJoCo state at the start of each nav+manip segment so
         # a failed subtask can restore the last good state and retry (with a
         # freshly-sampled parking pose) instead of discarding the whole episode.
-        self._checkpoints: dict[str, np.ndarray] = {}
+        self._checkpoints: dict[str, tuple[np.ndarray, int]] = {}
         self._retry_counts: dict[str, int] = {}
         self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 2)
 
@@ -541,6 +541,38 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         data = self.task.env.current_data
         mujoco.mj_setState(model, data, state, mujoco.mjtState.mjSTATE_INTEGRATION)
         mujoco.mj_forward(model, data)
+
+    def _make_checkpoint(self) -> tuple[np.ndarray, int]:
+        """Capture the full MuJoCo state plus the current recording length so a
+        later restore can both rewind the physics AND discard the recorded frames
+        of the failed attempt (see :meth:`_restore_checkpoint`)."""
+        return self._capture_state(), len(self.task.observation_cache)
+
+    def _restore_checkpoint(self, ckpt: tuple[np.ndarray, int]) -> None:
+        """Restore a checkpoint captured by :meth:`_make_checkpoint`: rewind the
+        physics state and truncate the task's per-step recording buffers back to
+        the checkpoint length, so the failed subtask attempt (and the teleport
+        discontinuity introduced by rewinding) never appears in the saved
+        trajectory. The parallel per-step traces the rollout keeps for subtask
+        labels re-sync automatically off ``len(observation_cache)``."""
+        state, obs_len = ckpt
+        self._restore_state(state)
+        self._truncate_recording(obs_len)
+
+    def _truncate_recording(self, obs_len: int) -> None:
+        """Drop recorded frames past ``obs_len`` from every task cache so the
+        saved trajectory contains only the retained (good) prefix. The
+        observation/reward/terminal/truncated/success caches include the reset
+        frame (length = steps + 1); the action cache does not (length = steps)."""
+        task = self.task
+        obs_len = max(0, min(obs_len, len(task.observation_cache)))
+        del task.observation_cache[obs_len:]
+        del task.reward_cache[obs_len:]
+        del task.terminal_cache[obs_len:]
+        del task.truncated_cache[obs_len:]
+        del task.success_cache[obs_len:]
+        act_len = max(0, obs_len - 1)
+        del task.action_cache[act_len:]
 
     # ------------------------------------------------------------------ #
     # Arm-motion safety clamp (kinematic smoothness)                     #
@@ -650,7 +682,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             )
             return False
         self._retry_counts[seg] = used + 1
-        self._restore_state(ckpt)
+        self._restore_checkpoint(ckpt)
         task_cfg = self.config.task_config
         self.task.set_nav_target(getattr(task_cfg, info["target_attr"]))
         # First retry re-drives to the feasibility-verified override; later
@@ -693,9 +725,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # (Avenue A), not the closest navigable cell.
         self.task.set_nav_goal_override(getattr(self.config.task_config, "robot_base_pose", None))
         self._nav_policy.reset()
-        # Cache the pristine post-sample state so the whole pick segment
-        # (navigate-to-object + pick) can be retried from scratch.
-        self._checkpoints[PICK] = self._capture_state()
+        # Cache the pristine post-sample state (and recording length) so the
+        # whole pick segment (navigate-to-object + pick) can be retried from
+        # scratch, with the failed attempt truncated out of the saved data.
+        self._checkpoints[PICK] = self._make_checkpoint()
         log.info("[MOBILE PNP FSM] reset → phase NAV_TO_OBJ")
 
     # ------------------------------------------------------------------ #
@@ -1144,9 +1177,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     continue
 
                 if self._phase == PICK:
-                    # Pick succeeded: cache the held-object state so the place
-                    # segment can be retried without redoing navigation+pick.
-                    self._checkpoints[PLACE] = self._capture_state()
+                    # Pick succeeded: cache the held-object state (and recording
+                    # length) so the place segment can be retried without redoing
+                    # navigation+pick, with the failed attempt truncated out.
+                    self._checkpoints[PLACE] = self._make_checkpoint()
                     # Lock the object to the gripper for the transport nav.
                     self._capture_grasp_lock()
                     self.task.set_nav_target(self.config.task_config.place_receptacle_name)
