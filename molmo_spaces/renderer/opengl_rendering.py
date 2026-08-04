@@ -1,4 +1,5 @@
 import os
+import platform
 from queue import Queue
 from typing import Any, Literal
 
@@ -119,8 +120,15 @@ class MjOpenGLRenderer(MjAbstractRenderer):
         if device_id is None:
             from mujoco import gl_context
 
+            # Backend-agnostic context: mujoco.gl_context.GLContext selects the
+            # offscreen backend from the MUJOCO_GL env var (osmesa / glfw / egl).
+            # On a CPU-only Linux node set MUJOCO_GL=osmesa (and hide CUDA so
+            # device_id stays None) for software rendering.
             self._gl_context = gl_context.GLContext(width, height)  # type: ignore
-            self._context_is_cgl = True
+            # The CGL unlock dance below is macOS-only; the Linux OSMesa/GLFW
+            # backends must NOT call into mujoco.cgl (which dlopens the macOS
+            # OpenGL framework and crashes on Linux).
+            self._context_is_cgl = platform.system() == "Darwin"
         else:
             from molmo_spaces.renderer.opengl_context import EGLGLContext
 
