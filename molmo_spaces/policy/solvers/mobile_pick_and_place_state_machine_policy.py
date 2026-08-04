@@ -882,9 +882,15 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             candidates.append(pos_quat_to_pose_mat(np.asarray(verified_pose_7d, dtype=float)))
 
         # Standoffs near the arm's comfortable reach (closer is generally more
-        # reachable). Kept small and bounded so the feasibility probe stays cheap.
-        radii = (0.38, 0.46, 0.54)
-        n_ang = 8
+        # reachable). Denser than a minimal probe because the per-step cost is
+        # now ~8x lower (get_info memoization + receptacle-heuristic gate), so a
+        # wider feasibility search is affordable and directly attacks the
+        # dominant "IK failed (base-locked)" PLACE failures: a finer ring makes
+        # it far likelier that the strict all-waypoint-reachable pass finds a
+        # standoff, instead of falling back to a build-only pose that then aborts
+        # mid-execution. Includes a closer 0.34m radius for short-reach targets.
+        radii = (0.34, 0.40, 0.46, 0.52)
+        n_ang = 12
         ring: list[np.ndarray] = []
         for r in radii:
             for k in range(n_ang):
@@ -899,8 +905,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 ring.append(m)
         # Prefer standoffs closest to where navigation already parked the base.
         ring.sort(key=lambda m: (m[0, 3] - base_xy[0]) ** 2 + (m[1, 3] - base_xy[1]) ** 2)
-        # Bound the probe budget: verified hint + a handful of nearest standoffs.
-        candidates.extend(ring[:11])
+        # Bound the probe budget: verified hint + the nearest standoffs. Wider
+        # than before (18 vs 11) now that stepping is cheap.
+        candidates.extend(ring[:18])
         return candidates
 
     def _search_manip_base_pose(
