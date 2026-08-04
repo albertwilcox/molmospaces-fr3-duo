@@ -52,6 +52,20 @@ NAV_TO_RECEPTACLE = "NAV_TO_RECEPTACLE"
 PLACE = "PLACE"
 DONE = "DONE"
 
+# Internal control-flow-only phases: the smooth base "approach" that drives the
+# base from where navigation parked to the manipulation standoff selected by the
+# feasibility search, over several slew-limited steps, instead of teleporting it
+# there in one frame (which showed up in the data as a base "teleport"). These
+# are reported as their parent navigation phase for subtask labelling (the base
+# is still driving toward its target with the arm stowed), so they never appear
+# as distinct phases in ``get_all_phases``.
+APPROACH_PICK = "APPROACH_PICK"
+APPROACH_PLACE = "APPROACH_PLACE"
+# Map each approach phase to (parent nav phase for labelling, manip phase to
+# enter on arrival).
+_APPROACH_PARENT = {APPROACH_PICK: NAV_TO_OBJ, APPROACH_PLACE: NAV_TO_RECEPTACLE}
+_APPROACH_MANIP = {APPROACH_PICK: PICK, APPROACH_PLACE: PLACE}
+
 _BASE_MG_ID = "base"
 
 # Base translation (m) above which a ``_snap_base_pose`` teleport is treated as
@@ -665,6 +679,119 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._nav_step_in_segment += 1
         return cmd
 
+    def _begin_base_approach(self, approach_phase: str, parked_pose: np.ndarray) -> None:
+        """Start a smooth base approach toward the searched manip standoff.
+
+        ``_enter_pick``/``_enter_place`` select ``_locked_base_pose`` by snapping
+        the base to a feasibility-verified standoff, which teleports it in one
+        frame (a base "teleport" in the recorded data). Instead of executing from
+        there, we snap the base back to where navigation actually parked and then
+        drive it to the standoff over several slew-limited steps, so the recorded
+        base motion is continuous and stays under the teleport threshold. The
+        manip primitives were already built at the standoff during the search and
+        stay valid: the base is re-pinned exactly there the instant we enter the
+        manip phase.
+        """
+        cfg = self.policy_config
+        target = self._locked_base_pose.copy()
+        carry = self.config.task_config.pickup_obj_name if approach_phase == APPROACH_PLACE else None
+        if not getattr(cfg, "base_approach_enabled", True):
+            # Approach disabled: leave the base at the standoff (legacy teleport).
+            self._phase = _APPROACH_MANIP[approach_phase]
+            return
+        # Undo the search teleport: put the base back where nav parked (carrying
+        # the held object along on PLACE so it isn't dropped) so the approach
+        # starts from the real parked pose.
+        self._snap_base_pose(parked_pose, carry_object_name=carry)
+        self._approach_target = target
+        self._approach_carry = carry
+        self._approach_steps = 0
+        # Re-arm the arm hold so the approach pins the arm at its current stow
+        # pose (mirrors a fresh nav segment).
+        self._nav_arm_hold = None
+        self._nav_step_in_segment = 0
+        self._phase = approach_phase
+        log.info(
+            f"[MOBILE PNP FSM] {_APPROACH_PARENT[approach_phase]} parked at "
+            f"({parked_pose[0, 3]:.2f}, {parked_pose[1, 3]:.2f}); smoothly approaching "
+            f"standoff ({target[0, 3]:.2f}, {target[1, 3]:.2f})."
+        )
+
+    def _step_base_approach(self, observation: Any) -> dict[str, Any] | None:
+        """One step of the smooth base approach. Returns an action dict while
+        still approaching, or ``None`` once the standoff is reached (the caller
+        then enters the manip phase, which re-pins the base at the standoff).
+
+        The base is advanced by *bounded qpos increments* toward the standoff
+        (each step's translation/yaw capped to the nav speed limits), exactly as
+        the manip phase pins the base, rather than by charging the physics
+        position servo at the target. Driving by increments keeps every recorded
+        step continuous and under the teleport threshold AND cannot stall when
+        the short parked->standoff move grazes the furniture the robot is about
+        to manipulate from (the servo would wedge and leave a residual snap)."""
+        cfg = self.policy_config
+        robot_view = self.task.env.current_robot.robot_view
+        gripper_ids = robot_view.get_gripper_movegroup_ids()
+        target = self._approach_target
+
+        base_pose = robot_view.base.pose
+        cur_xy = np.asarray(base_pose[:2, 3], dtype=np.float64)
+        cur_yaw = float(np.arctan2(base_pose[1, 0], base_pose[0, 0]))
+        tgt_xy = np.asarray(target[:2, 3], dtype=np.float64)
+        tgt_yaw = float(np.arctan2(target[1, 0], target[0, 0]))
+        pos_err = float(np.linalg.norm(tgt_xy - cur_xy))
+        yaw_err = abs(float(np.arctan2(np.sin(tgt_yaw - cur_yaw), np.cos(tgt_yaw - cur_yaw))))
+
+        pos_tol = getattr(cfg, "base_approach_pos_tol_m", 0.04)
+        yaw_tol = getattr(cfg, "base_approach_yaw_tol_rad", 0.05)
+        max_steps = int(getattr(cfg, "base_approach_max_steps", 60))
+        if (pos_err <= pos_tol and yaw_err <= yaw_tol) or self._approach_steps >= max_steps:
+            log.info(
+                f"[MOBILE PNP FSM] base approach done after {self._approach_steps} steps "
+                f"(pos_err={pos_err:.3f}m, yaw_err={yaw_err:.3f}rad)."
+            )
+            return None  # arrived (or budget spent): commit to manipulation.
+
+        # Bound this step's translation and yaw to the nav speed caps (ramping
+        # the translation up from rest over the first few steps), then snap the
+        # base to the resulting intermediate pose.
+        dt = self.config.policy_dt_ms / 1000.0
+        ramp_steps = max(int(getattr(cfg, "base_accel_ramp_steps", 8)), 1)
+        ramp = min(self._approach_steps + 1, ramp_steps) / ramp_steps
+        max_step = float(cfg.base_max_speed_m_s) * dt * ramp
+        max_yaw = float(cfg.base_max_yaw_rate_rad_s) * dt
+
+        delta = tgt_xy - cur_xy
+        dist = float(np.linalg.norm(delta))
+        new_xy = tgt_xy if dist <= max_step or dist == 0.0 else cur_xy + delta * (max_step / dist)
+        dyaw = float(np.arctan2(np.sin(tgt_yaw - cur_yaw), np.cos(tgt_yaw - cur_yaw)))
+        dyaw = float(np.clip(dyaw, -max_yaw, max_yaw))
+        new_yaw = cur_yaw + dyaw
+
+        step_pose = np.eye(4)
+        c, s = np.cos(new_yaw), np.sin(new_yaw)
+        step_pose[:3, :3] = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        step_pose[0, 3], step_pose[1, 3] = float(new_xy[0]), float(new_xy[1])
+        step_pose[2, 3] = float(target[2, 3])
+        # Snap to the intermediate pose (carrying the held object on PLACE) and
+        # set the base setpoint so physics holds it there for this step.
+        self._snap_base_pose(step_pose, carry_object_name=self._approach_carry)
+
+        hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
+        if self._nav_arm_hold is None:
+            self._nav_arm_hold = {
+                mg: np.asarray(
+                    robot_view.get_move_group(mg).joint_pos, dtype=np.float64
+                ).copy()
+                for mg in self._manip_policy._arm_move_group_ids()
+            }
+        for mg, qpos in self._nav_arm_hold.items():
+            hold[mg] = qpos
+        # Base is pinned via the snap above; do not command it through the action.
+        hold.pop(_BASE_MG_ID, None)
+        self._approach_steps += 1
+        return hold
+
     def _retry_segment(self, seg: str) -> bool:
         """Restore the segment-start checkpoint and re-run the segment.
 
@@ -705,7 +832,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         return {}
 
     def get_phase(self) -> str:
-        return self._phase
+        # Report the smooth base-approach sub-phases as their parent navigation
+        # phase: the base is still driving toward its goal with the arm stowed,
+        # so the subtask labeller merges them into the navigation segment (and
+        # they must not surface as unknown phases that would be dropped).
+        return _APPROACH_PARENT.get(self._phase, self._phase)
 
     def get_all_phases(self) -> dict[str, int]:
         return {NAV_TO_OBJ: 0, PICK: 1, NAV_TO_RECEPTACLE: 2, PLACE: 3, DONE: 4}
@@ -717,6 +848,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._checkpoints = {}
         self._retry_counts = {}
         self._locked_base_pose = None
+        # Smooth base-approach sub-phase state (drives the base from the parked
+        # nav pose to the manip standoff over several slew-limited steps).
+        self._approach_target = None
+        self._approach_carry = None
+        self._approach_steps = 0
         self._grasp_offset = None
         self._grasp_mg_id = None
         self._place_released = False
@@ -1100,12 +1236,17 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     return hold
 
                 if self._phase == NAV_TO_OBJ:
+                    parked_pose = self.task.env.current_robot.robot_view.base.pose.copy()
                     if not self._enter_pick():
                         if not self._retry_segment(PICK):
                             self._phase = DONE
                         continue
-                    self._phase = PICK
+                    # Drive smoothly from the parked pose to the searched standoff
+                    # instead of teleporting there (sets phase to APPROACH_PICK,
+                    # or straight to PICK if approach is disabled).
+                    self._begin_base_approach(APPROACH_PICK, parked_pose)
                 else:
+                    parked_pose = self.task.env.current_robot.robot_view.base.pose.copy()
                     if not self._enter_place():
                         if not self._retry_segment(PLACE):
                             self._phase = DONE
@@ -1114,7 +1255,19 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     # preplace move (arm repositioning above the receptacle while
                     # holding); it is released at the final lowering/open segment
                     # inside the PICK/PLACE branch so the object can be set down.
-                    self._phase = PLACE
+                    self._begin_base_approach(APPROACH_PLACE, parked_pose)
+                continue
+
+            if self._phase in (APPROACH_PICK, APPROACH_PLACE):
+                action = self._step_base_approach(observation)
+                if action is not None:
+                    return action
+                # Arrived at the standoff: re-pin the base exactly there and hand
+                # off to the manipulation phase built during the search.
+                self._snap_base_pose(self._locked_base_pose, carry_object_name=self._approach_carry)
+                self._phase = _APPROACH_MANIP[self._phase]
+                self._approach_target = None
+                self._approach_carry = None
                 continue
 
             if self._phase in (PICK, PLACE):

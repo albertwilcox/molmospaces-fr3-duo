@@ -22,7 +22,7 @@ from molmo_spaces.tasks.mobile_pick_and_place_task import MobilePickAndPlaceTask
 from molmo_spaces.tasks.pick_and_place_task_sampler import PickAndPlaceTaskSampler
 from molmo_spaces.tasks.task_sampler_errors import ObjectPlacementError, RobotPlacementError
 from molmo_spaces.utils.mj_model_and_data_utils import geom_aabb
-from molmo_spaces.utils.mujoco_scene_utils import place_object_near
+from molmo_spaces.utils.mujoco_scene_utils import get_supporting_geom, place_object_near
 from molmo_spaces.utils.pose import pose_mat_to_7d
 
 log = logging.getLogger(__name__)
@@ -176,6 +176,80 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                     best_geom = gid
         return best_geom
 
+    def _floor_top_z(self, env: CPUMujocoEnv) -> float:
+        """Top-z of the scene floor (fallback 0.0), used as the reference height
+        above which a candidate place surface counts as 'elevated'."""
+        floor_geom_id = self._find_floor_geom_id(env)
+        if floor_geom_id is None:
+            return 0.0
+        try:
+            center, dims = geom_aabb(env.current_model, env.current_data, [floor_geom_id])
+        except Exception:
+            return 0.0
+        return float(center[2] + dims[2] / 2.0)
+
+    def _find_far_elevated_surface_geoms(
+        self, env: CPUMujocoEnv, pickup_obj_pos: np.ndarray
+    ) -> list[int]:
+        """Discover elevated support surfaces (table / counter / shelf tops) a
+        real navigation distance from the pickup object.
+
+        Rather than guess which geoms are surfaces, we probe the surfaces that
+        *already support scene objects*: for every top-level object we find the
+        geom it rests on (``get_supporting_geom``) and keep the unique surfaces
+        whose top is elevated above the floor, whose flat top is large enough for
+        the receptacle, and whose horizontal distance from the pickup lies in the
+        far band. Farther surfaces are preferred so the place-nav segment is
+        genuinely exercised.
+        """
+        sampler_cfg = self.config.task_sampler_config
+        model = env.current_model
+        data = env.current_data
+        om = env.object_managers[env.current_batch_index]
+
+        floor_z = self._floor_top_z(env)
+        min_top_z = floor_z + float(sampler_cfg.elevated_min_height_m)
+        min_area = float(sampler_cfg.elevated_min_surface_area_m2)
+        far_min = float(sampler_cfg.far_min_object_to_receptacle_dist)
+        far_max = float(sampler_cfg.far_max_object_to_receptacle_dist)
+        pickup_xy = np.asarray(pickup_obj_pos)[:2]
+
+        seen: set[int] = set()
+        scored: list[tuple[float, int]] = []
+        for body_id in om.top_level_bodies():
+            name = om.get_object_name(body_id)
+            if not name or om.is_excluded(name) or om.is_structural(name):
+                continue
+            try:
+                geom_id = get_supporting_geom(data, int(body_id))
+            except Exception:
+                geom_id = None
+            if geom_id is None or int(geom_id) < 1 or int(geom_id) in seen:
+                continue
+            seen.add(int(geom_id))
+            try:
+                center, dims = geom_aabb(model, data, [int(geom_id)])
+            except Exception:
+                continue
+            top_z = float(center[2] + dims[2] / 2.0)
+            area = float(dims[0] * dims[1])
+            if top_z < min_top_z or area < min_area:
+                continue
+            dist = float(np.linalg.norm(np.asarray(center[:2]) - pickup_xy))
+            if not (far_min <= dist <= far_max):
+                continue
+            scored.append((dist, int(geom_id)))
+
+        # Prefer farther surfaces (genuine place-nav segment) but keep all
+        # candidates so placement can fall through to a nearer elevated surface.
+        scored.sort(key=lambda t: -t[0])
+        log.info(
+            f"[MOBILE PNP] elevated-surface search: {len(scored)} candidate surface(s) "
+            f"in [{far_min:.1f},{far_max:.1f}]m band above z={min_top_z:.2f} "
+            f"(probed {len(seen)} supporting geoms)."
+        )
+        return [gid for _, gid in scored]
+
     def _prepare_place_target(
         self,
         env: CPUMujocoEnv,
@@ -184,29 +258,109 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         pickup_obj_pos: np.ndarray,
         supporting_geom_id: int,
     ) -> bool:
-        """Stand the place receptacle(s) on the floor a real navigation distance
-        from the pickup object, so mobile pick-and-place is genuinely
-        navigate -> grasp -> navigate -> place.
+        """Stand the place receptacle(s) on an *elevated* surface a real
+        navigation distance from the pickup object, so mobile pick-and-place is
+        genuinely navigate -> grasp -> navigate -> place and the place target is
+        at a natural, reachable manipulation height (never on the floor).
 
-        Falls back to the fixed-base same-surface placement when far-on-floor is
-        disabled or no floor geom can be found.
+        Order of preference:
+        1. A far elevated surface (table/counter/shelf top) -- the desired case.
+        2. (legacy, off by default) the floor far away, if ``far_place_on_floor``.
+        3. The fixed-base same-surface placement (elevated, reachable, but a short
+           place-nav segment) as a last resort so a valid episode is still
+           produced instead of dropping the house.
         """
         sampler_cfg = self.config.task_sampler_config
-        if not getattr(sampler_cfg, "far_place_on_floor", False):
-            return super()._prepare_place_target(
-                env, place_target_name, pickup_obj_name, pickup_obj_pos, supporting_geom_id
+        om = env.object_managers[env.current_batch_index]
+
+        if getattr(sampler_cfg, "far_place_on_elevated_surface", True):
+            surface_geoms = self._find_far_elevated_surface_geoms(env, pickup_obj_pos)
+            if surface_geoms and self._place_receptacles_on_surfaces(
+                env, pickup_obj_name, surface_geoms
+            ):
+                return True
+            log.info(
+                "[MOBILE PNP] No far elevated surface worked for the receptacle; "
+                "falling back."
             )
 
-        floor_geom_id = self._find_floor_geom_id(env)
-        if floor_geom_id is None:
-            log.warning(
-                "[MOBILE PNP] No floor geom found; falling back to same-surface "
-                "receptacle placement (short place-nav segment)."
-            )
-            return super()._prepare_place_target(
-                env, place_target_name, pickup_obj_name, pickup_obj_pos, supporting_geom_id
-            )
+        if getattr(sampler_cfg, "far_place_on_floor", False):
+            floor_geom_id = self._find_floor_geom_id(env)
+            if floor_geom_id is not None and self._place_receptacles_on_floor(
+                env, pickup_obj_name, pickup_obj_pos, floor_geom_id
+            ):
+                return True
 
+        log.info(
+            "[MOBILE PNP] Falling back to same-surface receptacle placement "
+            "(short place-nav segment, still elevated)."
+        )
+        return super()._prepare_place_target(
+            env, place_target_name, pickup_obj_name, pickup_obj_pos, supporting_geom_id
+        )
+
+    def _place_receptacles_on_surfaces(
+        self, env: CPUMujocoEnv, pickup_obj_name: str, surface_geoms: list[int]
+    ) -> bool:
+        """Stand every active receptacle on the first far elevated surface that
+        accommodates it. Returns False if no surface works for a receptacle."""
+        sampler_cfg = self.config.task_sampler_config
+        om = env.object_managers[env.current_batch_index]
+        model = env.current_model
+        data = env.current_data
+
+        for receptacle_name in self.active_receptacle_names:
+            if not self._filter_place_target(env, pickup_obj_name, receptacle_name):
+                log.info(f"Place receptacle {receptacle_name} fails filter size")
+                if self.config.task_sampler_config.added_pickup_objects:
+                    self._advance_to_next_added_pickupable(env)
+                return False
+
+            receptacle_id = om.get_object_body_id(receptacle_name)
+            placed = False
+            for geom_id in surface_geoms:
+                try:
+                    center, dims = geom_aabb(model, data, [int(geom_id)])
+                except Exception:
+                    continue
+                reach = float(max(dims[0], dims[1]) / 2.0)
+                try:
+                    place_object_near(
+                        data=data,
+                        object_id=receptacle_id,
+                        placement_point=np.asarray(center, dtype=float),
+                        min_dist=0.0,
+                        max_dist=reach,
+                        max_tries=sampler_cfg.max_place_receptacle_sampling_attempts,
+                        supporting_geom_id=int(geom_id),
+                        z_eps=0.003,
+                    )
+                    placed = True
+                    log.info(
+                        f"[MOBILE PNP] Stood receptacle {receptacle_name} on far elevated "
+                        f"surface geom {int(geom_id)} (top area~{dims[0]*dims[1]:.2f}m^2)."
+                    )
+                    break
+                except ObjectPlacementError:
+                    continue
+            if not placed:
+                log.info(
+                    f"[MOBILE PNP] Could not stand receptacle {receptacle_name} on any "
+                    f"of {len(surface_geoms)} far elevated surfaces."
+                )
+                return False
+
+        return True
+
+    def _place_receptacles_on_floor(
+        self,
+        env: CPUMujocoEnv,
+        pickup_obj_name: str,
+        pickup_obj_pos: np.ndarray,
+        floor_geom_id: int,
+    ) -> bool:
+        """Legacy far-on-floor placement (kept behind ``far_place_on_floor``)."""
+        sampler_cfg = self.config.task_sampler_config
         om = env.object_managers[env.current_batch_index]
         for receptacle_name in self.active_receptacle_names:
             if not self._filter_place_target(env, pickup_obj_name, receptacle_name):

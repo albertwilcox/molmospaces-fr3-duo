@@ -98,12 +98,28 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # The fixed-base sampler places the receptacle on the *same* support surface
     # as the pickup object (within ~0.5 m), so the base barely moves between the
     # grasp and the place. For mobile pick-and-place we instead stand the
-    # receptacle on the floor a real navigation distance away, so the episode is
-    # genuinely navigate -> grasp -> navigate -> place.
-    far_place_on_floor: bool = True
+    # receptacle on a *different elevated surface* (table / counter / shelf) a
+    # real navigation distance away, so the episode is genuinely
+    # navigate -> grasp -> navigate -> place AND the place target is at a
+    # natural, reachable manipulation height (never on the floor).
+    far_place_on_elevated_surface: bool = True
+    # Legacy: stand the receptacle on the floor far away. Kept for backward
+    # compatibility but disabled by default -- floor placements put the place
+    # target below the arm's comfortable workspace and produced unreachable
+    # (and unnatural) placements.
+    far_place_on_floor: bool = False
+    # A candidate place surface must have its top at least this far above the
+    # floor to count as "elevated" (excludes rugs / floor-level geoms).
+    elevated_min_height_m: float = 0.30
+    # A candidate place surface must have at least this much flat top area (m^2)
+    # so the receptacle actually fits on it.
+    elevated_min_surface_area_m2: float = 0.06
     # Distance band (m) from the pickup object to stand the place receptacle.
-    far_min_object_to_receptacle_dist: float = 2.0
-    far_max_object_to_receptacle_dist: float = 5.0
+    # Widened from a tight [2,5] band so far *elevated* surfaces (which are
+    # sparser than the floor) are found more often before falling back to the
+    # same-surface (close, still elevated) placement.
+    far_min_object_to_receptacle_dist: float = 1.5
+    far_max_object_to_receptacle_dist: float = 8.0
 
 
 class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
@@ -165,14 +181,44 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # lurching from rest. This keeps genuine navigation intact (the base still
     # follows the same path, just smoothly) while eliminating the arm fling.
     base_slew_enabled: bool = True
-    # Max base translation speed during nav (m/s). Real indoor mobile bases
-    # cruise ~1 m/s; the unclamped servo hit ~2 m/s, which flung the arm.
-    base_max_speed_m_s: float = 1.1
-    # Max base yaw rate during nav (rad/s).
-    base_max_yaw_rate_rad_s: float = 1.5
+    # Max base translation speed during nav (m/s). The holonomic base is a
+    # critically-damped position servo (kp=25000, ζ=1) that tracks the
+    # slew-capped setpoint within a control step, so this cap is effectively the
+    # cruise speed. Raised from 1.1 -> 1.6 (real indoor bases cruise ~1-1.5 m/s)
+    # to speed navigation up; the stowed/held arm is separately position-held and
+    # velocity-clamped (arm_smoothing) so the faster base does not fling it.
+    base_max_speed_m_s: float = 1.6
+    # Max base yaw rate during nav (rad/s). Raised 1.5 -> 2.0 to match.
+    base_max_yaw_rate_rad_s: float = 2.0
     # Steps over which the translation speed cap ramps from ~0 to the max at the
     # start of each nav segment (gentle acceleration).
     base_accel_ramp_steps: int = 8
+
+    # --- Smooth base approach (nav -> manip standoff) -----------------------
+    # When navigation finishes, the manip feasibility search selects a standoff
+    # base pose that generally differs from where the base parked and snaps the
+    # base there in a single frame -- a base "teleport" in the recorded data. We
+    # instead drive the base from the parked pose to the standoff over several
+    # slew-limited steps (labelled as navigation, arm stowed), so the recorded
+    # base motion stays continuous and under the teleport-detection threshold.
+    #
+    # DISABLED BY DEFAULT: the parked->standoff gap is small (~0.1-0.4 m) and is
+    # NOT the gross "teleport back to the start" the debug videos show (that is
+    # the retry checkpoint-restore, which is truncated out of saved data).
+    # Integrating physics (mj_step) while the pinned base slides the last ~0.1 m
+    # into the manipulation standoff perturbs the scene enough to corrupt the
+    # immediately-following grasp (empirically: PICK "Object is not in grasp!"
+    # gross misses, dropping end-to-end success from ~8% to ~0% in a 24-house
+    # A/B). The single-frame standoff snap the direct path leaves is small and
+    # visually imperceptible, so we keep the (grasp-preserving) direct snap.
+    base_approach_enabled: bool = False
+    # Position/heading tolerance for declaring the approach complete (the final
+    # re-pin to the exact standoff is then far below the teleport threshold).
+    base_approach_pos_tol_m: float = 0.04
+    base_approach_yaw_tol_rad: float = 0.05
+    # Hard cap on approach steps so a stuck approach still commits to the manip
+    # phase (a rare, small residual snap) rather than looping forever.
+    base_approach_max_steps: int = 60
 
     def model_post_init(self, __context) -> None:
         super().model_post_init(__context)
