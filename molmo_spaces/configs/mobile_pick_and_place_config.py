@@ -121,6 +121,20 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     far_min_object_to_receptacle_dist: float = 1.5
     far_max_object_to_receptacle_dist: float = 8.0
 
+    # --- Same-room placement filter -----------------------------------------
+    # Restrict the place receptacle to a surface in the *same room* as the
+    # pickup object. This keeps the task an intra-room mobile pick-and-place
+    # (navigate -> grasp -> navigate -> place all within one room), which is the
+    # in-scope regime for the project. Room membership is read from the scene
+    # object body-name convention ``..._<room_id>`` (the trailing field); a
+    # candidate elevated surface is same-room iff its supporting body's room id
+    # matches the pickup object's. When enabled, the far-distance band lower
+    # bound is relaxed to ``same_room_min_object_to_receptacle_dist`` because
+    # intra-room navigation distances are naturally shorter, so we still exercise
+    # a genuine (if shorter) place-nav segment without starving candidates.
+    same_room_place_only: bool = True
+    same_room_min_object_to_receptacle_dist: float = 0.8
+
 
 class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     """Config for the mobile pick-and-place state-machine expert.
@@ -167,6 +181,30 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     arm_max_vel_rad_s: float = 1.5
     # Keep commanded joints this far (rad) inside their position limits.
     arm_pos_limit_margin_rad: float = 0.05
+
+    # --- Pre-navigation arm retract (stow pose) -----------------------------
+    # Before/while navigating, retract the arm to a compact, natural "home" tuck
+    # instead of pinning it at whatever (possibly extended, near-joint-limit)
+    # pose it happened to be in when the nav segment began. Watching the raw
+    # demos, the arm would immediately straighten out toward a joint limit the
+    # moment navigation started (an unnatural extended-arm drive). We instead
+    # ramp the held setpoint from the measured pose toward this stow config at
+    # the arm velocity cap (arm_max_vel_rad_s), so the arm tucks in smoothly and
+    # then drives with a retracted arm. The target matches the canonical
+    # robocasa mobile-manipulation home pose (per-joint mean over the reference
+    # dataset /mnt/disk/robocasa_data, std ~0.02 rad): a compact FR3 tuck.
+    nav_arm_retract_enabled: bool = True
+    # 7-DOF FR3 stow/home joint config (rad), joint1..joint7 order. Matches the
+    # robocasa reference dataset's reset arm configuration.
+    nav_arm_stow_qpos: tuple[float, ...] = (
+        -0.02,
+        -1.04,
+        -0.02,
+        -2.27,
+        0.04,
+        1.52,
+        0.70,
+    )
 
     # --- Base-motion slew limiter (nav smoothness) --------------------------
     # The pure-pursuit follower emits a base *pose* target a fixed look-ahead

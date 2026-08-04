@@ -635,6 +635,54 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             action[mg] = cmd
         return action
 
+    def _held_nav_arm_setpoints(self, robot_view: Any) -> dict[str, np.ndarray]:
+        """Arm move-group setpoints to hold during a nav/approach segment.
+
+        Instead of pinning the arm at whatever (possibly extended, near-limit)
+        pose it happened to be in when the segment began, ramp the held setpoint
+        from the measured pose toward the compact stow/home config
+        (``nav_arm_stow_qpos``) at the arm velocity cap (``arm_max_vel_rad_s``).
+        The base's position servo then drives with a retracted arm and the ramp
+        keeps the retract smooth (no fast/flinging arm motion). Falls back to a
+        constant hold of the entry pose when the retract is disabled or the move
+        group's DOF does not match the stow config (e.g. a non-7-DOF arm)."""
+        cfg = self.policy_config
+        arm_mgs = self._manip_policy._arm_move_group_ids()
+        if self._nav_arm_hold is None:
+            # Seed the ramp from the measured pose so it starts where the arm is.
+            self._nav_arm_hold = {
+                mg: np.asarray(
+                    robot_view.get_move_group(mg).joint_pos, dtype=np.float64
+                ).copy()
+                for mg in arm_mgs
+            }
+        if not getattr(cfg, "nav_arm_retract_enabled", True):
+            return self._nav_arm_hold
+
+        dt = self.config.policy_dt_ms / 1000.0
+        max_step = cfg.arm_max_vel_rad_s * dt
+        margin = cfg.arm_pos_limit_margin_rad
+        stow = np.asarray(cfg.nav_arm_stow_qpos, dtype=np.float64)
+        for mg in arm_mgs:
+            cur = self._nav_arm_hold.get(mg)
+            if cur is None:
+                continue
+            if cur.shape != stow.shape:
+                # DOF mismatch (not the 7-DOF FR3 arm): hold the entry pose.
+                continue
+            target = stow.copy()
+            mgv = robot_view.get_move_group(mg)
+            limits = np.asarray(mgv.joint_pos_limits, dtype=np.float64)
+            if limits.shape == (cur.shape[0], 2):
+                lo = limits[:, 0] + margin
+                hi = limits[:, 1] - margin
+                valid = hi >= lo
+                target = np.where(valid, np.clip(target, lo, hi), target)
+            # Ramp toward the stow config at the per-step velocity cap.
+            delta = np.clip(target - cur, -max_step, max_step)
+            self._nav_arm_hold[mg] = cur + delta
+        return self._nav_arm_hold
+
     def _slew_base_command(self, base_cmd: np.ndarray) -> np.ndarray:
         """Slew-limit a base pose command ``[x, y, heading]`` so the holonomic
         base accelerates and turns gently during navigation.
@@ -778,14 +826,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._snap_base_pose(step_pose, carry_object_name=self._approach_carry)
 
         hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
-        if self._nav_arm_hold is None:
-            self._nav_arm_hold = {
-                mg: np.asarray(
-                    robot_view.get_move_group(mg).joint_pos, dtype=np.float64
-                ).copy()
-                for mg in self._manip_policy._arm_move_group_ids()
-            }
-        for mg, qpos in self._nav_arm_hold.items():
+        for mg, qpos in self._held_nav_arm_setpoints(robot_view).items():
             hold[mg] = qpos
         # Base is pinned via the snap above; do not command it through the action.
         hold.pop(_BASE_MG_ID, None)
@@ -1217,20 +1258,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     # to BOTH nav segments; NAV_TO_RECEPTACLE additionally holds
                     # the grasped object rigidly (grasp lock above).
                     hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
-                    # Pin the arm to the stow pose captured on entry to this nav
-                    # segment instead of the (possibly uninitialised, near-zero)
-                    # actuator ctrl, which would otherwise straighten the arm out
-                    # into a near-limit extended pose the moment nav starts. The
-                    # position servo then actively holds the tuck and rejects any
-                    # base-motion-induced drift.
-                    if self._nav_arm_hold is None:
-                        self._nav_arm_hold = {
-                            mg: np.asarray(
-                                robot_view.get_move_group(mg).joint_pos, dtype=np.float64
-                            ).copy()
-                            for mg in self._manip_policy._arm_move_group_ids()
-                        }
-                    for mg, qpos in self._nav_arm_hold.items():
+                    # Pin the arm to a compact stow pose while navigating instead
+                    # of the (possibly uninitialised, near-zero) actuator ctrl,
+                    # which would otherwise straighten the arm out into a
+                    # near-limit extended pose the moment nav starts. The setpoint
+                    # ramps smoothly from the entry pose toward the stow config so
+                    # the arm retracts naturally, then the position servo actively
+                    # holds the tuck and rejects any base-motion-induced drift.
+                    for mg, qpos in self._held_nav_arm_setpoints(robot_view).items():
                         hold[mg] = qpos
                     hold[_BASE_MG_ID] = self._slew_base_command(nav_action[_BASE_MG_ID])
                     return hold

@@ -13,6 +13,7 @@ Composition strategy:
 """
 
 import logging
+from typing import Any
 
 import mujoco
 import numpy as np
@@ -210,8 +211,19 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         floor_z = self._floor_top_z(env)
         min_top_z = floor_z + float(sampler_cfg.elevated_min_height_m)
         min_area = float(sampler_cfg.elevated_min_surface_area_m2)
-        far_min = float(sampler_cfg.far_min_object_to_receptacle_dist)
         far_max = float(sampler_cfg.far_max_object_to_receptacle_dist)
+        # When restricting the place to the pickup object's room, relax the lower
+        # distance bound (intra-room distances are shorter) and resolve the
+        # pickup object's room id for same-room filtering of candidate surfaces.
+        same_room_only = bool(getattr(sampler_cfg, "same_room_place_only", False))
+        if same_room_only:
+            far_min = float(
+                getattr(sampler_cfg, "same_room_min_object_to_receptacle_dist", 0.8)
+            )
+            pickup_room = self._room_id_of_name(self.config.task_config.pickup_obj_name)
+        else:
+            far_min = float(sampler_cfg.far_min_object_to_receptacle_dist)
+            pickup_room = None
         pickup_xy = np.asarray(pickup_obj_pos)[:2]
 
         seen: set[int] = set()
@@ -238,17 +250,51 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             dist = float(np.linalg.norm(np.asarray(center[:2]) - pickup_xy))
             if not (far_min <= dist <= far_max):
                 continue
+            # Same-room gate: the receptacle must stand on a surface in the same
+            # room as the pickup object. The surface geom's supporting furniture
+            # body carries the room id in its name (``..._<room_id>``).
+            if pickup_room is not None:
+                surf_room = self._surface_geom_room_id(model, om, int(geom_id))
+                if surf_room is None or surf_room != pickup_room:
+                    continue
             scored.append((dist, int(geom_id)))
 
         # Prefer farther surfaces (genuine place-nav segment) but keep all
         # candidates so placement can fall through to a nearer elevated surface.
         scored.sort(key=lambda t: -t[0])
+        room_note = f" (same-room={pickup_room})" if pickup_room is not None else ""
         log.info(
             f"[MOBILE PNP] elevated-surface search: {len(scored)} candidate surface(s) "
-            f"in [{far_min:.1f},{far_max:.1f}]m band above z={min_top_z:.2f} "
-            f"(probed {len(seen)} supporting geoms)."
+            f"in [{far_min:.1f},{far_max:.1f}]m band above z={min_top_z:.2f}"
+            f"{room_note} (probed {len(seen)} supporting geoms)."
         )
         return [gid for _, gid in scored]
+
+    @staticmethod
+    def _room_id_of_name(name: str | None) -> str | None:
+        """Extract the room id from a scene object body name.
+
+        Scene object bodies follow the ``{lemma}_{hash}_{count}_{body_idx}_{room_id}``
+        convention (see ``molmo_spaces.housegen.utils.generate_body_name``), so
+        the trailing underscore-delimited field is the room id. Returns ``None``
+        for names that do not carry a numeric room suffix.
+        """
+        if not name:
+            return None
+        tail = name.rsplit("_", 1)[-1]
+        return tail if tail.isdigit() else None
+
+    def _surface_geom_room_id(
+        self, model: Any, om: Any, geom_id: int
+    ) -> str | None:
+        """Room id of the furniture body that owns a candidate surface geom."""
+        try:
+            body_id = int(model.geom_bodyid[geom_id])
+            root_body_id = int(model.body_rootid[body_id])
+            name = om.get_object_name(root_body_id)
+        except Exception:
+            return None
+        return self._room_id_of_name(name)
 
     def _prepare_place_target(
         self,
