@@ -1036,6 +1036,54 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
         mujoco.mj_forward(model, data)
 
+    def _snap_path_is_clear(self, target_pose: np.ndarray) -> bool:
+        """True if the straight-line base snap from the current (parked) base
+        pose to ``target_pose`` does not cross a wall/obstacle.
+
+        The manip-standoff snap is instantaneous, so a candidate whose endpoint
+        is IK-feasible can still teleport the base THROUGH a wall when nav parked
+        on the far side of it. We test the snap segment against the scene
+        occupancy map (agent-radius-dilated ProcTHOR map; True == free). A manip
+        standoff legitimately abuts the target furniture (map-occupied), and the
+        parked pose may too, so only the segment INTERIOR -- samples farther than
+        ``manip_snap_endpoint_margin_m`` from both endpoints -- is tested. Short
+        snaps (< 2x the margin) have no interior and always pass; a wall in the
+        middle of a long snap is detected and the candidate rejected. Fails open
+        (returns True) if the gate is disabled or the map is unavailable, so it
+        can never spuriously drop an otherwise valid episode."""
+        cfg = self.policy_config
+        if not getattr(cfg, "manip_snap_collision_gate_enabled", True):
+            return True
+        env = self.task.env
+        robot_view = env.current_robot.robot_view
+        start = robot_view.base.pose
+        start_xy = np.asarray(start[:2, 3], dtype=np.float64)
+        tgt_xy = np.asarray(target_pose[:2, 3], dtype=np.float64)
+        dist = float(np.linalg.norm(tgt_xy - start_xy))
+        margin = float(getattr(cfg, "manip_snap_endpoint_margin_m", 0.6))
+        if dist <= 2.0 * margin:
+            return True  # no interior to test: too short to be a wall crossing.
+        try:
+            thormap = env.get_thormap()
+        except Exception:
+            return True  # fail-open: never block when the map is unavailable.
+        spacing = max(float(getattr(cfg, "manip_snap_collision_sample_spacing_m", 0.15)), 0.05)
+        n = int(np.clip(np.ceil(dist / spacing), 2, 80))
+        pts: list[list[float]] = []
+        for k in range(1, n):
+            t = k / n
+            xy = start_xy + t * (tgt_xy - start_xy)
+            if np.linalg.norm(xy - start_xy) < margin or np.linalg.norm(xy - tgt_xy) < margin:
+                continue
+            pts.append([float(xy[0]), float(xy[1]), 0.0])
+        if not pts:
+            return True
+        try:
+            free = np.asarray(thormap.check_collision(np.asarray(pts, dtype=np.float64)))
+        except Exception:
+            return True  # fail-open on any map query error.
+        return bool(np.all(free))  # every interior sample must be free space.
+
     def _manip_base_candidates(
         self, target_name: str, verified_pose_7d: list[float] | None
     ) -> list[np.ndarray]:
@@ -1082,9 +1130,21 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 ring.append(m)
         # Prefer standoffs closest to where navigation already parked the base.
         ring.sort(key=lambda m: (m[0, 3] - base_xy[0]) ** 2 + (m[1, 3] - base_xy[1]) ** 2)
-        # Bound the probe budget: verified hint + the nearest standoffs. Wider
-        # than before (18 vs 11) now that stepping is cheap.
-        candidates.extend(ring[:18])
+        # Reject any standoff whose instantaneous snap from the parked pose would
+        # cross a wall/obstacle (the base "teleport through a wall" artifact):
+        # keep only candidates with a fully collision-free snap path. The
+        # verified hint is gated the same way -- if nav could not reach it, its
+        # snap crosses the wall too and must not be used. Filter lazily (nearest
+        # first) and stop once the probe budget of clear standoffs is met.
+        candidates = [c for c in candidates if self._snap_path_is_clear(c)]
+        budget = 18
+        n_ring_kept = 0
+        for m in ring:
+            if n_ring_kept >= budget:
+                break
+            if self._snap_path_is_clear(m):
+                candidates.append(m)
+                n_ring_kept += 1
         return candidates
 
     def _search_manip_base_pose(

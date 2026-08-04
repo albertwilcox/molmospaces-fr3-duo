@@ -165,6 +165,30 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # Camera used by the (default-off) nav goal-visibility gate.
     nav_visibility_camera_name: str = "nav_camera"
 
+    # --- Manip-standoff snap collision gate ---------------------------------
+    # After navigation the FSM freezes the base and snaps it to a manip standoff
+    # that is IK-feasible for the grasp/place. That snap is instantaneous, so if
+    # navigation parked the base on the wrong side of a wall (e.g. it could not
+    # traverse to the receptacle), the nearest IK-feasible standoff lies across
+    # the wall and the base visibly teleports THROUGH it. We reject any standoff
+    # whose straight-line snap from the parked pose crosses a wall/obstacle,
+    # tested against the scene occupancy map (the same agent-radius-dilated
+    # ProcTHOR map place_robot_near samples from). Because a legitimate manip
+    # standoff sits right next to the target furniture (map-occupied), we only
+    # test the MIDDLE of the snap segment -- samples farther than
+    # ``manip_snap_endpoint_margin_m`` from BOTH endpoints -- so furniture
+    # adjacency at either end is ignored while a wall in the interior is caught.
+    # Snaps shorter than 2x the margin therefore have no interior to test and
+    # always pass (they are never wall crossings), so ordinary short standoff
+    # repositioning is unaffected. If every candidate crosses a wall the segment
+    # fails and is retried/relocated rather than emitting a wall-crossing demo.
+    manip_snap_collision_gate_enabled: bool = True
+    # Spacing (metres) at which the snap segment interior is sampled.
+    manip_snap_collision_sample_spacing_m: float = 0.15
+    # Snap-segment samples within this distance (metres) of either endpoint are
+    # skipped (furniture is legitimately occupied next to a manip standoff).
+    manip_snap_endpoint_margin_m: float = 0.6
+
     # --- Arm-motion safety clamp (kinematic smoothness) ---------------------
     # The manipulation planner interpolates the TCP target smoothly in task
     # space and solves *stateless* IK per control step. Between consecutive
