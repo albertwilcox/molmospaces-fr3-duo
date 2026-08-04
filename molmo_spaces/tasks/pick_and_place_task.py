@@ -1,5 +1,6 @@
 from typing import Any
 
+import logging
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
@@ -11,6 +12,8 @@ from molmo_spaces.tasks.task import BaseMujocoTask
 from molmo_spaces.utils.mj_model_and_data_utils import body_aabb
 from molmo_spaces.utils.mujoco_scene_utils import is_object_supported_by_body
 from molmo_spaces.utils.pose import pos_quat_to_pose_mat
+
+log = logging.getLogger(__name__)
 
 
 class PickAndPlaceTask(BaseMujocoTask):
@@ -74,7 +77,24 @@ class PickAndPlaceTask(BaseMujocoTask):
         return rewards
 
     def get_info(self) -> list[dict[str, Any]]:
-        """Get additional metrics for each environment."""
+        """Get additional metrics for each environment.
+
+        The success/support computation below is comparatively expensive
+        (AABBs, contact-force support analysis, receptacle-displacement checks)
+        and is invoked several times per environment step — directly, via
+        ``judge_success`` inside ``is_terminal``, and again to populate the
+        ``success`` cache. Because the MuJoCo state does not change between
+        those calls within a single step, we memoize the result keyed on
+        ``episode_step_count``. This both removes the dominant per-step cost
+        (~3x fewer evaluations) and fixes a latent bug where the
+        ``_supported_rel_poses`` carry-forward history was appended multiple
+        times per step, biasing the carry-forward match.
+        """
+        if (
+            getattr(self, "_info_cache_key", None) == self.episode_step_count
+            and getattr(self, "_info_cache", None) is not None
+        ):
+            return self._info_cache
         metrics = []
 
         for i in range(self._env.n_batch):
@@ -87,7 +107,9 @@ class PickAndPlaceTask(BaseMujocoTask):
             pickup_obj_aabb = body_aabb(data.model, data, pickup_obj.body_id)
             pickup_obj_aabb_min = pickup_obj_aabb[0] - pickup_obj_aabb[1] / 2
             pickup_obj_aabb_max = pickup_obj_aabb[0] + pickup_obj_aabb[1] / 2
-            place_receptacle_aabb_center, _ = body_aabb(data.model, data, place_receptacle.body_id)
+            place_receptacle_aabb_center, place_receptacle_aabb_size = body_aabb(
+                data.model, data, place_receptacle.body_id
+            )
 
             # the pos err is the distance between the receptacle center and the pickup object aabb
             # pos err is 0 when the pickup object contains the receptacle center point
@@ -107,7 +129,18 @@ class PickAndPlaceTask(BaseMujocoTask):
                 frac_weight_threshold=task_config.receptacle_supported_weight_frac,
             )
 
-            if not supported_by_receptacle:
+            # The geometric fallback (``objects_on_receptacle``) is expensive
+            # (~0.6s/call — it collision-tests the object against every
+            # receptacle geom) and dominated the per-step cost. It can only ever
+            # return True when the object is within the receptacle's footprint,
+            # so skip it whenever the object AABB is clearly outside that
+            # footprint (i.e. during navigation / pick / transport, when the
+            # held object is metres away). ``pos_err`` is the gap between the
+            # object AABB and the receptacle centre; if that gap exceeds the
+            # receptacle's own half-extent (plus a margin) the object cannot be
+            # resting on it, so the fallback would return False anyway.
+            recept_reach = float(np.linalg.norm(place_receptacle_aabb_size) / 2.0) + 0.15
+            if not supported_by_receptacle and pos_err <= recept_reach:
                 # Use heuristic
                 om = self._env.object_managers[i]
                 objects_on_receptacle = om.objects_on_receptacle(
@@ -214,6 +247,8 @@ class PickAndPlaceTask(BaseMujocoTask):
                 }
             )
 
+        self._info_cache = metrics
+        self._info_cache_key = self.episode_step_count
         return metrics
 
     def get_obs_scene(self):
