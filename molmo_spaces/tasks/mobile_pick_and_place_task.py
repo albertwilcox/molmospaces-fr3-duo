@@ -99,6 +99,15 @@ class MobilePickAndPlaceTask(PickAndPlaceTask):
         result = super().reset()
         # Re-arm navigation for the pickup object each episode.
         self.set_nav_target(self.config.task_config.pickup_obj_name)
+        # ``set_nav_target`` clears any goal override, and this task-level reset
+        # runs AFTER the FSM policy's reset (which set the override), so without
+        # re-arming here the first (PICK) navigation would fall back to the
+        # navgoal sampler -- a boundary cell that is frequently NOT grasp
+        # feasible -- forcing the FSM to snap the base to a reachable standoff on
+        # manip entry (a base "teleport" in the recorded data). Re-set the
+        # grasp-feasibility-verified pickup standoff the sampler recorded so nav
+        # drives straight to a graspable pose and the PICK builds in place.
+        self.set_nav_goal_override(getattr(self.config.task_config, "robot_base_pose", None))
         return result
 
     # ------------------------------------------------------------------ #
