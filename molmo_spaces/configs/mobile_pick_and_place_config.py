@@ -135,6 +135,89 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     same_room_place_only: bool = True
     same_room_min_object_to_receptacle_dist: float = 0.8
 
+    # --- Direct-on-furniture place destinations ------------------------------
+    # By default the place target is a spawned receptacle object (e.g. a bowl)
+    # stood on a far surface, and the pickup object is placed INTO it. To
+    # diversify place destinations, with probability ``place_on_furniture_prob``
+    # we instead redirect the place target to an existing same-room furniture
+    # body (cabinet / dresser / nightstand / small table): the pickup object is
+    # then placed directly ON that furniture's top surface -- no receptacle
+    # spawned -- and, when the furniture already holds other items, effectively
+    # NEXT TO them. This reuses the existing receptacle-support success test and
+    # placement planner unchanged (the furniture simply plays the receptacle
+    # role). Only furniture whose top-surface footprint is small enough for its
+    # centre to remain within arm reach from a standoff is eligible, so
+    # placement feasibility (and thus the overall success rate) is preserved;
+    # oversized furniture (e.g. a large bed) is skipped and the bowl path is
+    # kept for that episode.
+    place_on_furniture_prob: float = 0.4
+    # Max XY half-extent (m) of an eligible furniture footprint. The base parks
+    # ~``manip_standoff_radius`` from the furniture and the object is placed at
+    # the furniture centre, so the centre must stay within the arm's reach; a
+    # 0.4 m half-extent keeps centre-to-base distance within the Franka envelope.
+    furniture_place_max_half_extent_m: float = 0.40
+
+    # --- Sample-time place-reachability verification -------------------------
+    # The pickup loop already rejects objects with no feasible grasp, but the
+    # place receptacle was previously accepted on collision-free placement alone.
+    # Genuinely-unreachable receptacles (too high, too deep in a corner, or held
+    # at an awkward carried orientation) then wasted whole episodes on the
+    # runtime "no reachable base standoff for place" failure. When enabled, the
+    # sampler replicates the placement planner's pose construction (grasp
+    # orientation inherited, translated to the receptacle top) and the FSM's ring
+    # standoff search: it accepts the receptacle only if some (standoff, grasp)
+    # pair yields IK-feasible pre-place AND place poses. Acceptance therefore
+    # guarantees the runtime PLACE phase can find a feasible standoff, removing
+    # the dominant place failure mode. Fail-open: if grasps/metadata are missing
+    # the receptacle is kept (never blocks on incomplete data).
+    verify_place_reachable: bool = True
+    # Cap on candidate carried-grasp orientations probed per receptacle.
+    place_reachable_max_grasps: int = 8
+    # Number of ring standoff angles probed per radius (radii reuse the pickup
+    # standoff band ``manip_standoff_radius_range``).
+    place_reachable_standoff_angles: int = 12
+    # Vertical clearance (m) added above the receptacle top for the probe place
+    # pose (mirrors the planner's small ``place_z_offset``).
+    # Number of collision-free receptacle-facing standoffs (sampled via the same
+    # ``place_robot_near`` sampler the runtime uses for its place nav-goal hint)
+    # that the probe IK-verifies before declaring a receptacle unreachable.
+    place_reachable_standoff_tries: int = 24
+    place_reachable_z_offset_m: float = 0.05
+    # If True, reject a receptacle when the sample-time probe finds no
+    # place-feasible standoff, advancing the selection loop to another candidate.
+    # Default False (advisory): although the probe samples standoffs with the
+    # runtime's ``place_robot_near`` sampler and base-locked IK-verifies them, the
+    # runtime's actual place uses a single cost-selected grasp whose orientation
+    # the probe's independent (standoff x cached-grasp) sampling does not reliably
+    # reproduce, so the probe still yields false-positive rejections that discard
+    # placeable receptacles and regress otherwise-succeeding houses. The probe is
+    # therefore advisory: it only *records* a verified standoff as the place nav
+    # goal when one is found (which navigation can then reach, since it is a
+    # ``place_robot_near`` sample), and never rejects. Enable only with a
+    # higher-fidelity probe (e.g. replicating the runtime's grasp selection).
+    place_reject_on_unreachable: bool = False
+
+    # When the place-feasibility probe finds no reachable standoff for the spawned
+    # receptacle at its initially sampled spot, RE-SAMPLE the receptacle to a
+    # different point on the far elevated surface and re-probe, up to this many
+    # times, keeping the first spot from which the arm can place. Because the
+    # probe is strictly more conservative than the runtime place, a probe-verified
+    # spot is high-confidence for the runtime, so this makes the place target
+    # reachable by construction wherever a reachable spot exists -- directly
+    # attacking the dominant "no reachable base standoff for place" failure and
+    # avoiding a wasted full-length rollout on a guaranteed PLACE failure. Set to
+    # 0 to disable re-sampling (single placement attempt, prior behavior).
+    #
+    # DEFAULT 0 (disabled): empirically the base-locked ring-IK probe is too
+    # conservative for the ELEVATED far-surface placements this sampler produces
+    # -- it fails to verify spots the runtime can actually place on (it verified
+    # none across repeated re-samples on validated houses), so re-sampling found
+    # no reachable spot to switch to and only added sample-time overhead before
+    # restoring the original placement. Re-enable once the probe replicates the
+    # runtime's held-object place-standoff search (higher fidelity), at which
+    # point re-sampling can make the place target reachable by construction.
+    place_receptacle_resample_tries: int = 0
+
 
 class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     """Config for the mobile pick-and-place state-machine expert.

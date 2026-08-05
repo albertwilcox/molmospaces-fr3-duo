@@ -699,6 +699,8 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._max_s_reached = 0.0
         self._stall_steps = 0
         self._terminal_steps = 0
+        self._align_best_ang_err = np.inf
+        self._align_no_improve = 0
 
     def build_policy_plan(self, world_waypoints):
         # Build the parent's (x, y, theta) plan, then derive the spatial reference
@@ -718,6 +720,8 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._max_s_reached = 0.0
         self._stall_steps = 0
         self._terminal_steps = 0
+        self._align_best_ang_err = np.inf
+        self._align_no_improve = 0
         # Publish the ACTUAL pre-grasp goal pose the follower drives to (plan
         # endpoint + final facing) so the task's goal-pose-reaching success
         # criterion judges arrival on the pose really tracked -- not the raw goal
@@ -787,11 +791,25 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
                     f" ({self._reached_waypoints} carrots advanced)."
                 )
                 return self._build_done_action()
+            # Track angular progress: keep turning while the heading error is
+            # still shrinking (up to the large ``pursuit_final_align_max_steps``
+            # budget), but bail out early once it plateaus for
+            # ``pursuit_final_align_stall_steps`` -- the base is wedged and cannot
+            # rotate further, so spinning out the full budget only wastes steps.
+            if ang_err + 1e-3 < self._align_best_ang_err:
+                self._align_best_ang_err = ang_err
+                self._align_no_improve = 0
+            else:
+                self._align_no_improve += 1
             # Bound the final-alignment phase with its OWN budget (not the mid-path
             # stall budget): the absolute-heading position servo slews at a bounded
             # rate, so a large in-place turn needs many steps. Giving up too early
             # parks the base facing away from the target and dooms the grasp/place.
-            if self._terminal_steps > cfg.pursuit_final_align_max_steps:
+            if (
+                self._terminal_steps > cfg.pursuit_final_align_max_steps
+                or self._align_no_improve
+                > getattr(cfg, "pursuit_final_align_stall_steps", 40)
+            ):
                 log.warning(
                     f"[PurePursuit DONE] Reached path end but could not align"
                     f" (|ang err|={ang_err:.2f}rad) after {self._terminal_steps} align steps;"

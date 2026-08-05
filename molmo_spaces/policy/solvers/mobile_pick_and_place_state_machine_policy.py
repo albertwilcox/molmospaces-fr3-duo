@@ -1240,15 +1240,50 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         return False
 
     def _enter_pick(self) -> bool:
-        """Park the base at a reachable standoff and build the pick primitives.
-        Returns False if the object is unreachable from every candidate."""
+        """Build the pick primitives from the *navigated* base pose.
+
+        Navigation already drives the base to the grasp-feasibility-verified
+        standoff the sampler recorded (``robot_base_pose``, used as the A* goal
+        override), so the parked pose is normally itself grasp-feasible. We
+        therefore build in place at the navigated pose -- no ring search, no base
+        teleport -- exactly as PLACE does. Only if the parked pose is infeasible
+        (e.g. navigation parked short) do we fall back to a few nearby standoffs,
+        reached via the wall-gated smooth base approach rather than a raw
+        teleport, before finally retrying the segment (fresh navigation)."""
+        self._manip_policy.phase = PICK
+        current = self.task.env.current_robot.robot_view.base.pose.copy()
+        attempt = self._retry_counts.get(PICK, 0)
+        if attempt == 0:
+            try:
+                self._manip_policy.reset(reset_retries=True)
+                self._locked_base_pose = current
+                log.info(
+                    "[MOBILE PNP FSM] NAV_TO_OBJ done → phase PICK "
+                    f"(built at navigated pose ({current[0, 3]:.2f}, {current[1, 3]:.2f}))."
+                )
+                return True
+            except ValueError:
+                log.info(
+                    "[MOBILE PNP FSM] PICK not feasible at navigated pose; "
+                    "trying nearby standoffs."
+                )
+        else:
+            # On a retry, the navigated-pose grasp already failed once; go
+            # straight to the ring search, which rotates the standoff (a fresh
+            # base position + approach angle each retry) to convert a marginal
+            # base-locked grasp into a secure one. The snap to a ring standoff is
+            # small (radius <=~0.5 m) and wall-gated, never a through-wall jump.
+            log.info(
+                f"[MOBILE PNP FSM] PICK retry {attempt}: searching a fresh standoff "
+                "for a new grasp angle."
+            )
         ok = self._search_manip_base_pose(
             PICK,
             self.config.task_config.pickup_obj_name,
             getattr(self.config.task_config, "robot_base_pose", None),
         )
         if ok:
-            log.info("[MOBILE PNP FSM] NAV_TO_OBJ done → phase PICK")
+            log.info("[MOBILE PNP FSM] NAV_TO_OBJ done → phase PICK (nearby standoff).")
         return ok
 
     def _enter_place(self) -> bool:

@@ -451,8 +451,15 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # steps than the mid-path stall budget allows; sharing the stall budget made
     # the base give up mid-turn with a large heading error, which then dooms the
     # downstream grasp/place (the arm cannot reach an object the base is not
-    # facing). Sized to complete a ~pi in-place rotation.
-    pursuit_final_align_max_steps: int = 90
+    # facing). Sized (empirically) to comfortably complete a ~pi in-place
+    # rotation; the separate ``pursuit_final_align_stall_steps`` cuts the phase
+    # short when the base is genuinely wedged (heading error stops improving), so
+    # a large budget does not waste steps on a stuck base.
+    pursuit_final_align_max_steps: int = 250
+    # End the terminal alignment early once the heading error stops improving for
+    # this many consecutive steps (the base is wedged / cannot rotate further),
+    # rather than spinning out the full ``pursuit_final_align_max_steps`` budget.
+    pursuit_final_align_stall_steps: int = 40
 
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""
