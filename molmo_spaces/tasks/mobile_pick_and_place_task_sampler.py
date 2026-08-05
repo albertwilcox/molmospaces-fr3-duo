@@ -470,6 +470,15 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 _checked, standoff = self._find_place_standoff(env)
                 if standoff is not None:
                     self._verified_place_base_pose = standoff.copy()
+                    # Keep the referral-expression source in lockstep with the
+                    # redirected target. ``_configure_pick_and_place`` generates
+                    # the place referral (hence the instruction and subtask
+                    # labels) from ``self.place_receptacle_name``, but the
+                    # redirect above only rewrote ``task_cfg.place_receptacle_name``.
+                    # Without this sync the instruction/labels would describe the
+                    # now-unused spawned bowl instead of the actual furniture
+                    # destination the object is placed on.
+                    self.place_receptacle_name = task_cfg.place_receptacle_name
                     log.info(
                         "[MOBILE PNP] Redirected place target to furniture "
                         f"'{task_cfg.place_receptacle_name}' (verified reachable, "
