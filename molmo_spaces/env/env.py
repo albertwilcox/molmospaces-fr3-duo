@@ -692,6 +692,47 @@ class CPUMujocoEnv(BaseMujocoEnv):
 
         return collision_found
 
+    def robot_collision_bodies_in_current_pose(
+        self, robot_namespace: str = "robot_0/", min_penetration: float = 0.0
+    ) -> set[str]:
+        """Return the set of non-robot, non-floor root-body names currently in contact
+        with the robot at the present qpos (call mj_forward first). Used by the swept
+        path-collision checker to diff arm configurations against a baseline.
+
+        Args:
+            min_penetration: only count contacts whose penetration depth exceeds this
+                many metres (``contact.dist < -min_penetration``). Grazing/touch
+                contacts (dist ~ 0) are ignored when this is > 0, which suppresses
+                false positives from arm configurations that merely brush clutter.
+        """
+        model = self.current_model
+        data = self.current_data
+        contacts = data.contact
+        bodies: set[str] = set()
+
+        for i in range(data.ncon):
+            contact = contacts[i]
+            if contact.dist >= -min_penetration:
+                continue
+
+            root1_id = model.body_rootid[model.geom_bodyid[contact.geom1]]
+            root2_id = model.body_rootid[model.geom_bodyid[contact.geom2]]
+            body1_name = model.body(root1_id).name
+            body2_name = model.body(root2_id).name
+
+            b1_robot = body1_name.startswith(robot_namespace)
+            b2_robot = body2_name.startswith(robot_namespace)
+            if b1_robot == b2_robot:
+                # both robot (self-collision) or both non-robot: ignore here
+                continue
+
+            other_body_name = body2_name if b1_robot else body1_name
+            if "floor" in other_body_name.lower():
+                continue
+            bodies.add(other_body_name)
+
+        return bodies
+
     def get_thormap(
         self, agent_radius: float = 0.35, px_per_m: int = 200
     ) -> "ProcTHORMap | iTHORMap":

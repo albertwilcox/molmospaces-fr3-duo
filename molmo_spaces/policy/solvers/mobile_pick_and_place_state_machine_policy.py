@@ -218,6 +218,21 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
 
         start_ee_pose = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_world
 
+        if self.policy_config.check_pick_path_collisions:
+            model = self.task.env.current_model
+            allowed_root_names = {model.body(model.body_rootid[pickup_obj.object_id]).name}
+            hits = self._swept_path_collision_bodies(
+                corridors=[
+                    (pregrasp_pose, grasp_pose_world),
+                    (grasp_pose_world, lift_pose),
+                ],
+                allowed_root_names=allowed_root_names,
+                n_samples=self.policy_config.path_collision_samples_per_segment,
+            )
+            if hits:
+                log.info(f"[MOBILE PNP FSM] PICK arm path sweeps into {sorted(hits)}; rejecting")
+                raise ValueError(f"Path collision (pick) with {sorted(hits)}")
+
         return [
             GripperAction(robot_view, True, 0.0, gripper_mg_id=gripper_mg_id),
             TCPMoveSequence(
@@ -410,6 +425,24 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
             pickup_obj=pickup_obj,
             place_receptacle=place_receptacle,
         )
+
+        if self.policy_config.check_place_path_collisions:
+            model = self.task.env.current_model
+            allowed_root_names = {
+                model.body(model.body_rootid[obj.object_id]).name
+                for obj in (pickup_obj, place_receptacle)
+            }
+            hits = self._swept_path_collision_bodies(
+                corridors=[
+                    (current_ee_pose, preplace_pose),
+                    (preplace_pose, place_pose),
+                ],
+                allowed_root_names=allowed_root_names,
+                n_samples=self.policy_config.path_collision_samples_per_segment,
+            )
+            if hits:
+                log.info(f"[MOBILE PNP FSM] PLACE arm path sweeps into {sorted(hits)}; rejecting")
+                raise ValueError(f"Path collision (place) with {sorted(hits)}")
 
         return [
             TCPMoveSequence(

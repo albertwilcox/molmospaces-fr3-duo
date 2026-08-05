@@ -96,6 +96,44 @@ class ObjectManipulationPlannerPolicyConfig(BasePolicyConfig):
     grasp_feasibility_batch_size: int = 256
     grasp_feasibility_max_grasps: int = 256
 
+    # Swept path-collision checking (default OFF).
+    # When enabled, the planner samples arm configurations along the straight-line
+    # TCP corridors, solves IK, and rejects the plan if any arm/gripper link sweeps
+    # (penetrates by > ``path_collision_penetration_m``) into an environment body it
+    # was not already touching (baseline-diff) and that is not the target object or
+    # place receptacle. A rejection raises ValueError, which the mobile FSM turns
+    # into a base-repositioning retry.
+    #
+    # Two independent gates. Both are OFF by default: empirically (validated on
+    # ProcTHOR houses) a *hard* swept-collision reject over-rejects and can destroy
+    # otherwise-successful episodes, for two reasons -- (1) per-waypoint standalone
+    # IK produces arm/elbow configurations that differ from the executed servo
+    # trajectory and spuriously clip walls, and (2) support surfaces (the table under
+    # the target, the coffee-table under the receptacle) are legitimately brushed and
+    # are not in the allowed set. Concretely, enabling the PICK gate rejected all base
+    # standoffs on a cluttered tabletop (house 19), and enabling the PLACE gate turned
+    # a previously-successful house-19 episode into a failure by rejecting the carry
+    # corridor against the receptacle's coffee-table support and nearby walls; house 23
+    # was unaffected. They are therefore left OFF and kept as scaffolding: a robust
+    # collision-aware planner should either replay the executed joint trajectory (not
+    # per-waypoint IK), treat support surfaces as allowed, and/or use a soft cost
+    # rather than a hard reject -- which is essentially what the curobo planner
+    # (curobo_pick_and_place_planner_policy) provides.
+    #   * PICK gate: samples pregrasp->grasp->lift (allowed = target object).
+    #   * PLACE gate: samples the carry transit + place descent (allowed = target
+    #     object + place receptacle).
+    # NOTE: only *arm-link* collisions are detected; the carried object is not
+    # re-posed onto the gripper during the check, so carried-object collisions are
+    # not caught.
+    check_pick_path_collisions: bool = False
+    check_place_path_collisions: bool = False
+    path_collision_samples_per_segment: int = 6
+    # Only count a swept contact as a collision if the arm penetrates the obstacle by
+    # more than this many metres. Grazing/touch contacts (dist ~ 0) that arise from
+    # per-waypoint IK configurations brushing nearby clutter are ignored, which keeps
+    # the checker from rejecting otherwise-good plans.
+    path_collision_penetration_m: float = 0.01
+
     # Debugging
     debug_poses: bool = False  # Enable debug printing for poses
     verbose: bool = True  # Enable verbose output for debugging

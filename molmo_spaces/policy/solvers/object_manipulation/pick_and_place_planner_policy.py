@@ -271,6 +271,29 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
         target_poses["place"] = place_pose
         target_poses["postplace"] = postplace_pose
 
+        if self.policy_config.check_pick_path_collisions or self.policy_config.check_place_path_collisions:
+            model = self.task.env.current_model
+            allowed_root_names = {
+                model.body(model.body_rootid[obj.object_id]).name
+                for obj in (pickup_obj, place_receptacle)
+            }
+            corridors = []
+            if self.policy_config.check_pick_path_collisions:
+                corridors.append((target_poses["pregrasp"], target_poses["grasp"]))
+            if self.policy_config.check_place_path_collisions:
+                corridors += [
+                    (target_poses["lift"], target_poses["preplace"]),
+                    (target_poses["preplace"], target_poses["place"]),
+                ]
+            hits = self._swept_path_collision_bodies(
+                corridors,
+                allowed_root_names,
+                self.policy_config.path_collision_samples_per_segment,
+            )
+            if hits:
+                log.info(f"  - ⚠️ Arm path sweeps into {sorted(hits)}; triggering retry")
+                raise ValueError(f"Path collision with {sorted(hits)}")
+
         # debug
         visualize_poses = True
         if visualize_poses and self.task.viewer is not None:

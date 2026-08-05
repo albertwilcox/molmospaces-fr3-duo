@@ -602,6 +602,67 @@ class BaseObjectManipulationPlannerPolicy(PlannerPolicy):
             )
             return jp_dict is not None
 
+    def _swept_path_collision_bodies(
+        self,
+        corridors: list[tuple[np.ndarray, np.ndarray]],
+        allowed_root_names: set[str],
+        n_samples: int,
+    ) -> set[str]:
+        """Sample arm configurations along straight-line TCP corridors and return the
+        set of environment root-body names that an arm/gripper link newly sweeps into
+        (relative to the current, pre-motion baseline) and that are not in
+        ``allowed_root_names`` (target object + place receptacle).
+
+        Arm joint qpos is temporarily set and restored; global RNG is untouched. Only
+        arm-link collisions are detected (the carried object is not re-posed onto the
+        gripper), so carried-object collisions are out of scope here.
+        """
+        env = self.task.env
+        model = env.current_model
+        data = env.current_data
+        robot_view = self.robot_view
+        namespace = env.current_robot.namespace
+        kinematics = env.current_robot.kinematics
+        mg_id = self.active_gripper_mg_id
+
+        gripper_mgs = set(robot_view.get_gripper_movegroup_ids())
+        arm_mgs = [x for x in robot_view.move_group_ids() if x not in gripper_mgs]
+
+        saved_qpos = {m: np.asarray(v).copy() for m, v in robot_view.get_qpos_dict(arm_mgs).items()}
+        base_pose = robot_view.base.pose
+
+        new_hits: set[str] = set()
+        try:
+            mujoco.mj_forward(model, data)
+            penetration = self.policy_config.path_collision_penetration_m
+            baseline = env.robot_collision_bodies_in_current_pose(namespace, penetration)
+
+            for start_pose, end_pose in corridors:
+                lin_vel, ang_vel = transform_to_twist(np.linalg.inv(start_pose) @ end_pose)
+                for t in np.linspace(0.0, 1.0, n_samples):
+                    pose = start_pose @ twist_to_transform(lin_vel * t, ang_vel * t)
+                    jp = kinematics.ik(
+                        mg_id,
+                        pose,
+                        arm_mgs,
+                        robot_view.get_qpos_dict(),
+                        base_pose,
+                    )
+                    if jp is None:
+                        continue
+                    robot_view.set_qpos_dict({m: jp[m] for m in arm_mgs})
+                    mujoco.mj_forward(model, data)
+                    for body_name in env.robot_collision_bodies_in_current_pose(
+                        namespace, penetration
+                    ):
+                        if body_name not in baseline and body_name not in allowed_root_names:
+                            new_hits.add(body_name)
+        finally:
+            robot_view.set_qpos_dict(saved_qpos)
+            mujoco.mj_forward(model, data)
+
+        return new_hits
+
     def _show_poses(self, poses, style, color=(1, 0, 0, 1)) -> None:
         if self.task.viewer is None:
             return
