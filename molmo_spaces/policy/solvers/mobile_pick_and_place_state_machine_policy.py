@@ -148,6 +148,45 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
         )
         return jp is not None
 
+    def ik_reach_margin(self, pose: np.ndarray) -> float | None:
+        """Normalized joint-limit slack of the base-locked IK solution for a
+        target pose.
+
+        Returns the minimum over the arm joints of each joint's fractional
+        distance to its nearer position limit (0.0 = hard against a limit,
+        0.5 = mid-range), or ``None`` when the pose has no base-locked IK
+        solution. A larger margin means the arm reaches the target well inside
+        its joint envelope -- i.e. far from the reach-limit/joint-limit
+        singularities that produce the dominant "object not in grasp" misses --
+        so the manip base search can prefer the most interior standoff instead of
+        merely the first one that is IK-feasible at all.
+        """
+        assert pose.shape == (4, 4)
+        kinematics = self.task.env.current_robot.kinematics
+        arm_mgs = self._arm_move_group_ids()
+        jp = kinematics.ik(
+            self.active_gripper_mg_id,
+            pose,
+            arm_mgs,
+            self.robot_view.get_qpos_dict(),
+            base_pose=self.robot_view.base.pose,
+        )
+        if jp is None:
+            return None
+        worst = np.inf
+        for mg in arm_mgs:
+            if mg not in jp:
+                continue
+            limits = np.asarray(
+                self.robot_view.get_move_group(mg).joint_pos_limits, dtype=float
+            )
+            q = np.asarray(jp[mg], dtype=float)
+            lo, hi = limits[:, 0], limits[:, 1]
+            span = np.maximum(hi - lo, 1e-6)
+            slack = np.minimum(q - lo, hi - q) / span
+            worst = min(worst, float(np.min(slack)))
+        return None if not np.isfinite(worst) else worst
+
     # -- phase-split trajectory --------------------------------------------- #
     def _compute_trajectory(self) -> list[ActionPrimitive]:
         if self.phase == PICK:
@@ -552,6 +591,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # (e.g. a retreat IK hiccup) must NOT retry, which would teleport the
         # already-placed object back into the gripper and undo the success.
         self._place_released: bool = False
+        # Pickup object's world-z captured just before the PICK manipulation
+        # begins (its resting height). After the lift we verify the object rose
+        # by at least ``grasp_verify_min_rise_m`` to confirm it is actually in the
+        # gripper (not a marginal reach-limit miss that closed on empty space).
+        self._pick_object_ref_z: float | None = None
         # --- Subtask checkpoint / retry ----------------------------------- #
         # Cache the full MuJoCo state at the start of each nav+manip segment so
         # a failed subtask can restore the last good state and retry (with a
@@ -930,6 +974,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._grasp_offset = None
         self._grasp_mg_id = None
         self._place_released = False
+        self._pick_object_ref_z = None
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
         # Drive to the grasp-feasibility-verified base pose the sampler recorded
         # (Avenue A), not the closest navigable cell.
@@ -950,6 +995,66 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         if mg_id is None:
             return None
         return self.task.env.current_robot.robot_view.get_move_group(mg_id).leaf_frame_to_world
+
+    def _verify_grasp(self) -> bool:
+        """Confirm the pickup object was actually grasped.
+
+        The grasp primitive can report success while the gripper closed on empty
+        space (a marginal reach-limit grasp). We accept the grasp when EITHER
+        signal holds:
+
+        * the object's world-z rose by at least ``grasp_verify_min_rise_m`` versus
+          its pre-pick resting height (captured in
+          :meth:`_capture_pick_reference_z`) -- it was lifted with the gripper; or
+        * the object sits within ``grasp_verify_max_tcp_dist_m`` of the gripper
+          TCP -- it is physically in the hand even if the lift was skipped (no
+          feasible lift height near the reach limit). An empty grasp leaves the
+          object on the support, ~a lift-height away from the raised TCP.
+
+        If the object height/TCP cannot be read (e.g. no free joint), verification
+        is skipped (returns True) so it never blocks otherwise-valid episodes."""
+        if not getattr(self.policy_config, "grasp_verify_enabled", True):
+            return True
+        ref_z = self._pick_object_ref_z
+        if ref_z is None:
+            return True
+        pose = self._held_object_pose()
+        if pose is None:
+            return True
+        obj_xyz = pose[:3, 3]
+        rise = float(obj_xyz[2]) - ref_z
+        min_rise = float(getattr(self.policy_config, "grasp_verify_min_rise_m", 0.03))
+        if rise >= min_rise:
+            log.info(f"[MOBILE PNP FSM] grasp verify: object rose {rise:.3f} m → held")
+            return True
+        # Not clearly lifted: accept only if the object is actually in the gripper.
+        mg_id = getattr(self._manip_policy, "active_gripper_mg_id", None)
+        if mg_id is not None:
+            tcp = self.task.env.current_robot.robot_view.get_move_group(mg_id).leaf_frame_to_world
+            tcp_dist = float(np.linalg.norm(obj_xyz - tcp[:3, 3]))
+            max_dist = float(getattr(self.policy_config, "grasp_verify_max_tcp_dist_m", 0.12))
+            if tcp_dist <= max_dist:
+                log.info(
+                    f"[MOBILE PNP FSM] grasp verify: object {tcp_dist:.3f} m from TCP "
+                    f"(rose only {rise:.3f} m; lift likely skipped) → held"
+                )
+                return True
+            log.info(
+                f"[MOBILE PNP FSM] grasp verify: object rose {rise:.3f} m and is "
+                f"{tcp_dist:.3f} m from TCP (max {max_dist:.3f}) → MISSED (empty grasp)"
+            )
+            return False
+        log.info(
+            f"[MOBILE PNP FSM] grasp verify: object rose only {rise:.3f} m "
+            f"(min {min_rise:.3f} m) → MISSED (empty grasp)"
+        )
+        return False
+
+    def _capture_pick_reference_z(self) -> None:
+        """Record the pickup object's resting world-z before PICK manipulation,
+        so :meth:`_verify_grasp` can confirm it was lifted."""
+        pose = self._held_object_pose()
+        self._pick_object_ref_z = None if pose is None else float(pose[2, 3])
 
     def _capture_grasp_lock(self) -> None:
         """After a successful pick, record the held object's pose in the TCP
@@ -1180,6 +1285,19 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 n_ring_kept += 1
         return candidates
 
+    def _targets_reach_margin(self, targets: list[Any]) -> float:
+        """Aggregate reach margin over a set of manip waypoints: the minimum
+        per-waypoint base-locked IK joint-limit slack (see
+        ``_MobileManipPlannerPolicy.ik_reach_margin``). Waypoints without an IK
+        solution are ignored (they were already gated by the strict feasibility
+        pass); an empty/unsolvable set scores 0.0 (neutral)."""
+        margins = [
+            m
+            for p in targets
+            if (m := self._manip_policy.ik_reach_margin(np.asarray(p))) is not None
+        ]
+        return min(margins) if margins else 0.0
+
     def _search_manip_base_pose(
         self, phase: str, target_name: str, verified_pose_7d: list[float] | None
     ) -> bool:
@@ -1210,55 +1328,84 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # A candidate whose grasp pose alone is IK-feasible can still fail mid
         # execution: with the base frozen, an intermediate waypoint (pregrasp
         # standoff, lift) may be out of the arm's base-locked reach, which shows
-        # up as a run of "IK failed (base-locked)" aborts. So we prefer the first
-        # candidate from which EVERY planned waypoint is base-locked reachable
-        # (strict pass) and only fall back to the first that merely builds
-        # (lenient pass) when no candidate fully clears — never regressing below
-        # the previous accept-first-build behaviour.
+        # up as a run of "IK failed (base-locked)" aborts. So we require EVERY
+        # planned waypoint to be base-locked reachable (strict pass). Rather than
+        # accept the first such standoff, we score a bounded set of them by their
+        # reach margin (how far the IK solution sits from the arm's joint limits)
+        # and commit to the most interior/robust one -- directly attacking the
+        # reach-limit "object not in grasp" misses -- with a small proximity
+        # penalty so a closer standoff wins on ties. Only if NO candidate clears
+        # the strict pass do we fall back to the first that merely builds
+        # (lenient), never regressing below the previous accept-first-build
+        # behaviour.
+        parked_xy = self.task.env.current_robot.robot_view.base.pose[:2, 3].copy()
+        scoring_on = getattr(self.policy_config, "manip_reach_scoring_enabled", True)
+        score_budget = int(getattr(self.policy_config, "manip_reach_scored_candidates", 6))
+        prox_pen = float(getattr(self.policy_config, "manip_reach_proximity_penalty_per_m", 0.15))
+
         first_built: int | None = None
         first_built_pose: np.ndarray | None = None
-        for strict in (True, False):
-            for i, base_pose in enumerate(candidates):
-                if not strict and first_built is not None and i != first_built:
-                    # Lenient pass: we already know the first buildable candidate.
-                    continue
-                self._snap_base_pose(base_pose, carry_object_name=carry)
-                try:
-                    self._manip_policy.reset(reset_retries=True)
-                except ValueError:
-                    continue
-                if strict:
-                    if first_built is None:
-                        first_built = i
-                        first_built_pose = base_pose.copy()
-                    targets = list(self._manip_policy.target_poses.values())
-                    if targets and not all(
-                        bool(self._manip_policy.check_feasible_ik(np.asarray(p)))
-                        for p in targets
-                    ):
-                        continue  # some waypoint unreachable base-locked; skip.
-                # Pin the (holonomic) base here for the whole manip phase: unlike
-                # the bolted fixed-base robot, the mobile base drifts under
-                # arm/grasp reaction forces, shifting the grasp enough to miss.
+        # (score, index, base_pose) for every all-waypoint-feasible candidate.
+        scored: list[tuple[float, int, np.ndarray]] = []
+        for i, base_pose in enumerate(candidates):
+            self._snap_base_pose(base_pose, carry_object_name=carry)
+            try:
+                self._manip_policy.reset(reset_retries=True)
+            except ValueError:
+                continue
+            if first_built is None:
+                first_built = i
+                first_built_pose = base_pose.copy()
+            targets = list(self._manip_policy.target_poses.values())
+            if targets and not all(
+                bool(self._manip_policy.check_feasible_ik(np.asarray(p))) for p in targets
+            ):
+                continue  # some waypoint unreachable base-locked; skip.
+            if not scoring_on:
+                # Legacy behaviour: pin the (holonomic) base at the first
+                # all-waypoint-feasible standoff and stop searching.
                 self._locked_base_pose = base_pose.copy()
                 log.info(
-                    f"[MOBILE PNP FSM] {phase} base found "
-                    f"({'all-waypoint' if strict else 'build-only'} candidate "
+                    f"[MOBILE PNP FSM] {phase} base found (all-waypoint candidate "
                     f"{i}/{len(candidates)}) at "
                     f"({base_pose[0, 3]:.2f}, {base_pose[1, 3]:.2f})."
                 )
                 return True
-            if first_built is None:
-                # No candidate even builds: the lenient pass cannot help either.
+            margin = self._targets_reach_margin(targets)
+            dist = float(np.hypot(base_pose[0, 3] - parked_xy[0], base_pose[1, 3] - parked_xy[1]))
+            scored.append((margin - prox_pen * dist, i, base_pose.copy()))
+            if len(scored) >= score_budget:
                 break
-            if strict and first_built_pose is not None:
-                # Re-snap/rebuild at the known-buildable candidate for the lenient
-                # accept below (state was left on the last strict-rejected snap).
-                self._snap_base_pose(first_built_pose, carry_object_name=carry)
-                try:
-                    self._manip_policy.reset(reset_retries=True)
-                except ValueError:
-                    break
+
+        if scored:
+            scored.sort(key=lambda t: t[0], reverse=True)
+            best_score, best_i, best_pose = scored[0]
+            # Re-snap/rebuild at the highest-reach-margin standoff (state was left
+            # on the last-scanned candidate). Pin the base there for the whole
+            # manip phase: unlike the bolted fixed-base robot, the mobile base
+            # drifts under arm/grasp reaction forces, shifting the grasp enough to
+            # miss.
+            self._snap_base_pose(best_pose, carry_object_name=carry)
+            try:
+                self._manip_policy.reset(reset_retries=True)
+            except ValueError:
+                best_pose = None  # extremely unlikely; fall through to lenient.
+            if best_pose is not None:
+                self._locked_base_pose = best_pose.copy()
+                log.info(
+                    f"[MOBILE PNP FSM] {phase} base found (best-reach-margin candidate "
+                    f"{best_i}/{len(candidates)}, margin={best_score:.3f}, "
+                    f"scored {len(scored)}) at "
+                    f"({best_pose[0, 3]:.2f}, {best_pose[1, 3]:.2f})."
+                )
+                return True
+
+        if first_built_pose is not None:
+            # Lenient fallback: no candidate cleared the strict all-waypoint pass;
+            # re-snap/rebuild at the first candidate that merely built.
+            self._snap_base_pose(first_built_pose, carry_object_name=carry)
+            try:
+                self._manip_policy.reset(reset_retries=True)
                 self._locked_base_pose = first_built_pose.copy()
                 log.info(
                     f"[MOBILE PNP FSM] {phase} base found (build-only fallback "
@@ -1266,6 +1413,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     f"({first_built_pose[0, 3]:.2f}, {first_built_pose[1, 3]:.2f})."
                 )
                 return True
+            except ValueError:
+                pass
         log.warning(
             f"[MOBILE PNP FSM] {phase} build failed: no reachable base standoff for "
             f"'{target_name}' among {len(candidates)} candidates."
@@ -1400,6 +1549,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
 
                 if self._phase == NAV_TO_OBJ:
                     parked_pose = self.task.env.current_robot.robot_view.base.pose.copy()
+                    # Snapshot the object's resting height before manipulation so
+                    # the post-lift grasp check can confirm it was actually lifted.
+                    self._capture_pick_reference_z()
                     if not self._enter_pick():
                         if not self._retry_segment(PICK):
                             self._phase = DONE
@@ -1500,6 +1652,20 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     continue
 
                 if self._phase == PICK:
+                    # Verify the object was actually grasped+lifted before
+                    # committing to transport. A marginal reach-limit grasp can
+                    # report "done" having closed on empty space; navigating with
+                    # nothing in hand wastes the whole episode (the miss is only
+                    # caught at the final judge). Treat a miss as a PICK failure so
+                    # the retry rotates to a fresh standoff/approach angle.
+                    if not self._verify_grasp():
+                        log.warning(
+                            "[MOBILE PNP FSM] PICK grasp verification failed "
+                            "(object not lifted); retrying PICK from a new angle."
+                        )
+                        if not self._retry_segment(PICK):
+                            self._phase = DONE
+                        continue
                     # Pick succeeded: cache the held-object state (and recording
                     # length) so the place segment can be retried without redoing
                     # navigation+pick, with the failed attempt truncated out.

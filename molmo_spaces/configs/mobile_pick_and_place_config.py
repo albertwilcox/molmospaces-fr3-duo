@@ -272,6 +272,49 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # skipped (furniture is legitimately occupied next to a manip standoff).
     manip_snap_endpoint_margin_m: float = 0.6
 
+    # --- Manipulability / reach-margin base scoring -------------------------
+    # The manip base search used to accept the FIRST standoff from which every
+    # grasp/place waypoint has *some* base-locked IK solution. "IK exists" is a
+    # binary that says nothing about how close that solution sits to the arm's
+    # joint limits, and the dominant end-to-end failure ("object not in grasp!")
+    # is precisely a grasp executed at the reach/joint-limit boundary (strongly
+    # correlated with pickup-object height near the arm's vertical reach limit).
+    # Instead of accepting the first feasible standoff we score a bounded set of
+    # feasible standoffs by their reach margin -- the minimum fractional distance
+    # of the IK solution's arm joints from their nearer position limit across all
+    # waypoints -- and commit to the most interior (most robust) one. A small
+    # proximity penalty keeps the chosen standoff close to where navigation
+    # parked (small, imperceptible base snaps) unless a farther standoff buys a
+    # materially larger reach margin. Set enabled=False to restore the legacy
+    # accept-first-feasible behaviour.
+    manip_reach_scoring_enabled: bool = True
+    # Number of all-waypoint-feasible standoffs to score before committing to the
+    # best (bounds the extra IK cost of scanning past the first feasible one).
+    manip_reach_scored_candidates: int = 6
+    # Reach-margin penalty per metre the standoff sits from the parked base, so
+    # a closer standoff wins unless a farther one is meaningfully more interior.
+    manip_reach_proximity_penalty_per_m: float = 0.15
+
+    # --- Grasp verification + regrasp ---------------------------------------
+    # The grasp primitive can report "done" while the gripper closed on empty
+    # space (a marginal reach-limit grasp), after which the FSM would happily
+    # navigate to the receptacle carrying nothing and only discover the miss at
+    # the final success judge -- wasting the whole episode. After the PICK lift
+    # completes we verify the pickup object actually rose with the gripper
+    # (its world-z increased by at least ``grasp_verify_min_rise_m`` relative to
+    # its pre-pick resting height). A miss re-runs the PICK segment, which the
+    # existing retry rotates to a fresh standoff/approach angle for a different
+    # grasp, instead of proceeding empty-handed.
+    grasp_verify_enabled: bool = True
+    # Minimum object world-z rise (metres) to consider the object grasped+lifted.
+    # Below the smallest lift height (0.05 m) so a successful shallow lift passes.
+    grasp_verify_min_rise_m: float = 0.03
+    # If the object did not clearly rise (e.g. lift skipped at the reach limit),
+    # still accept the grasp when the object is within this distance (metres) of
+    # the gripper TCP -- it is in the hand. An empty grasp leaves it ~a lift
+    # height away from the raised TCP.
+    grasp_verify_max_tcp_dist_m: float = 0.12
+
     # --- Arm-motion safety clamp (kinematic smoothness) ---------------------
     # The manipulation planner interpolates the TCP target smoothly in task
     # space and solves *stateless* IK per control step. Between consecutive
