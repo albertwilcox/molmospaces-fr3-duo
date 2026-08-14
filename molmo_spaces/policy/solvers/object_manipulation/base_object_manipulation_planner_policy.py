@@ -282,6 +282,21 @@ class TCPMoveSequence(MoveSequence):
             # we haven't started moving yet
             return False
 
+        # The TCP-error gate compares the gripper against the *interpolated*
+        # target pose, which sweeps ahead of the arm while a segment is still in
+        # motion. During active interpolation the arm legitimately lags that
+        # moving setpoint (it is tracking a pose it has not reached yet), so the
+        # instantaneous pos_err routinely exceeds the threshold mid-move -- most
+        # of all near the arm's reach boundary, where the arm slews slowly. Firing
+        # the failure there aborts a perfectly good pregrasp/grasp move before it
+        # can converge (observed: many "feasible grasp" pregrasp moves that fail
+        # with no grasp attempt on small objects at the reach limit). Only enforce
+        # the threshold once the whole trajectory has finished interpolating
+        # (i.e. we are in the settle window past the last segment), when the
+        # residual error is a real can't-reach signal rather than tracking lag.
+        if self.elapsed_time() < self.duration:
+            return False
+
         curr_target_pose = self.get_current_target_pose()
         gripper_mg_id = self._gripper_mg_id or self.robot_view.get_gripper_movegroup_ids()[0]
         gripper = self.robot_view.get_gripper(gripper_mg_id)
