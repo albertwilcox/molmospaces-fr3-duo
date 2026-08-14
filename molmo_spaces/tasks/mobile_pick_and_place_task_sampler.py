@@ -467,7 +467,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 getattr(task_cfg, "place_receptacle_start_pose", None),
             )
             if self._redirect_place_to_furniture(env):
-                _checked, standoff = self._find_place_standoff(env)
+                _checked, standoff, _reachable = self._find_place_standoff(env)
                 if standoff is not None:
                     self._verified_place_base_pose = standoff.copy()
                     # Keep the referral-expression source in lockstep with the
@@ -522,7 +522,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             om.get_object_by_name(reference_obj_name).position, dtype=np.float64
         )
         n_resample = int(getattr(sampler_cfg, "place_receptacle_resample_tries", 8))
-        checked, standoff = self._find_place_standoff(env)
+        checked, standoff, reachable = self._find_place_standoff(env)
         if standoff is None and n_resample > 0:
             # Snapshot the original (already-valid) receptacle placement so we can
             # RESTORE it if re-sampling fails to find a probe-verified spot. This
@@ -555,7 +555,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                     continue
                 recep = om.get_object_by_name(self.place_receptacle_name)
                 task_cfg.place_receptacle_start_pose = pose_mat_to_7d(recep.pose).tolist()
-                checked, standoff = self._find_place_standoff(env)
+                checked, standoff, reachable = self._find_place_standoff(env)
             if standoff is not None:
                 self._verified_place_base_pose = standoff.copy()
                 log.info(
@@ -570,13 +570,14 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         elif standoff is not None:
             self._verified_place_base_pose = standoff.copy()
 
-        if standoff is None and bool(
+        if not reachable and bool(
             getattr(sampler_cfg, "place_reject_on_unreachable", False)
         ):
             log.info(
                 "[MOBILE PNP] Place target "
                 f"'{task_cfg.place_receptacle_name}' unreachable from any "
-                "standoff; trying another candidate."
+                "standoff (centre or top-footprint grid); trying another "
+                "candidate."
             )
             return False
         return True
@@ -674,22 +675,33 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             return True
         return False
 
-    def _find_place_standoff(self, env: CPUMujocoEnv) -> tuple[bool, np.ndarray | None]:
+    def _find_place_standoff(
+        self, env: CPUMujocoEnv
+    ) -> tuple[bool, np.ndarray | None, bool]:
         """Probe for a base standoff from which the carried pickup object can be
         placed on the receptacle.
 
         Returns ``(checked, pose)``:
 
-        * ``(False, None)`` -- the probe could not run (verification disabled, or
-          grasps / metadata / kinematics unavailable). The caller keeps the
-          candidate and records no verified pose (fail-open: incomplete data never
-          blocks sampling).
-        * ``(True, None)`` -- the probe ran and NO standoff is place-feasible. The
-          caller rejects the candidate (this receptacle is genuinely unreachable).
-        * ``(True, pose)`` -- a base-locked place-feasible standoff (4x4 world
-          pose). The caller keeps the candidate and records the pose as the place
-          nav goal, so navigation parks at a place-feasible pose and the PLACE
-          phase builds in place (no ring search, no teleport).
+        Returns ``(checked, record_pose, reachable)``:
+
+        * ``record_pose`` is a base-locked standoff (4x4 world pose) from which
+          the receptacle *centre* place pose is IK-feasible, or ``None``. When
+          non-None the caller records it as the place nav goal so navigation
+          parks at a place-feasible pose and the PLACE phase builds in place (no
+          ring search, no teleport). It is CENTRE-only on purpose: recording a
+          grid-derived off-centre standoff would shift the parked base and can
+          regress a previously-succeeding episode.
+        * ``reachable`` is True when *any* standoff can place the object on the
+          receptacle -- at the centre OR (mirroring the runtime
+          ``_nearest_reachable_place_pose`` fallback) at a nearest-to-base point
+          on the receptacle top footprint grid. This is the signal the optional
+          ``place_reject_on_unreachable`` path uses, so it matches the runtime's
+          true reachability rather than the stricter centre-only test.
+        * ``checked`` is False when the probe could not run (verification
+          disabled, or grasps / metadata / kinematics unavailable); in that case
+          ``reachable`` is True (fail-open: incomplete data never blocks
+          sampling).
 
         Mirrors the placement planner's pose construction (the carried-object
         grasp orientation, translated so the *object* lands on the receptacle
@@ -698,7 +710,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         sampler_cfg = self.config.task_sampler_config
         task_cfg = self.config.task_config
         if not getattr(sampler_cfg, "verify_place_reachable", True):
-            return (False, None)
+            return (False, None, True)
 
         om = env.object_managers[env.current_batch_index]
         model = env.current_model
@@ -707,7 +719,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         try:
             kinematics = env.current_robot.kinematics
         except Exception:
-            return (False, None)  # no kinematics available -> cannot probe.
+            return (False, None, True)  # no kinematics available -> cannot probe.
 
         try:
             pickup = om.get_object_by_name(task_cfg.pickup_obj_name)
@@ -715,19 +727,19 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             receptacle_id = om.get_object_body_id(task_cfg.place_receptacle_name)
             pickup_id = om.get_object_body_id(task_cfg.pickup_obj_name)
         except Exception:
-            return (False, None)
+            return (False, None, True)
 
         # Carried-grasp orientations to probe: the same cached grasps the pickup
         # loop validated as non-colliding, expressed in world frame.
         asset_uid = self.get_asset_uid_from_object(env, task_cfg.pickup_obj_name)
         if not asset_uid:
-            return (False, None)
+            return (False, None, True)
         try:
             _gripper, cached_grasps = load_grasps_for_object(asset_uid, 512)
         except (KeyError, ValueError):
-            return (False, None)
+            return (False, None, True)
         if cached_grasps is None or len(cached_grasps) == 0:
-            return (False, None)
+            return (False, None, True)
         object_pose = pos_quat_to_pose_mat(pickup.position, pickup.quat)
         grasp_poses_world = object_pose @ cached_grasps
         try:
@@ -736,7 +748,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         except (KeyError, ValueError):
             pass  # keep all grasps if the collision bodies are absent.
         if len(grasp_poses_world) == 0:
-            return (False, None)
+            return (False, None, True)
         max_grasps = int(getattr(sampler_cfg, "place_reachable_max_grasps", 8))
         grasp_poses_world = grasp_poses_world[:max_grasps]
 
@@ -746,17 +758,47 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             rec_center, rec_size = body_aabb(model, data, receptacle_id)
             pick_center, pick_size = body_aabb(model, data, pickup_id)
         except Exception:
-            return (False, None)
+            return (False, None, True)
         receptacle_top_z = float(rec_center[2] + rec_size[2] / 2.0)
         pickup_bottom_z = float(pick_center[2] - pick_size[2] / 2.0)
         z_off = float(getattr(sampler_cfg, "place_reachable_z_offset_m", 0.05))
         rec_xy = np.asarray(receptacle.position, dtype=np.float64)[:2]
         pickup_pos = np.asarray(pickup.position, dtype=np.float64)
 
-        def place_poses_for(grasp_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # Runtime place fallback replication: when the receptacle-CENTRE place
+        # pose is not IK-reachable, the FSM does NOT give up -- it searches a
+        # grid over the receptacle top footprint (shrunk by the object half-
+        # extent + margin) for the nearest-to-base reachable point and places
+        # there (see ``_nearest_reachable_place_pose`` /
+        # ``_get_placement_poses`` in the policy). A probe that tests only the
+        # centre therefore under-reports reachability and false-rejects
+        # receptacles the runtime can place on. Mirror the runtime grid here so
+        # the probe's verdict matches the runtime, making rejection / re-sampling
+        # safe to enable. Config knobs mirror the policy's
+        # ``place_edge_margin_m`` / ``place_search_grid_n``.
+        grid_margin = float(getattr(sampler_cfg, "place_reachable_edge_margin_m", 0.03))
+        grid_n = int(getattr(sampler_cfg, "place_reachable_search_grid_n", 5))
+        half_x = max(float(rec_size[0] / 2.0 - pick_size[0] / 2.0 - grid_margin), 0.0)
+        half_y = max(float(rec_size[1] / 2.0 - pick_size[1] / 2.0 - grid_margin), 0.0)
+        grid_xs = np.linspace(-half_x, half_x, grid_n) + float(rec_center[0])
+        grid_ys = np.linspace(-half_y, half_y, grid_n) + float(rec_center[1])
+
+        def place_xy_candidates(base_pose: np.ndarray) -> list[np.ndarray]:
+            """Receptacle-top XY place points, receptacle centre first, then the
+            footprint grid ordered nearest-to-base (mirroring the runtime)."""
+            base_xy = base_pose[:2, 3]
+            grid = [
+                np.array([x, y], dtype=np.float64)
+                for x in grid_xs
+                for y in grid_ys
+            ]
+            grid.sort(key=lambda p: float((p[0] - base_xy[0]) ** 2 + (p[1] - base_xy[1]) ** 2))
+            return [rec_xy] + grid
+
+        def place_poses_for(grasp_world: np.ndarray, place_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             clearance = max(float(grasp_world[2, 3]) - pickup_bottom_z, 0.0)
             preplace = grasp_world.copy()
-            preplace[:2, 3] = rec_xy
+            preplace[:2, 3] = place_xy
             preplace[2, 3] = receptacle_top_z + clearance + z_off
             preplace[:3, 3] += grasp_world[:3, 3] - pickup_pos
             place = preplace.copy()
@@ -802,6 +844,18 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         radii = np.linspace(float(r_lo), float(r_hi), 2)
         n_ang = int(getattr(sampler_cfg, "place_reachable_standoff_angles", 12))
         found_pose: np.ndarray | None = None
+        # ``found_pose`` is the recorded (centre-feasible) nav goal, preserving
+        # prior behaviour exactly. ``reachable_pose`` additionally counts
+        # grid-feasible (off-centre) standoffs -- used ONLY to judge whether the
+        # receptacle is reachable at all (for the rejection path), never recorded
+        # as the nav goal. The off-centre grid probe is GATED on rejection being
+        # enabled (its extra IK calls perturb the shared RNG); when off, the
+        # receptacle is treated as reachable iff a centre standoff was found and
+        # the probe is a strict no-op vs the prior centre-only behaviour.
+        grid_reject_enabled = bool(
+            getattr(sampler_cfg, "place_reject_on_unreachable", False)
+        )
+        reachable_pose: np.ndarray | None = None
         try:
             for r in radii:
                 for k in range(n_ang):
@@ -823,13 +877,34 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                             continue
                     except Exception:
                         pass
+                    place_xys = (
+                        place_xy_candidates(base_pose) if grid_reject_enabled else []
+                    )
                     for grasp_world in grasp_poses_world:
-                        preplace, place = place_poses_for(grasp_world)
-                        # Place (lower) is the binding constraint; test it first as
-                        # a cheap reject, then confirm the pre-place approach.
-                        if ik_ok(base_pose, place) and ik_ok(base_pose, preplace):
+                        # Record a nav-goal standoff from the receptacle CENTRE
+                        # place pose only (matches the prior behaviour exactly).
+                        preplace_c, place_c = place_poses_for(grasp_world, rec_xy)
+                        if ik_ok(base_pose, place_c) and ik_ok(base_pose, preplace_c):
                             found_pose = base_pose.copy()
+                            reachable_pose = found_pose
                             break
+                        # Runtime ``_nearest_reachable_place_pose`` mirror: the
+                        # runtime can place off-centre on the top footprint when
+                        # the centre is unreachable. Track that as REACHABLE (for
+                        # the opt-in rejection path) WITHOUT recording it as the
+                        # nav goal. GATED on rejection being enabled: the extra
+                        # grid IK calls advance the IK solver's RNG and would
+                        # perturb all downstream episode sampling
+                        # (``place_robot_near`` etc.), so when rejection is off
+                        # (default) we skip the grid entirely and keep the exact
+                        # baseline IK-call sequence -- making this probe a strict
+                        # no-op vs the prior centre-only behaviour.
+                        if grid_reject_enabled and reachable_pose is None:
+                            for place_xy in place_xys[1:]:
+                                preplace, place = place_poses_for(grasp_world, place_xy)
+                                if ik_ok(base_pose, place) and ik_ok(base_pose, preplace):
+                                    reachable_pose = base_pose.copy()
+                                    break
                     if found_pose is not None:
                         break
                 if found_pose is not None:
@@ -838,7 +913,12 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             robot_view.base.pose = original_base
             robot_view.set_qpos_dict(original_qpos)
             mujoco.mj_forward(model, data)
-        return (True, found_pose)
+        # When the off-centre grid is disabled we never reject, so report
+        # reachable=True unconditionally (rejection is gated on this flag AND on
+        # ``place_reject_on_unreachable``). When enabled, reachability reflects
+        # whether any centre-or-grid standoff could place the object.
+        reachable = True if not grid_reject_enabled else (reachable_pose is not None)
+        return (True, found_pose, reachable)
 
     def _prepare_place_target(
         self,

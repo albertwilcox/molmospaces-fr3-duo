@@ -183,18 +183,25 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # that the probe IK-verifies before declaring a receptacle unreachable.
     place_reachable_standoff_tries: int = 24
     place_reachable_z_offset_m: float = 0.05
+    # Runtime place-fallback replication (see ``_find_place_standoff``): when the
+    # receptacle-CENTRE place pose is IK-unreachable the runtime places at the
+    # nearest reachable point on the receptacle top footprint (a grid search,
+    # ``_nearest_reachable_place_pose``). The probe mirrors that grid so its
+    # reachability verdict matches the runtime -- removing the centre-only
+    # false-positive rejections that previously forced ``place_reject_on_unreachable``
+    # off. These mirror the policy's ``place_edge_margin_m`` / ``place_search_grid_n``.
+    place_reachable_edge_margin_m: float = 0.03
+    place_reachable_search_grid_n: int = 5
     # If True, reject a receptacle when the sample-time probe finds no
     # place-feasible standoff, advancing the selection loop to another candidate.
-    # Default False (advisory): although the probe samples standoffs with the
-    # runtime's ``place_robot_near`` sampler and base-locked IK-verifies them, the
-    # runtime's actual place uses a single cost-selected grasp whose orientation
-    # the probe's independent (standoff x cached-grasp) sampling does not reliably
-    # reproduce, so the probe still yields false-positive rejections that discard
-    # placeable receptacles and regress otherwise-succeeding houses. The probe is
-    # therefore advisory: it only *records* a verified standoff as the place nav
-    # goal when one is found (which navigation can then reach, since it is a
-    # ``place_robot_near`` sample), and never rejects. Enable only with a
-    # higher-fidelity probe (e.g. replicating the runtime's grasp selection).
+    # The probe now replicates the runtime's place fallback (receptacle-centre
+    # place pose, then a nearest-to-base grid search over the receptacle top
+    # footprint -- see ``place_reachable_search_grid_n``), so it no longer
+    # false-rejects receptacles the runtime could place on off-centre. That makes
+    # rejection safe in principle; keep the default False until an A/B confirms
+    # the higher-fidelity probe does not regress otherwise-succeeding houses,
+    # then flip to True to skip guaranteed-unreachable place targets at sample
+    # time (avoiding a wasted full-length PLACE-fail rollout).
     place_reject_on_unreachable: bool = False
 
     # When the place-feasibility probe finds no reachable standoff for the spawned
