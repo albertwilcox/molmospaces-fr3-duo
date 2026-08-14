@@ -257,6 +257,28 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
 
         start_ee_pose = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_world
 
+        # Presence predicate for the empty-grasp check during the lift/carry: the
+        # target object is still in hand iff it is within a small distance of the
+        # gripper TCP. This is robust to object SIZE (unlike the finger-aperture
+        # heuristic, which mis-flags thin/small objects that close the fingers to
+        # their hard stop as an empty grasp). Mirrors ``_verify_grasp``'s
+        # TCP-distance test; tolerant radius so a held object is never a miss.
+        _present_max_dist = float(
+            getattr(self.policy_config, "grasp_verify_max_tcp_dist_m", 0.12)
+        )
+
+        def _object_in_gripper() -> bool:
+            try:
+                obj_xyz = np.asarray(pickup_obj.position, dtype=np.float64)
+                tcp = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_world
+                return bool(
+                    np.linalg.norm(obj_xyz - tcp[:3, 3]) <= _present_max_dist
+                )
+            except Exception:
+                # If the object/TCP cannot be read, fall back to the aperture
+                # heuristic (return False so it is not overridden).
+                return False
+
         if self.policy_config.check_pick_path_collisions:
             model = self.task.env.current_model
             allowed_root_names = {model.body(model.body_rootid[pickup_obj.object_id]).name}
@@ -312,6 +334,7 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
                 tcp_pos_err_threshold=self.policy_config.tcp_pos_err_threshold,
                 tcp_rot_err_threshold=self.policy_config.tcp_rot_err_threshold,
                 gripper_mg_id=gripper_mg_id,
+                object_present_fn=_object_in_gripper,
                 move_segments=[
                     TCPMoveSegment(
                         name="lift",

@@ -117,6 +117,7 @@ class MoveSequence(ActionPrimitive):
         is_holding_object: bool = False,
         gripper_empty_threshold: float = 0.0,
         gripper_mg_id: str | None = None,
+        object_present_fn: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(robot_view, sum(seg.duration for seg in move_segments))
         self._move_segments = move_segments
@@ -126,6 +127,12 @@ class MoveSequence(ActionPrimitive):
         self.is_holding_object = is_holding_object
         self.gripper_empty_threshold = gripper_empty_threshold
         self._gripper_mg_id = gripper_mg_id
+        # Optional predicate: True iff the target object is still physically in
+        # the gripper (e.g. within a small distance of the TCP). When supplied,
+        # a fully-closed gripper is only treated as an EMPTY grasp if the object
+        # is ALSO absent -- so a genuinely-held small/thin object (which closes
+        # the fingers to near their hard stop) is not mis-flagged as a miss.
+        self._object_present_fn = object_present_fn
 
     def execute(self) -> bool:
         if self.start_time is None:
@@ -186,6 +193,19 @@ class MoveSequence(ActionPrimitive):
                 gripper.inter_finger_dist
                 < gripper.inter_finger_dist_range[0] + self.gripper_empty_threshold
             ):
+                # Fingers are (near-)fully closed. Historically this was treated
+                # as an empty grasp, but a genuinely-held SMALL/THIN object (a
+                # pencil, candle, apple, deformable tomato) closes the fingers to
+                # within a couple of mm of their hard stop and was being
+                # mis-flagged as a miss -- aborting the lift and burning the whole
+                # episode even though the object was in hand (confirmed on video +
+                # ``inter_finger_dist`` traces of 0.0-0.0016 m). If an
+                # object-presence predicate is available, only declare an empty
+                # grasp when the object is ALSO physically absent from the
+                # gripper; the aperture alone cannot tell "closed on a thin
+                # object" from "closed on nothing".
+                if self._object_present_fn is not None and self._object_present_fn():
+                    return False
                 log.info(
                     f"Object is not in grasp! {gripper.inter_finger_dist:.05f} < {gripper.inter_finger_dist_range[0] + self.gripper_empty_threshold:05f}"
                 )
@@ -213,6 +233,7 @@ class TCPMoveSequence(MoveSequence):
         tcp_pos_err_threshold: float = np.inf,
         tcp_rot_err_threshold: float = np.inf,
         gripper_mg_id: str | None = None,
+        object_present_fn: Callable[[], bool] | None = None,
     ) -> None:
         super().__init__(
             robot_view,
@@ -221,6 +242,7 @@ class TCPMoveSequence(MoveSequence):
             is_holding_object,
             gripper_empty_threshold,
             gripper_mg_id=gripper_mg_id,
+            object_present_fn=object_present_fn,
         )
         self.tcp_to_jp_fn = tcp_to_jp_fn
         self.tcp_pos_err_threshold = tcp_pos_err_threshold
