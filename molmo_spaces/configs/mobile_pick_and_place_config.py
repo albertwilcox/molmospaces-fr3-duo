@@ -157,6 +157,32 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # 0.4 m half-extent keeps centre-to-base distance within the Franka envelope.
     furniture_place_max_half_extent_m: float = 0.40
 
+    # --- Broad furniture placement (any flat furniture is a place target) ----
+    # When True, treat *any* eligible flat-topped furniture (bed / sofa / table /
+    # counter / desk / dresser ...) as a valid place destination, not just small
+    # furniture whose CENTRE is reachable. This is safe because the runtime place
+    # builder no longer requires the receptacle centre: ``_get_placement_poses``
+    # falls back to ``_nearest_reachable_place_pose``, which searches the whole
+    # furniture top footprint for the IK-reachable point nearest the base. So a
+    # large bed/table only needs *some* reachable point on its top (which the base
+    # parks beside), not a reachable centre -- and plopping an object onto a broad
+    # flat surface is an EASIER placement than fitting it into a small bowl.
+    # Enabling this:
+    #   * lifts the small-footprint gate (``furniture_place_max_half_extent_m`` is
+    #     ignored for large furniture; a reachable-top-point check is used
+    #     instead, mirroring the runtime),
+    #   * drops the body-origin-under-surface guard (only needed for the old
+    #     centre-drop path), and
+    #   * raises the furniture-redirect probability to
+    #     ``broad_furniture_place_prob``.
+    # Default False preserves the exact prior (small-furniture-only) behaviour.
+    prefer_furniture_place: bool = False
+    broad_furniture_place_prob: float = 0.85
+    # Minimum top-surface XY half-extent (m) for a large furniture body to be an
+    # eligible broad place target (excludes thin ledges / chair seats that read as
+    # furniture but are not sensible drop surfaces).
+    broad_furniture_min_half_extent_m: float = 0.20
+
     # --- Sample-time place-reachability verification -------------------------
     # The pickup loop already rejects objects with no feasible grasp, but the
     # place receptacle was previously accepted on collision-free placement alone.

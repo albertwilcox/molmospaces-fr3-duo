@@ -22,7 +22,7 @@ from molmo_spaces.env.env import CPUMujocoEnv
 from molmo_spaces.tasks.mobile_pick_and_place_task import MobilePickAndPlaceTask
 from molmo_spaces.tasks.pick_and_place_task_sampler import PickAndPlaceTaskSampler
 from molmo_spaces.tasks.task_sampler_errors import ObjectPlacementError, RobotPlacementError
-from molmo_spaces.utils.mj_model_and_data_utils import body_aabb, geom_aabb
+from molmo_spaces.utils.mj_model_and_data_utils import body_aabb, descendant_geoms, geom_aabb
 from molmo_spaces.utils.mujoco_scene_utils import get_supporting_geom, place_object_near
 from molmo_spaces.utils.pose import pose_mat_to_7d, pos_quat_to_pose_mat
 from molmo_spaces.utils.grasp_sample import get_noncolliding_grasp_mask, load_grasps_for_object
@@ -317,6 +317,124 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         tail = name.rsplit("_", 1)[-1]
         return tail if tail.isdigit() else None
 
+    def _find_furniture_top_geoms(
+        self, env: CPUMujocoEnv, pickup_obj_pos: np.ndarray
+    ) -> list[int]:
+        """Discover the *top* geom of every static furniture body in the far
+        band, WITHOUT requiring the furniture to already support a scene object.
+
+        ``_find_far_elevated_surface_geoms`` finds surfaces by probing what each
+        scene object rests on, so a bare bed/table (nothing on it) is invisible
+        to it -- the main reason furniture placement previously "made little
+        progress". This finder instead enumerates furniture bodies directly and
+        returns, per body, the descendant geom whose AABB top is highest and flat
+        enough to drop an object on. Used only in broad furniture-place mode.
+
+        Eligibility per body: top-level, non-structural, non-excluded, STATIC (no
+        free joint -> not a pickup object), NOT an enclosed articulable container
+        (fridge/cabinet ... -- unreachable interiors), with a top geom above the
+        elevated-height floor, of at least the broad min half-extent, in the far
+        distance band, and (when restricting) in the pickup object's room."""
+        sampler_cfg = self.config.task_sampler_config
+        model = env.current_model
+        data = env.current_data
+        om = env.object_managers[env.current_batch_index]
+
+        floor_z = self._floor_top_z(env)
+        min_top_z = floor_z + float(sampler_cfg.elevated_min_height_m)
+        min_half = float(getattr(sampler_cfg, "broad_furniture_min_half_extent_m", 0.20))
+        far_max = float(sampler_cfg.far_max_object_to_receptacle_dist)
+        same_room_only = bool(getattr(sampler_cfg, "same_room_place_only", False))
+        if same_room_only:
+            far_min = float(
+                getattr(sampler_cfg, "same_room_min_object_to_receptacle_dist", 0.8)
+            )
+            pickup_room = self._room_id_of_name(self.config.task_config.pickup_obj_name)
+        else:
+            far_min = float(sampler_cfg.far_min_object_to_receptacle_dist)
+            pickup_room = None
+        pickup_xy = np.asarray(pickup_obj_pos)[:2]
+        pickup_root = int(
+            model.body_rootid[int(om.get_object_body_id(self.config.task_config.pickup_obj_name))]
+        )
+
+        scored: list[tuple[float, int]] = []
+        for body_id in om.top_level_bodies():
+            root_id = int(model.body_rootid[int(body_id)])
+            if root_id == pickup_root:
+                continue
+            name = om.get_object_name(int(body_id))
+            if not name or om.is_excluded(name) or om.is_structural(name):
+                continue
+            # Static only: a body with a free joint is a movable object, not
+            # furniture to place onto.
+            try:
+                if om.has_free_joint(name):
+                    continue
+            except Exception:
+                pass
+            # Never an enclosed container interior (fridge/cabinet ...).
+            if self._surface_geom_is_enclosed_container_body(model, om, int(body_id)):
+                continue
+            # Highest flat descendant geom = the top surface.
+            try:
+                geom_ids = descendant_geoms(model, int(body_id), True)
+            except Exception:
+                geom_ids = []
+            best_geom = None
+            best_top_z = -np.inf
+            for gid in geom_ids:
+                try:
+                    center, dims = geom_aabb(model, data, [int(gid)])
+                except Exception:
+                    continue
+                if float(min(dims[0], dims[1]) / 2.0) < min_half:
+                    continue  # thin/narrow geom -- not a drop surface.
+                top_z = float(center[2] + dims[2] / 2.0)
+                if top_z > best_top_z:
+                    best_top_z = top_z
+                    best_geom = int(gid)
+            if best_geom is None or best_top_z < min_top_z:
+                continue
+            try:
+                bcenter, _bdims = geom_aabb(model, data, [best_geom])
+            except Exception:
+                continue
+            dist = float(np.linalg.norm(np.asarray(bcenter[:2]) - pickup_xy))
+            if not (far_min <= dist <= far_max):
+                continue
+            if pickup_room is not None:
+                surf_room = self._surface_geom_room_id(model, om, best_geom)
+                if surf_room is None or surf_room != pickup_room:
+                    continue
+            scored.append((dist, best_geom))
+
+        scored.sort(key=lambda t: -t[0])  # farther first (genuine place-nav).
+        log.info(
+            f"[MOBILE PNP] furniture-top search: {len(scored)} static furniture "
+            f"surface(s) in [{far_min:.1f},{far_max:.1f}]m band above z={min_top_z:.2f}."
+        )
+        return [gid for _, gid in scored]
+
+    def _surface_geom_is_enclosed_container_body(
+        self, model: Any, om: Any, body_id: int
+    ) -> bool:
+        """Enclosed-container test keyed on a furniture BODY id (see
+        ``_surface_geom_is_enclosed_container`` which keys on a geom id)."""
+        try:
+            name = om.get_object_name(int(model.body_rootid[int(body_id)]))
+        except Exception:
+            return False
+        if not name:
+            return False
+        lowered = name.lower()
+        if not any(kw in lowered for kw in self._CONTAINER_NAME_KEYWORDS):
+            return False
+        try:
+            return bool(om.is_object_articulable(name))
+        except Exception:
+            return False
+
     def _surface_geom_room_id(
         self, model: Any, om: Any, geom_id: int
     ) -> str | None:
@@ -507,14 +625,19 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         # furniture is not verifiably reachable we revert to the spawned-receptacle
         # (bowl) wiring, so the redirect can only add variety, never reduce yield.
         prob = float(getattr(sampler_cfg, "place_on_furniture_prob", 0.0))
+        broad = bool(getattr(sampler_cfg, "prefer_furniture_place", False))
+        if broad:
+            prob = float(getattr(sampler_cfg, "broad_furniture_place_prob", 0.85))
         if prob > 0.0 and float(np.random.random()) < prob:
             saved = (
                 task_cfg.place_receptacle_name,
                 task_cfg.place_target_name,
                 getattr(task_cfg, "place_receptacle_start_pose", None),
             )
-            if self._redirect_place_to_furniture(env):
-                _checked, standoff, _reachable = self._find_place_standoff(env)
+            if self._redirect_place_to_furniture(env, broad=broad):
+                _checked, standoff, _reachable = self._find_place_standoff(
+                    env, broad=broad
+                )
                 if standoff is not None:
                     self._verified_place_base_pose = standoff.copy()
                     # Keep the referral-expression source in lockstep with the
@@ -629,9 +752,27 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             return False
         return True
 
-    def _redirect_place_to_furniture(self, env: CPUMujocoEnv) -> bool:
-        """Point the place target at an existing same-room furniture body whose
-        top-surface centre is reachable, replacing the spawned receptacle.
+    def _redirect_place_to_furniture(self, env: CPUMujocoEnv, broad: bool = False) -> bool:
+        """Point the place target at an existing same-room furniture body,
+        replacing the spawned receptacle.
+
+        Two modes:
+
+        * default (``broad=False``): only *small-footprint* furniture whose
+          top-surface CENTRE stays within arm reach is eligible, and the object
+          drops at the furniture body-origin xy (legacy centre-drop). Origin-
+          under-surface and height-match guards prevent off-surface drops.
+
+        * ``broad=True`` (``prefer_furniture_place``): *any* flat-topped furniture
+          large enough to be a sensible drop surface (bed / sofa / table / counter
+          / desk ...) is eligible, regardless of footprint size. This is safe
+          because the runtime place builder no longer needs the centre: it falls
+          back to ``_nearest_reachable_place_pose`` (a grid search over the
+          furniture top for the IK-reachable point nearest the base). Eligibility
+          is therefore judged by "the top has a reachable point", which the
+          ``_find_place_standoff`` probe run by the caller verifies -- so the
+          size/origin/height guards below are dropped for large furniture. A
+          minimum half-extent floor still excludes thin ledges / chair seats.
 
         Returns True and rewrites ``place_receptacle_name`` / ``place_target_name``
         / ``place_receptacle_start_pose`` on success; False (leaving the receptacle
@@ -647,6 +788,9 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             return False
 
         max_half = float(getattr(sampler_cfg, "furniture_place_max_half_extent_m", 0.40))
+        min_half_broad = float(
+            getattr(sampler_cfg, "broad_furniture_min_half_extent_m", 0.20)
+        )
         try:
             pickup_body_id = int(om.get_object_body_id(task_cfg.pickup_obj_name))
             _pc, pickup_dims = body_aabb(model, env.current_data, pickup_body_id)
@@ -655,8 +799,15 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             pickup_half_xy = 0.05
         # Reuse the far/same-room/elevated surface search, then map each surface
         # geom to its owning furniture body and keep the first (farthest) whose
-        # footprint is small enough for its centre to stay within arm reach.
+        # footprint is small enough for its centre to stay within arm reach. In
+        # broad mode, prepend directly-discovered furniture tops (bare beds /
+        # tables that support nothing, invisible to the supported-object search)
+        # so any flat furniture -- not just cluttered furniture -- is eligible.
         surface_geoms = self._find_far_elevated_surface_geoms(env, pickup_pos)
+        if broad:
+            direct_tops = self._find_furniture_top_geoms(env, pickup_pos)
+            seen_g = set(surface_geoms)
+            surface_geoms = direct_tops + [g for g in surface_geoms if g not in seen_g]
         pickup_root = int(model.body_rootid[int(om.get_object_body_id(task_cfg.pickup_obj_name))])
         seen_bodies: set[int] = set()
         for geom_id in surface_geoms:
@@ -675,6 +826,38 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 body_center, dims = body_aabb(model, env.current_data, root_id, visual_only=True)
             except Exception:
                 continue
+            try:
+                surf_center, surf_dims = geom_aabb(model, env.current_data, [int(geom_id)])
+            except Exception:
+                continue
+            if broad:
+                # Broad mode: accept any flat furniture whose top surface is big
+                # enough to hold the object with margin. Reachability of a top
+                # point is verified by the caller's ``_find_place_standoff`` probe
+                # (which reverts the redirect if unreachable), so no centre / size
+                # / origin / height gate is applied here beyond a sensible floor.
+                surf_half = float(min(surf_dims[0], surf_dims[1]) / 2.0)
+                if surf_half < min_half_broad:
+                    continue  # thin ledge / chair seat -- not a drop surface.
+                margin_x = float(surf_dims[0] / 2.0 - pickup_half_xy)
+                margin_y = float(surf_dims[1] / 2.0 - pickup_half_xy)
+                if margin_x <= 0.0 or margin_y <= 0.0:
+                    continue  # surface too small for the object footprint.
+                try:
+                    start_pose = pose_mat_to_7d(
+                        om.get_object_by_name(name).pose
+                    ).tolist()
+                except Exception:
+                    continue
+                task_cfg.place_receptacle_name = name
+                task_cfg.place_target_name = name
+                task_cfg.place_receptacle_start_pose = start_pose
+                log.info(
+                    f"[MOBILE PNP] Broad furniture place target '{name}' "
+                    f"(top {surf_dims[0]:.2f}x{surf_dims[1]:.2f}m); runtime places "
+                    "at nearest reachable top point."
+                )
+                return True
             # Shorter footprint half-extent: the base can approach from the
             # narrow side, so the centre is reachable when the SMALLER half-extent
             # is within the gate.
@@ -693,10 +876,6 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             # above a shorter surface of a taller body). Furniture whose origin is
             # not under its top surface (e.g. an L-shaped stand) is skipped so it
             # cannot produce off-surface drops.
-            try:
-                surf_center, surf_dims = geom_aabb(model, env.current_data, [int(geom_id)])
-            except Exception:
-                continue
             origin_xy = np.asarray(furniture.position, dtype=np.float64)[:2]
             surf_xy = np.asarray(surf_center[:2], dtype=np.float64)
             margin_x = float(surf_dims[0] / 2.0 - pickup_half_xy)
@@ -723,7 +902,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         return False
 
     def _find_place_standoff(
-        self, env: CPUMujocoEnv
+        self, env: CPUMujocoEnv, broad: bool = False
     ) -> tuple[bool, np.ndarray | None, bool]:
         """Probe for a base standoff from which the carried pickup object can be
         placed on the receptacle.
@@ -902,56 +1081,127 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         grid_reject_enabled = bool(
             getattr(sampler_cfg, "place_reject_on_unreachable", False)
         )
+        # Broad furniture mode: the runtime places at the nearest reachable point
+        # on a (potentially large) furniture top, so a centre-only probe wrongly
+        # rejects big surfaces whose centre is out of arm reach. Enable the grid
+        # probe AND allow a grid-feasible standoff to be RECORDED as the nav goal
+        # (so navigation parks where an off-centre top point is reachable). This
+        # is what makes bare beds / large tables usable as place targets.
+        grid_enabled = grid_reject_enabled or broad
         reachable_pose: np.ndarray | None = None
+        # Standoff anchor points: the ring of base standoffs is built around each
+        # anchor at radius ``manip_standoff_radius_range`` facing the anchor. For
+        # normal (small) receptacles the single anchor is the receptacle centre
+        # (unchanged behaviour). For BROAD furniture the centre of a large top is
+        # unreachable from any collision-free standoff (the base would sit inside
+        # the furniture footprint), so we anchor on EDGE points of the top and put
+        # the base OUTSIDE the footprint (beyond the edge) reaching inward -- this
+        # mirrors the runtime, which parks beside the furniture and places at the
+        # nearest reachable top point.
+        broad_specs: list[tuple[np.ndarray, np.ndarray]] = []  # (anchor_xy, base_xy)
+        if broad:
+            surf_half_x = float(rec_size[0] / 2.0)
+            surf_half_y = float(rec_size[1] / 2.0)
+            edge_reach = float(getattr(sampler_cfg, "broad_place_edge_reach_m", 0.35))
+            base_gap = float(getattr(sampler_cfg, "broad_place_base_gap_m", 0.55))
+            # Edge anchors: midpoints of the 4 sides, plus their halves, inset by
+            # the object footprint so the object rests fully on the surface.
+            for frac in (-0.5, 0.0, 0.5):
+                # +X / -X edges (base stands off in ±x beyond the edge)
+                ax = float(rec_center[0] + surf_half_x - edge_reach)
+                ay = float(rec_center[1] + frac * 2.0 * (surf_half_y - edge_reach))
+                broad_specs.append((np.array([ax, ay]),
+                                    np.array([rec_center[0] + surf_half_x + base_gap, ay])))
+                ax2 = float(rec_center[0] - surf_half_x + edge_reach)
+                broad_specs.append((np.array([ax2, ay]),
+                                    np.array([rec_center[0] - surf_half_x - base_gap, ay])))
+                # +Y / -Y edges
+                bx = float(rec_center[0] + frac * 2.0 * (surf_half_x - edge_reach))
+                by = float(rec_center[1] + surf_half_y - edge_reach)
+                broad_specs.append((np.array([bx, by]),
+                                    np.array([bx, rec_center[1] + surf_half_y + base_gap])))
+                by2 = float(rec_center[1] - surf_half_y + edge_reach)
+                broad_specs.append((np.array([bx, by2]),
+                                    np.array([bx, rec_center[1] - surf_half_y - base_gap])))
+            anchors = [a for a, _ in broad_specs]
+            if len(anchors) == 0:
+                anchors = [rec_xy]
+                broad_specs = [(rec_xy, None)]
+        else:
+            anchors = [rec_xy]
+            broad_specs = [(rec_xy, None)]
         try:
-            for r in radii:
-                for k in range(n_ang):
-                    a = 2.0 * np.pi * k / max(n_ang, 1)
-                    bx = float(rec_xy[0] + r * np.cos(a))
-                    by = float(rec_xy[1] + r * np.sin(a))
-                    theta = float(np.arctan2(rec_xy[1] - by, rec_xy[0] - bx))
-                    c, s = np.cos(theta), np.sin(theta)
-                    base_pose = np.eye(4)
-                    base_pose[:3, :3] = np.array(
-                        [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
-                    )
-                    base_pose[0, 3], base_pose[1, 3], base_pose[2, 3] = bx, by, base_z
-                    # Skip standoffs that collide with the environment.
-                    robot_view.base.pose = base_pose
-                    mujoco.mj_forward(model, data)
-                    try:
-                        if env.check_robot_collision_in_current_pose(namespace):
-                            continue
-                    except Exception:
-                        pass
-                    place_xys = (
-                        place_xy_candidates(base_pose) if grid_reject_enabled else []
-                    )
-                    for grasp_world in grasp_poses_world:
-                        # Record a nav-goal standoff from the receptacle CENTRE
-                        # place pose only (matches the prior behaviour exactly).
-                        preplace_c, place_c = place_poses_for(grasp_world, rec_xy)
-                        if ik_ok(base_pose, place_c) and ik_ok(base_pose, preplace_c):
-                            found_pose = base_pose.copy()
-                            reachable_pose = found_pose
+            for anchor_xy, fixed_base_xy in broad_specs:
+                if found_pose is not None:
+                    break
+                for r in radii:
+                    for k in range(n_ang):
+                        if broad and fixed_base_xy is not None:
+                            # Broad furniture: base is fixed OUTSIDE the footprint
+                            # beyond the chosen edge; vary only the standoff radius
+                            # (offset outward). ``n_ang`` collapses to a single
+                            # facing-inward orientation.
+                            if k > 0:
+                                continue
+                            outward = fixed_base_xy - anchor_xy
+                            nrm = float(np.linalg.norm(outward)) or 1.0
+                            outward = outward / nrm
+                            bx = float(anchor_xy[0] + outward[0] * r * 2.0)
+                            by = float(anchor_xy[1] + outward[1] * r * 2.0)
+                        else:
+                            a = 2.0 * np.pi * k / max(n_ang, 1)
+                            bx = float(anchor_xy[0] + r * np.cos(a))
+                            by = float(anchor_xy[1] + r * np.sin(a))
+                        theta = float(np.arctan2(anchor_xy[1] - by, anchor_xy[0] - bx))
+                        c, s = np.cos(theta), np.sin(theta)
+                        base_pose = np.eye(4)
+                        base_pose[:3, :3] = np.array(
+                            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+                        )
+                        base_pose[0, 3], base_pose[1, 3], base_pose[2, 3] = bx, by, base_z
+                        # Skip standoffs that collide with the environment.
+                        robot_view.base.pose = base_pose
+                        mujoco.mj_forward(model, data)
+                        try:
+                            if env.check_robot_collision_in_current_pose(namespace):
+                                continue
+                        except Exception:
+                            pass
+                        place_xys = (
+                            place_xy_candidates(base_pose) if grid_enabled else []
+                        )
+                        # Primary place point: receptacle CENTRE for normal
+                        # receptacles (unchanged), or the current anchor top point
+                        # for broad furniture (the runtime places at the nearest
+                        # reachable top point, which is near an edge, not centre).
+                        primary_xy = anchor_xy if broad else rec_xy
+                        for grasp_world in grasp_poses_world:
+                            preplace_c, place_c = place_poses_for(grasp_world, primary_xy)
+                            if ik_ok(base_pose, place_c) and ik_ok(base_pose, preplace_c):
+                                found_pose = base_pose.copy()
+                                reachable_pose = found_pose
+                                break
+                            # Runtime ``_nearest_reachable_place_pose`` mirror: the
+                            # runtime can place off-centre on the top footprint when
+                            # the centre is unreachable. Track that as REACHABLE (for
+                            # the opt-in rejection path) WITHOUT recording it as the
+                            # nav goal. GATED on rejection being enabled: the extra
+                            # grid IK calls advance the IK solver's RNG and would
+                            # perturb all downstream episode sampling
+                            # (``place_robot_near`` etc.), so when rejection is off
+                            # (default) we skip the grid entirely and keep the exact
+                            # baseline IK-call sequence. In ``broad`` mode the
+                            # grid-feasible standoff is ALSO recorded as the nav goal.
+                            if grid_enabled and reachable_pose is None:
+                                for place_xy in place_xys[1:]:
+                                    preplace, place = place_poses_for(grasp_world, place_xy)
+                                    if ik_ok(base_pose, place) and ik_ok(base_pose, preplace):
+                                        reachable_pose = base_pose.copy()
+                                        if broad and found_pose is None:
+                                            found_pose = base_pose.copy()
+                                        break
+                        if found_pose is not None:
                             break
-                        # Runtime ``_nearest_reachable_place_pose`` mirror: the
-                        # runtime can place off-centre on the top footprint when
-                        # the centre is unreachable. Track that as REACHABLE (for
-                        # the opt-in rejection path) WITHOUT recording it as the
-                        # nav goal. GATED on rejection being enabled: the extra
-                        # grid IK calls advance the IK solver's RNG and would
-                        # perturb all downstream episode sampling
-                        # (``place_robot_near`` etc.), so when rejection is off
-                        # (default) we skip the grid entirely and keep the exact
-                        # baseline IK-call sequence -- making this probe a strict
-                        # no-op vs the prior centre-only behaviour.
-                        if grid_reject_enabled and reachable_pose is None:
-                            for place_xy in place_xys[1:]:
-                                preplace, place = place_poses_for(grasp_world, place_xy)
-                                if ik_ok(base_pose, place) and ik_ok(base_pose, preplace):
-                                    reachable_pose = base_pose.copy()
-                                    break
                     if found_pose is not None:
                         break
                 if found_pose is not None:
@@ -964,7 +1214,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         # reachable=True unconditionally (rejection is gated on this flag AND on
         # ``place_reject_on_unreachable``). When enabled, reachability reflects
         # whether any centre-or-grid standoff could place the object.
-        reachable = True if not grid_reject_enabled else (reachable_pose is not None)
+        reachable = True if not grid_enabled else (reachable_pose is not None)
         return (True, found_pose, reachable)
 
     def _prepare_place_target(
