@@ -626,6 +626,35 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._checkpoints: dict[str, tuple[np.ndarray, int]] = {}
         self._retry_counts: dict[str, int] = {}
         self._max_segment_retries = getattr(self.policy_config, "max_segment_retries", 2)
+        # --- Place-phase diagnostics -------------------------------------- #
+        # Per-episode flags that turn the opaque "place NOT_REACHED" failure
+        # mode into concrete, queryable causes (see get_info). Populated as the
+        # FSM advances; surfaced in obs_scene so a datagen pass can attribute
+        # every failed episode without re-running a VLM.
+        self._diag: dict[str, Any] = self._fresh_diag()
+
+    @staticmethod
+    def _fresh_diag() -> dict[str, Any]:
+        return {
+            # High-level milestones.
+            "grasp_verified": False,       # PICK produced a confirmed grasp.
+            "reached_nav_to_receptacle": False,  # transport nav segment entered.
+            "place_phase_started": False,  # PLACE primitives built + executing.
+            "place_ik_feasible": None,     # did _enter_place build a place pose?
+            "place_standoff_searched": False,  # fell back to ring standoff search.
+            "release_commanded": False,    # object was set down (grasp lock dropped).
+            "place_completed": False,      # PLACE reached DONE cleanly.
+            # Failure attribution (first cause wins).
+            "place_fail_cause": None,      # one of the cause strings below.
+            # Final geometry (filled at teardown / DONE).
+            "final_gripper_to_receptacle_m": None,
+            "retries": {},                 # per-phase retry counts.
+        }
+
+    def _set_place_cause(self, cause: str) -> None:
+        """Record the first place-phase failure cause (later ones are symptoms)."""
+        if self._diag.get("place_fail_cause") is None:
+            self._diag["place_fail_cause"] = cause
 
     # Segment = (navigate to a target, then manipulate). A failure anywhere in
     # a segment restores the segment-start checkpoint and re-runs the segment.
@@ -982,6 +1011,52 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
     def get_all_phases(self) -> dict[str, int]:
         return {NAV_TO_OBJ: 0, PICK: 1, NAV_TO_RECEPTACLE: 2, PLACE: 3, DONE: 4}
 
+    def _gripper_to_receptacle_m(self) -> float | None:
+        """Planar (xy) distance from the active gripper TCP to the place
+        receptacle centre, or None if either is unavailable. Read at teardown to
+        quantify how close the arm got to the intended receptacle."""
+        try:
+            tcp = self._tcp_world_pose()
+            if tcp is None:
+                mg_ids = self.task.env.current_robot.robot_view.get_gripper_movegroup_ids()
+                if not mg_ids:
+                    return None
+                tcp = self.task.env.current_robot.robot_view.get_move_group(
+                    mg_ids[0]
+                ).leaf_frame_to_world
+            om = self.task.env.object_managers[self.task.env.current_batch_index]
+            recep = om.get_object_by_name(self.config.task_config.place_receptacle_name)
+            d = np.asarray(recep.position)[:2] - np.asarray(tcp[:2, 3])
+            return float(np.linalg.norm(d))
+        except Exception:
+            return None
+
+    def _derive_place_diag_cause(self) -> str:
+        """Collapse the diagnostic flags into a single top-level attribution for
+        the place phase, mirroring the manip_failure_analysis taxonomy."""
+        d = self._diag
+        if d["place_completed"]:
+            return "place_completed"
+        if not d["grasp_verified"]:
+            return "no_verified_grasp"
+        if not d["reached_nav_to_receptacle"]:
+            return "grasp_but_no_transport"
+        if d["place_ik_feasible"] is False:
+            return "place_ik_infeasible"
+        if not d["place_phase_started"]:
+            return "reached_receptacle_but_place_not_started"
+        if not d["release_commanded"]:
+            return d.get("place_fail_cause") or "place_started_but_no_release"
+        return "released_but_not_scored_success"
+
+    def get_info(self) -> dict:
+        info = super().get_info()
+        self._diag["retries"] = dict(self._retry_counts)
+        self._diag["final_gripper_to_receptacle_m"] = self._gripper_to_receptacle_m()
+        self._diag["place_diag_cause"] = self._derive_place_diag_cause()
+        info["mobile_pnp_diag"] = self._diag
+        return info
+
     def reset(self) -> None:
         self._phase = NAV_TO_OBJ
         self._nav_step_in_segment = 0
@@ -998,6 +1073,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._grasp_mg_id = None
         self._place_released = False
         self._pick_object_ref_z = None
+        self._diag = self._fresh_diag()
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
         # Drive to the grasp-feasibility-verified base pose the sampler recorded
         # (Avenue A), not the closest navigable cell.
@@ -1508,6 +1584,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         try:
             self._manip_policy.reset(reset_retries=True)
             self._locked_base_pose = current
+            self._diag["place_ik_feasible"] = True
             log.info(
                 "[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE "
                 f"(built at navigated pose ({current[0, 3]:.2f}, {current[1, 3]:.2f}))."
@@ -1518,11 +1595,15 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 "[MOBILE PNP FSM] PLACE not feasible at navigated pose; "
                 "trying nearby standoffs (carrying object)."
             )
+        self._diag["place_standoff_searched"] = True
         ok = self._search_manip_base_pose(
             PLACE,
             self.config.task_config.place_receptacle_name,
             getattr(self.config.task_config, "place_robot_base_pose", None),
         )
+        self._diag["place_ik_feasible"] = bool(ok)
+        if not ok:
+            self._set_place_cause("place_ik_infeasible_all_standoffs")
         if ok:
             log.info("[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE (nearby standoff).")
         return ok
@@ -1619,6 +1700,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 # then release it at the lowering/open segment so it can be set
                 # down. Releasing earlier let it slip out at preplace entry.
                 if self._phase == PLACE and self._grasp_offset is not None:
+                    self._diag["place_phase_started"] = True
                     if self._manip_policy.get_phase() == "preplace":
                         self._apply_grasp_lock()
                     else:
@@ -1627,6 +1709,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         # later failure won't retry and undo the placement.
                         self._grasp_offset = None
                         self._place_released = True
+                        self._diag["release_commanded"] = True
                 try:
                     manip_action = self._manip_policy.get_action(observation)
                 except (ValueError, AssertionError) as e:
@@ -1651,6 +1734,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         )
                         self._phase = DONE
                     elif not self._retry_segment(self._phase):
+                        if self._phase == PLACE:
+                            self._set_place_cause(
+                                "place_aborted_before_release_retries_exhausted"
+                            )
                         self._phase = DONE
                     continue
                 manip_done = manip_action.pop("done", False)
@@ -1671,6 +1758,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                         )
                         self._phase = DONE
                     elif not self._retry_segment(self._phase):
+                        if self._phase == PLACE:
+                            self._set_place_cause(
+                                "place_primitive_failed_before_release"
+                            )
                         self._phase = DONE
                     continue
 
@@ -1692,6 +1783,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     # Pick succeeded: cache the held-object state (and recording
                     # length) so the place segment can be retried without redoing
                     # navigation+pick, with the failed attempt truncated out.
+                    self._diag["grasp_verified"] = True
                     self._checkpoints[PLACE] = self._make_checkpoint()
                     # Lock the object to the gripper for the transport nav.
                     self._capture_grasp_lock()
@@ -1705,9 +1797,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     self._nav_step_in_segment = 0
                     self._nav_arm_hold = None
                     self._phase = NAV_TO_RECEPTACLE
+                    self._diag["reached_nav_to_receptacle"] = True
                     log.info("[MOBILE PNP FSM] PICK done → phase NAV_TO_RECEPTACLE")
                 else:
                     self._phase = DONE
+                    self._diag["place_completed"] = True
                     log.info("[MOBILE PNP FSM] PLACE done → phase DONE")
                 continue
 
