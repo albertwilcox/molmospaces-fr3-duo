@@ -482,6 +482,26 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
         # receptacle and IK-checks the poses from the parked base.
         current_ee_pose = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_world.copy()
 
+        # Presence predicate for the empty-grasp check during the preplace
+        # transport move. The held object closes the fingers to their hard stop
+        # on THIN/SMALL objects (inter_finger_dist ~= 0), which the aperture-only
+        # heuristic mis-flags as an empty grasp -- aborting PLACE before release
+        # even though the object is in hand (observed: soap dispensers/bottles
+        # fail with "Object is not in grasp! 0.00000"). Mirror the PICK-phase fix
+        # (_object_in_gripper) so PLACE is hardened against the same misfire: the
+        # object is in hand iff it is within a small distance of the gripper TCP.
+        _present_max_dist = float(
+            getattr(self.policy_config, "grasp_verify_max_tcp_dist_m", 0.12)
+        )
+
+        def _object_in_gripper() -> bool:
+            try:
+                obj_xyz = np.asarray(pickup_obj.position, dtype=np.float64)
+                tcp = robot_view.get_move_group(gripper_mg_id).leaf_frame_to_world
+                return bool(np.linalg.norm(obj_xyz - tcp[:3, 3]) <= _present_max_dist)
+            except Exception:
+                return False
+
         preplace_pose, place_pose, postplace_pose = self._get_placement_poses(
             grasp_pose_world=current_ee_pose,
             pickup_obj=pickup_obj,
@@ -516,6 +536,7 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
                 tcp_pos_err_threshold=self.policy_config.tcp_pos_err_threshold,
                 tcp_rot_err_threshold=self.policy_config.tcp_rot_err_threshold,
                 gripper_mg_id=gripper_mg_id,
+                object_present_fn=_object_in_gripper,
                 move_segments=[
                     TCPMoveSegment(
                         name="preplace",
