@@ -231,6 +231,10 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         # distance bound (intra-room distances are shorter) and resolve the
         # pickup object's room id for same-room filtering of candidate surfaces.
         same_room_only = bool(getattr(sampler_cfg, "same_room_place_only", False))
+        exclude_enclosed = bool(
+            getattr(sampler_cfg, "place_exclude_enclosed_container_surfaces", False)
+        )
+        n_enclosed_skipped = 0
         if same_room_only:
             far_min = float(
                 getattr(sampler_cfg, "same_room_min_object_to_receptacle_dist", 0.8)
@@ -272,16 +276,30 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 surf_room = self._surface_geom_room_id(model, om, int(geom_id))
                 if surf_room is None or surf_room != pickup_room:
                     continue
+            # Enclosed-container gate: skip surfaces owned by an appliance the
+            # base cannot maneuver into to place (fridge shelf, oven rack, etc.).
+            # Only prunes candidates; open surfaces remain, so a house is never
+            # exhausted by this filter.
+            if exclude_enclosed and self._surface_geom_is_enclosed_container(
+                model, om, int(geom_id)
+            ):
+                n_enclosed_skipped += 1
+                continue
             scored.append((dist, int(geom_id)))
 
         # Prefer farther surfaces (genuine place-nav segment) but keep all
         # candidates so placement can fall through to a nearer elevated surface.
         scored.sort(key=lambda t: -t[0])
         room_note = f" (same-room={pickup_room})" if pickup_room is not None else ""
+        enclosed_note = (
+            f", {n_enclosed_skipped} enclosed-container surface(s) skipped"
+            if exclude_enclosed and n_enclosed_skipped
+            else ""
+        )
         log.info(
             f"[MOBILE PNP] elevated-surface search: {len(scored)} candidate surface(s) "
             f"in [{far_min:.1f},{far_max:.1f}]m band above z={min_top_z:.2f}"
-            f"{room_note} (probed {len(seen)} supporting geoms)."
+            f"{room_note} (probed {len(seen)} supporting geoms){enclosed_note}."
         )
         return [gid for _, gid in scored]
 
@@ -310,6 +328,35 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         except Exception:
             return None
         return self._room_id_of_name(name)
+
+    def _surface_geom_is_enclosed_container(
+        self, model: Any, om: Any, geom_id: int
+    ) -> bool:
+        """True when a candidate surface geom belongs to an *enclosed* container
+        appliance (fridge/oven/microwave/cabinet/drawer ...) the mobile base
+        cannot maneuver into to place.
+
+        Mirrors the pickup-side container test: the owning furniture must both
+        match a container lemma (``_CONTAINER_NAME_KEYWORDS``) AND be articulable
+        (have a door/drawer joint), so open shelving with a container-like name
+        is not spuriously excluded. Fail-open (returns False) on any lookup error
+        so incomplete data never removes a candidate.
+        """
+        try:
+            body_id = int(model.geom_bodyid[geom_id])
+            root_body_id = int(model.body_rootid[body_id])
+            name = om.get_object_name(root_body_id)
+        except Exception:
+            return False
+        if not name:
+            return False
+        lowered = name.lower()
+        if not any(kw in lowered for kw in self._CONTAINER_NAME_KEYWORDS):
+            return False
+        try:
+            return bool(om.is_object_articulable(name))
+        except Exception:
+            return False
 
     # --- Closed-container (fridge/cabinet/drawer) pickup exclusion ---------- #
     # Substrings identifying openable *container* furniture that can hide a

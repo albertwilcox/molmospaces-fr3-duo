@@ -204,6 +204,18 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # time (avoiding a wasted full-length PLACE-fail rollout).
     place_reject_on_unreachable: bool = False
 
+    # If True, exclude candidate place surfaces that belong to an *enclosed*
+    # container appliance (fridge/oven/microwave/dishwasher/cabinet/drawer etc.)
+    # from the far-elevated-surface search, so the spawned place receptacle is
+    # never stood on a shelf inside a fridge/cabinet. The mobile base cannot
+    # maneuver into an appliance interior to place (and grazing the door swings
+    # it shut), which is a frequent PLACE-phase failure. Unlike
+    # ``place_reject_on_unreachable`` this only PRUNES the candidate list -- open
+    # tables/counters/shelves remain, so it changes the place distribution
+    # without ever exhausting a house (no intrinsic-failure risk). Default False
+    # keeps the exact prior candidate set.
+    place_exclude_enclosed_container_surfaces: bool = False
+
     # When the place-feasibility probe finds no reachable standoff for the spawned
     # receptacle at its initially sampled spot, RE-SAMPLE the receptacle to a
     # different point on the far elevated surface and re-probe, up to this many
