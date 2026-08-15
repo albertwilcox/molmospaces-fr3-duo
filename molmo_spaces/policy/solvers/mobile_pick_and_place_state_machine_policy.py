@@ -1717,17 +1717,24 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 # step makes the base effectively rigid for the manip phase.
                 if self._locked_base_pose is not None:
                     self._snap_base_pose(self._locked_base_pose)
-                # Hold the object rigidly through the PLACE preplace repositioning,
-                # then release it at the lowering/open segment so it can be set
-                # down. Releasing earlier let it slip out at preplace entry.
+                # Hold the object rigidly through the PLACE preplace repositioning
+                # AND the place descent, then release it only at the gripper-open
+                # segment so it can be set down. Marking release at the *place*
+                # descent (merely leaving "preplace") was premature: if the place
+                # descent then fails IK, the grasp lock is already dropped, so the
+                # object falls wherever it happened to be (mid-air / off the
+                # receptacle) and the FSM wrongly treats it as placed -> DONE ->
+                # scored failure ("released_but_not_scored_success"). The object
+                # is only actually set down once the gripper opens.
                 if self._phase == PLACE and self._grasp_offset is not None:
                     self._diag["place_phase_started"] = True
-                    if self._manip_policy.get_phase() == "preplace":
+                    if self._manip_policy.get_phase() in ("preplace", "place"):
                         self._apply_grasp_lock()
                     else:
-                        # Reached the lowering/open segment: the object is being
-                        # set down. Stop the grasp lock and mark it released so a
-                        # later failure won't retry and undo the placement.
+                        # Reached the gripper-open (release) segment: the object
+                        # is being set down. Stop the grasp lock and mark it
+                        # released so a later failure won't retry and undo the
+                        # placement.
                         self._grasp_offset = None
                         self._place_released = True
                         self._diag["release_commanded"] = True
