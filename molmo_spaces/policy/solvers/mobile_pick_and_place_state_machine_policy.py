@@ -893,7 +893,18 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         cfg = self.policy_config
         target = self._locked_base_pose.copy()
         carry = self.config.task_config.pickup_obj_name if approach_phase == APPROACH_PLACE else None
-        if not getattr(cfg, "base_approach_enabled", True):
+        # The PLACE entry is always safe to smooth: the object is grasp-locked
+        # (rigidly fixed to the gripper) so sliding the base to the standoff over
+        # several snap-held steps cannot corrupt the grasp -- unlike the PICK
+        # entry, where integrating physics while sliding into the grasp standoff
+        # historically dropped success to ~0% ("Object is not in grasp!"). So
+        # PICK obeys ``base_approach_enabled`` (default off) while PLACE always
+        # approaches smoothly, eliminating the manip-entry observation teleport.
+        approach_on = getattr(cfg, "base_approach_enabled", True) or (
+            approach_phase == APPROACH_PLACE
+            and getattr(cfg, "base_approach_place_enabled", True)
+        )
+        if not approach_on:
             # Approach disabled: leave the base at the standoff (legacy teleport).
             self._phase = _APPROACH_MANIP[approach_phase]
             return
@@ -1629,9 +1640,29 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             log.info("[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE (nearby standoff).")
         return ok
 
+    def _current_base_command(self) -> np.ndarray:
+        """The base's current world pose as an ``[x, y, yaw]`` command.
+
+        During manipulation and at episode end the base is frozen (pinned at the
+        standoff), so the FSM emits no nav base command. Recording that as an
+        absent/zeroed base action writes a ``[0, 0, 0]`` sentinel into
+        ``action.base_pose_command``, which reads as a multi-metre teleport
+        to/from the origin in the saved data. Emitting the ACTUAL held base pose
+        instead keeps the recorded command continuous and truthful (the base
+        genuinely isn't moving), so no spurious teleport is logged.
+        """
+        base_pose = self.task.env.current_robot.robot_view.base.pose
+        x = float(base_pose[0, 3])
+        y = float(base_pose[1, 3])
+        yaw = float(np.arctan2(base_pose[1, 0], base_pose[0, 0]))
+        return np.array([x, y, yaw], dtype=np.float64)
+
     def _done_action(self) -> dict[str, Any]:
         gripper_ids = self.task.env.current_robot.robot_view.get_gripper_movegroup_ids()
         action = self.task.env.current_robot.robot_view.get_ctrl_dict(["arm"] + gripper_ids)
+        # Emit the held base pose (not an absent/zeroed base) so the final
+        # recorded base command doesn't read as a teleport to the origin.
+        action[_BASE_MG_ID] = self._current_base_command()
         action["done"] = True
         return action
 
@@ -1770,9 +1801,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     continue
                 manip_done = manip_action.pop("done", False)
                 manip_failed = manip_action.pop("success", None) is False
-                # Never command the base during manipulation: drop the key so
-                # the task freezes the base at the parked pose.
-                manip_action.pop(_BASE_MG_ID, None)
+                # The base is pinned during manipulation (re-pinned via qpos+ctrl
+                # every step in the PICK/PLACE branch). Record the held base pose
+                # as the commanded base instead of dropping the key: an absent
+                # base key is logged as a [0,0,0] sentinel that reads as a
+                # multi-metre teleport in the saved action.base_pose_command.
+                # Emitting the actual (unchanging) pose keeps the record truthful
+                # and continuous while the base still stays frozen.
+                manip_action[_BASE_MG_ID] = self._current_base_command()
 
                 if not manip_done:
                     return self._smooth_arm_action(manip_action)

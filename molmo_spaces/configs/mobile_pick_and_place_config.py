@@ -445,6 +445,13 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # A/B). The single-frame standoff snap the direct path leaves is small and
     # visually imperceptible, so we keep the (grasp-preserving) direct snap.
     base_approach_enabled: bool = False
+    # PLACE-entry smooth approach. Unlike PICK, the object is already grasp-locked
+    # (rigidly fixed to the gripper) when entering PLACE, so sliding the base to
+    # the place standoff over snap-held steps cannot corrupt a grasp. Enabling it
+    # eliminates the manip-entry base "teleport" in the observation stream at the
+    # NAV_TO_RECEPTACLE -> PLACE transition (e.g. a ~0.2 m single-frame base snap)
+    # without the grasp-corruption risk that keeps ``base_approach_enabled`` off.
+    base_approach_place_enabled: bool = True
     # Position/heading tolerance for declaring the approach complete (the final
     # re-pin to the exact standoff is then far below the teleport threshold).
     base_approach_pos_tol_m: float = 0.04
