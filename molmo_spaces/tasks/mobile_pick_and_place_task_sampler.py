@@ -571,24 +571,102 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 return True
         return False
 
+    def _has_overhead_obstruction(self, env: CPUMujocoEnv, obj_name: str) -> bool:
+        """True if another scene geom sits directly above ``obj_name`` within the
+        configured clear-column, so an approach-from-above grasp would collide.
+
+        We take the candidate's world AABB, shrink its XY footprint by
+        ``overhead_clearance_xy_margin_m`` (a negative margin grows it), and scan
+        every geom that does NOT belong to the candidate's own body. A geom is a
+        blocker when its AABB overlaps the (shrunk) footprint by at least
+        ``overhead_clearance_min_overlap_frac`` of the footprint area AND its
+        bottom lies in the band ``(obj_top, obj_top + clearance_height]``. Static
+        world geometry (walls, ceilings) far above is naturally excluded by the
+        bounded clearance band; only genuinely overhanging clutter qualifies.
+        """
+        sampler_cfg = self.config.task_sampler_config
+        if not getattr(sampler_cfg, "require_overhead_clearance", True):
+            return False
+        model = env.current_model
+        data = env.current_data
+        om = env.object_managers[env.current_batch_index]
+        try:
+            obj_body_id = int(om.get_object_body_id(obj_name))
+            obj_center, obj_dims = body_aabb(model, data, obj_body_id)
+        except Exception:
+            return False
+        obj_center = np.asarray(obj_center, dtype=np.float64)
+        obj_dims = np.asarray(obj_dims, dtype=np.float64)
+        obj_top = obj_center[2] + obj_dims[2] / 2.0
+        clearance = float(getattr(sampler_cfg, "overhead_clearance_height_m", 0.25))
+        xy_margin = float(getattr(sampler_cfg, "overhead_clearance_xy_margin_m", -0.02))
+        min_frac = float(getattr(sampler_cfg, "overhead_clearance_min_overlap_frac", 0.10))
+
+        half_x = max(obj_dims[0] / 2.0 + xy_margin, 1e-4)
+        half_y = max(obj_dims[1] / 2.0 + xy_margin, 1e-4)
+        foot_area = (2.0 * half_x) * (2.0 * half_y)
+        o_xmin, o_xmax = obj_center[0] - half_x, obj_center[0] + half_x
+        o_ymin, o_ymax = obj_center[1] - half_y, obj_center[1] + half_y
+
+        # Geoms belonging to the candidate's own body tree (exclude from the scan).
+        own_geoms = set(descendant_geoms(model, obj_body_id, visual_only=False))
+
+        for gid in range(model.ngeom):
+            if gid in own_geoms:
+                continue
+            if int(model.geom_bodyid[gid]) == obj_body_id:
+                continue
+            try:
+                gc, gd = geom_aabb(model, data, [int(gid)])
+            except Exception:
+                continue
+            g_bottom = gc[2] - gd[2] / 2.0
+            # Bottom must lie in the clear column just above the object's top.
+            if not (obj_top < g_bottom <= obj_top + clearance):
+                continue
+            g_hx, g_hy = gd[0] / 2.0, gd[1] / 2.0
+            ox = max(0.0, min(o_xmax, gc[0] + g_hx) - max(o_xmin, gc[0] - g_hx))
+            oy = max(0.0, min(o_ymax, gc[1] + g_hy) - max(o_ymin, gc[1] - g_hy))
+            overlap = ox * oy
+            if overlap >= min_frac * foot_area:
+                return True
+        return False
+
     def _get_scene_objects(self, env: CPUMujocoEnv, mass_limit: float = 100) -> list:
         """Scene pickup candidates, with objects enclosed by a closed openable
-        container (fridge/cabinet/drawer) removed on top of the base filters."""
+        container (fridge/cabinet/drawer) removed on top of the base filters, and
+        objects with overhead obstructions (which foil top-down grasps) removed."""
         candidates = super()._get_scene_objects(env, mass_limit=mass_limit)
         containers = self._openable_container_boxes(env)
-        if not containers:
-            return candidates
-        kept = []
-        dropped = 0
+        after_enclosed = []
+        dropped_enclosed = 0
         for obj in candidates:
-            if self._object_is_enclosed(env, obj.name, containers):
-                dropped += 1
+            if containers and self._object_is_enclosed(env, obj.name, containers):
+                dropped_enclosed += 1
+                continue
+            after_enclosed.append(obj)
+        kept = []
+        dropped_overhead = 0
+        for obj in after_enclosed:
+            if self._has_overhead_obstruction(env, obj.name):
+                dropped_overhead += 1
                 continue
             kept.append(obj)
-        if dropped:
+        # Never exhaust the pool: if the overhead filter removed every remaining
+        # candidate, fall back to the clearance-agnostic set so the house stays
+        # usable (an obstructed grasp is still better than no task).
+        if not kept and after_enclosed:
             log.info(
-                f"[MOBILE PNP] Excluded {dropped} pickup candidate(s) enclosed by a "
-                f"closed openable container; {len(kept)} remain."
+                "[MOBILE PNP] Overhead-clearance filter would empty the pickup "
+                f"pool ({dropped_overhead} obstructed); keeping obstructed candidates."
+            )
+            kept = after_enclosed
+            dropped_overhead = 0
+        if dropped_enclosed or dropped_overhead:
+            log.info(
+                f"[MOBILE PNP] Excluded {dropped_enclosed} enclosed + "
+                f"{dropped_overhead} overhead-obstructed pickup candidate(s); "
+                f"{len(kept)} remain."
             )
         return kept
 

@@ -263,6 +263,25 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # point re-sampling can make the place target reachable by construction.
     place_receptacle_resample_tries: int = 0
 
+    # --- Overhead clearance for pickup candidates ------------------------- #
+    # Reject pickup candidates that have OTHER scene geometry directly above
+    # them within a vertical column: a top-down / approach-from-above grasp
+    # would collide with the overhanging object (e.g. an item on a shelf under
+    # the next shelf, or a mug tucked under a cabinet lip), which leads to
+    # empty-grasp misfires. Enabled by default; disable to restore the prior
+    # (clearance-agnostic) candidate pool.
+    require_overhead_clearance: bool = True
+    # Height (m) of the clear column required directly above a candidate's top
+    # face. Roughly the gripper + approach standoff the arm needs from above.
+    overhead_clearance_height_m: float = 0.25
+    # Horizontal shrink (m) applied to the candidate's XY footprint before
+    # testing for overhang, so a geom merely flush beside the object (touching
+    # its side, not truly above it) does not disqualify it.
+    overhead_clearance_xy_margin_m: float = -0.02
+    # Minimum XY overlap fraction of the candidate footprint that an overhead
+    # geom must cover to count as blocking (filters slivers / grazing contacts).
+    overhead_clearance_min_overlap_frac: float = 0.10
+
 
 class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     """Config for the mobile pick-and-place state-machine expert.
