@@ -177,7 +177,7 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     #     ``broad_furniture_place_prob``.
     # Default False preserves the exact prior (small-furniture-only) behaviour.
     prefer_furniture_place: bool = False
-    broad_furniture_place_prob: float = 0.85
+    broad_furniture_place_prob: float = 0.75
     # Minimum top-surface XY half-extent (m) for a large furniture body to be an
     # eligible broad place target (excludes thin ledges / chair seats that read as
     # furniture but are not sensible drop surfaces).
