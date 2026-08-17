@@ -31,6 +31,23 @@ class AStarPlannerConfig(Config):
     # historical default; raise it to steer around obstacles more conservatively.
     weight_exp: int = 2
 
+    # Per-step distance cost added to every graph edge. The clearance term above
+    # is otherwise the ONLY edge cost, so A* minimises summed clearance penalty
+    # with no regard for path length and takes long detours through open space
+    # (observed ~4x the straight-line distance in cluttered procthor houses),
+    # burning the step budget before the robot reaches the object. A positive
+    # ``distance_weight`` makes A* minimise length while still preferring
+    # clearance to break ties. Set to 0 to recover the legacy clearance-only
+    # behaviour.
+    distance_weight: float = 1.0
+
+    # Clamp (in grid cells) on the distance-transform value used for the
+    # clearance penalty. Beyond this the penalty saturates, so a cell that is
+    # already "far enough" from obstacles gains nothing from being even farther
+    # -- this stops the planner detouring into the middle of large open rooms
+    # purely to maximise clearance. None disables the clamp.
+    max_clearance_cells: float | None = 3.0
+
 
 class AStarPlanner(Planner):
     def __init__(
@@ -138,7 +155,11 @@ class AStarPlanner(Planner):
     def graph(self):
         if self._graph is None:
             self._graph = dtutils.make_grid_graph(
-                self.downscaled_grid, self.dt, weight_exp=self.config.weight_exp
+                self.downscaled_grid,
+                self.dt,
+                weight_exp=self.config.weight_exp,
+                distance_weight=self.config.distance_weight,
+                max_clearance_cells=self.config.max_clearance_cells,
             )
 
         return self._graph
@@ -207,6 +228,7 @@ class AStarPlanner(Planner):
                 3,
                 self.grid_spacing,
                 0.6,
+                distance_weight=self.config.distance_weight,
             )
 
             pixel_waypoints = np.array(waypoints) * self.downscale

@@ -82,6 +82,18 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # object (representative of where navigation parks the base for the grasp).
     manip_standoff_radius_range: tuple[float, float] = (0.35, 0.7)
 
+    # --- Base-locked grasp-reachability gate (sample time) ------------------
+    # The inherited grasp check only verifies a grasp is non-colliding, not that
+    # the arm can REACH it with the base frozen. Enable a base-locked IK gate at
+    # sample time (mirroring the FSM's runtime standoff search) so ungraspable
+    # pickup objects are rejected and a reachable one is sampled instead --
+    # directly attacking the dominant ``no reachable base standoff`` /
+    # ``no_verified_grasp`` runtime failure.
+    manip_reach_gate_enabled: bool = True
+    # Cap on the number of (grasp, pregrasp) IK solves per object so a
+    # pathological object can't blow up sample time.
+    manip_reach_gate_max_grasps: int = 48
+
     # Radius range for the navigable START pose (far enough that navigation is
     # genuinely exercised, close enough that the smoke test stays fast/robust).
     nav_start_radius_range: tuple[float, float] = (2.0, 6.0)
@@ -301,6 +313,15 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
         nav_goal_distance_threshold=0.25,
         path_min_dist_to_target_center=0.4,
         use_pure_pursuit=True,
+        # Give the stowed FR3 arm real wall clearance so planned paths do not
+        # route the base through gaps the arm cannot clear (the dominant
+        # "wedged mid-navigation / no arc-length progress" abort). 0.30 covers
+        # only the base column; 0.40 covers the compact nav-stow arm envelope.
+        nav_planning_agent_radius=0.40,
+        # Stop the B-spline smoother from cutting corners into walls, which
+        # produces the short execution stalls that the pure-pursuit tracker then
+        # aborts on.
+        nav_smooth_clearance_repair=True,
     )
 
     # Manipulation sub-policy (pick-and-place planner). Only the pick / place

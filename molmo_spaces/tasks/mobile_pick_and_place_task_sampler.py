@@ -70,12 +70,96 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 f"Failed to place mobile robot near pickup object: {pickup_obj.name}"
             )
 
+        # Gate: the collision-only grasp check (inherited from PickTaskSampler)
+        # accepts an object as long as >=1 grasp is non-colliding, but says
+        # nothing about whether the ARM can actually reach any grasp with the
+        # base frozen at this standoff. That optimism is the dominant runtime
+        # failure ("PICK build failed: no reachable base standoff" ->
+        # no_verified_grasp): small/flat objects (e.g. remotes on a surface)
+        # whose only grasps sit outside the arm's base-locked reach envelope.
+        # Re-run the SAME base-locked IK the FSM uses at runtime and reject the
+        # standoff if no grasp's pregrasp+grasp pair is reachable, so a different
+        # (graspable) pickup object is sampled instead.
+        if getattr(sampler_cfg, "manip_reach_gate_enabled", True):
+            if not self._pick_reachable_base_locked(env, pickup_obj, robot_view):
+                raise RobotPlacementError(
+                    "No base-locked-IK-reachable grasp for pickup object "
+                    f"{pickup_obj.name} at the sampled standoff."
+                )
+
         self.used_robot_positions[pickup_obj.name].append(robot_view.base.pose[:3, 3])
         task_cfg.robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
 
         pickup_obj_goal_pose = pose_mat_to_7d(pickup_obj.pose)
         pickup_obj_goal_pose[2] += 0.05
         task_cfg.pickup_obj_goal_pose = pickup_obj_goal_pose.tolist()
+
+    def _arm_move_group_ids_for(self, robot_view) -> list[str]:
+        """Arm move groups (arm only; never the holonomic base or the gripper).
+
+        Mirrors ``_MobileManipPlannerPolicy._arm_move_group_ids`` so the sample-
+        time reachability gate solves IK over exactly the joints the runtime
+        unlocks during a base-frozen grasp.
+        """
+        gripper_mgs = set(robot_view.get_gripper_movegroup_ids())
+        return [
+            mg
+            for mg in robot_view.move_group_ids()
+            if mg not in gripper_mgs and mg != _BASE_MG_ID_SAMPLER
+        ]
+
+    def _pick_reachable_base_locked(self, env: CPUMujocoEnv, pickup_obj, robot_view) -> bool:
+        """Whether at least one non-colliding grasp of ``pickup_obj`` has BOTH
+        its grasp pose and its pregrasp stand-off base-locked IK-reachable from
+        the robot's current (parked) base pose.
+
+        This is the sample-time analogue of the FSM's runtime standoff search:
+        it uses the identical ``kinematics.ik`` call with the base move group
+        locked, so an object that passes here is one the arm can genuinely reach
+        without the base moving -- eliminating the ``no reachable base standoff``
+        -> ``no_verified_grasp`` failures that dominate mobile pick.
+        """
+        asset_uid = self.get_asset_uid_from_object(env, pickup_obj.name)
+        if not asset_uid:
+            return True  # no asset metadata -> can't gate; defer to runtime.
+        try:
+            _gripper, cached_grasps = load_grasps_for_object(asset_uid, 512)
+        except (ValueError, KeyError):
+            return True  # no grasp file -> handled elsewhere; don't reject here.
+        if len(cached_grasps) == 0:
+            return True
+
+        object_pose = pos_quat_to_pose_mat(pickup_obj.position, pickup_obj.quat)
+        grasp_poses_world = object_pose @ cached_grasps
+        try:
+            noncolliding = get_noncolliding_grasp_mask(
+                env.current_model, env.current_data, grasp_poses_world, 64
+            )
+        except (KeyError, ValueError):
+            noncolliding = np.ones(len(grasp_poses_world), dtype=bool)
+        feasible_world = grasp_poses_world[noncolliding]
+        if len(feasible_world) == 0:
+            return False
+
+        kinematics = env.current_robot.kinematics
+        base_pose = robot_view.base.pose
+        arm_mgs = self._arm_move_group_ids_for(robot_view)
+        gripper_mg_id = robot_view.get_gripper_movegroup_ids()[0]
+        q0 = robot_view.get_qpos_dict()
+        pregrasp_z = self.config.policy_config.manip_policy_config.pregrasp_z_offset
+
+        # Cap the number of IK solves so a pathological object can't blow up
+        # sample time; grasps are already cost/collision-filtered upstream.
+        max_checks = int(getattr(self.config.task_sampler_config, "manip_reach_gate_max_grasps", 48))
+        for grasp_world in feasible_world[:max_checks]:
+            if kinematics.ik(gripper_mg_id, grasp_world, arm_mgs, q0, base_pose) is None:
+                continue
+            pregrasp_world = grasp_world.copy()
+            pregrasp_world[:3, 3] -= pregrasp_z * pregrasp_world[:3, 2]
+            if kinematics.ik(gripper_mg_id, pregrasp_world, arm_mgs, q0, base_pose) is None:
+                continue
+            return True
+        return False
 
     def _sample_place_robot_base_pose(self, env: CPUMujocoEnv) -> None:
         """Record the place-phase base nav goal near the receptacle.

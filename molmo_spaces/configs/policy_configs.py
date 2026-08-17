@@ -409,6 +409,20 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # A* planner configuration
     planner_config: AStarPlannerConfig = AStarPlannerConfig()
 
+    # --- Nav-planning footprint radius (stowed-arm clearance) ---------------
+    # The A* planner inflates obstacles by an agent radius. Historically this was
+    # tied to ``task_sampler_config.robot_safety_radius`` (~0.3 m), which only
+    # covers the mobile BASE column -- not the stowed FR3 arm, whose wrist
+    # (``fr3_link6``) projects well beyond 0.3 m even in the compact nav-stow
+    # config. Planning against the base-only radius routes paths through gaps the
+    # real robot-plus-arm does not fit, so the base wedges (arm-vs-wall contact)
+    # and pure-pursuit aborts with "no arc-length progress" partway to the goal
+    # -- the dominant "stops mid-navigation" failure. When set, this dedicated
+    # radius is used for NAV PLANNING ONLY (placement/standoff sampling keep the
+    # base-only radius), giving the stowed arm real wall clearance. ``None``
+    # falls back to ``robot_safety_radius`` (legacy behaviour).
+    nav_planning_agent_radius: float | None = None
+
     # A* planner parameters (for backward compatibility)
     map_path: str | None = None  # Path to occupancy map
     downscale: int = 5  # Downscaling factor for grid

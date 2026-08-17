@@ -58,7 +58,10 @@ class AStarPlannerPolicy(PlannerPolicy):
         self._nav_goal_sampler = None
 
         self.config.policy_config.planner_config.agent_radius = (
-            self.config.task_sampler_config.robot_safety_radius
+            getattr(self.config.policy_config, "nav_planning_agent_radius", None)
+            if getattr(self.config.policy_config, "nav_planning_agent_radius", None)
+            is not None
+            else self.config.task_sampler_config.robot_safety_radius
         )
 
         self.nav_planner = AStarPlanner(

@@ -33,17 +33,38 @@ def make_grid_graph(
     grid,
     dt,
     weight_exp=2,
+    distance_weight=1.0,
+    max_clearance_cells=None,
 ):
+    """Build the 4-connected grid graph A* searches over.
+
+    Edge weight = ``distance_weight`` (a fixed per-step distance cost, since every
+    edge spans one grid cell) plus a clearance penalty. Historically the edge
+    weight was the clearance penalty ALONE (``distance_weight=0``), which makes
+    A* minimise summed clearance cost with no regard for path length -- so in
+    open/cluttered houses it takes long detours that hug high-clearance regions
+    and can consume the entire step budget before the robot reaches the object.
+    Adding the distance term makes the planner minimise length while still
+    preferring clearance to break ties, eliminating those detours.
+
+    ``max_clearance_cells`` optionally clamps the distance transform used for the
+    penalty (in cells) so that the clearance term saturates once a cell is
+    "far enough" from any obstacle -- this prevents wide-open regions from
+    receiving a near-zero penalty that would otherwise justify a big detour just
+    to gain marginal extra clearance.
+    """
+
     def make_direction_edges(s0: tuple[slice, slice], s1: tuple[slice, slice]):
         locs = np.nonzero(grid[s0] * grid[s1])
-        ws = np.maximum(cost[s0], cost[s1])[locs]
+        ws = (distance_weight + np.maximum(cost[s0], cost[s1]))[locs]
         labs0 = labels[s0][locs]
         labs1 = labels[s1][locs]
         return map(
             lambda labsw: (tuple(labsw[0]), tuple(labsw[1]), labsw[2]), zip(labs0, labs1, ws)
         )
 
-    cost = cost_function(dt, weight_exp)
+    dt_for_cost = dt if max_clearance_cells is None else np.minimum(dt, max_clearance_cells)
+    cost = cost_function(dt_for_cost, weight_exp)
     labels = np.stack(
         np.meshgrid(range(grid.shape[0]), range(grid.shape[1]), indexing="ij"), axis=2
     )
@@ -122,8 +143,22 @@ def make_discrete_path(
     weight_exp,
     grid_spacing,
     max_distance_to_obstacle,
+    distance_weight=1.0,
 ):
-    locs = nx.astar_path(graph, (source_row, source_col), (target_row, target_col))
+    # Manhattan heuristic scaled by the per-step distance cost. With the edge
+    # weights now including a ``distance_weight`` term this heuristic is
+    # admissible (never over-estimates: the clearance penalty is >= 0, so the
+    # true cost is >= distance_weight * grid steps) and makes A* goal-directed
+    # instead of degenerating to Dijkstra over the clearance field.
+    def heuristic(a, b):
+        return distance_weight * (abs(a[0] - b[0]) + abs(a[1] - b[1]))
+
+    locs = nx.astar_path(
+        graph,
+        (source_row, source_col),
+        (target_row, target_col),
+        heuristic=heuristic,
+    )
     waypoints, path_cost = simplify_path_greedy(
         locs, distance_transform, weight_exp, grid_spacing, max_distance_to_obstacle
     )
