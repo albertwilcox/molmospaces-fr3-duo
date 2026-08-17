@@ -295,7 +295,7 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # the higher-fidelity probe does not regress otherwise-succeeding houses,
     # then flip to True to skip guaranteed-unreachable place targets at sample
     # time (avoiding a wasted full-length PLACE-fail rollout).
-    place_reject_on_unreachable: bool = False
+    place_reject_on_unreachable: bool = True
 
     # If True, exclude candidate place surfaces that belong to an *enclosed*
     # container appliance (fridge/oven/microwave/dishwasher/cabinet/drawer etc.)
