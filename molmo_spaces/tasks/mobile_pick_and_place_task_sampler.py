@@ -369,11 +369,19 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             ):
                 n_enclosed_skipped += 1
                 continue
-            scored.append((dist, int(geom_id)))
+            scored.append((dist, area, int(geom_id)))
 
-        # Prefer farther surfaces (genuine place-nav segment) but keep all
-        # candidates so placement can fall through to a nearer elevated surface.
-        scored.sort(key=lambda t: -t[0])
+        # Prefer surfaces that are both reasonably far (genuine place-nav segment)
+        # AND large enough to actually stand a receptacle on and park the base
+        # beside. Sorting purely farthest-first picks tiny distant ledges
+        # (~0.1 m^2) that are unreachable/unplaceable and waste the whole rollout
+        # (``place_ik_infeasible``). We instead score ``dist + area_weight*area``
+        # so a large nearby table can outrank a tiny far shelf, while distance
+        # still dominates among comparably sized surfaces. Candidates are kept
+        # (not dropped) so placement can still fall through to any of them.
+        area_w = float(getattr(sampler_cfg, "elevated_surface_area_score_weight", 2.0))
+        scored.sort(key=lambda t: -(t[0] + area_w * t[1]))
+        scored = [(d, g) for (d, _a, g) in scored]
         room_note = f" (same-room={pickup_room})" if pickup_room is not None else ""
         enclosed_note = (
             f", {n_enclosed_skipped} enclosed-container surface(s) skipped"

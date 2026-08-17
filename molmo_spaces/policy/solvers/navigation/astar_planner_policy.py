@@ -434,8 +434,24 @@ class AStarPlannerPolicy(PlannerPolicy):
 
         return np.vstack([waypoints[0:1]] + segments)
 
+    def _nav_goal_override_active(self) -> bool:
+        """True while the current nav phase is driving to a feasibility-verified
+        standoff (nav goal override). In that case the object-centre truncation in
+        ``stop_plan`` (radius ``path_min_dist_to_target_center``) must be skipped:
+        it cuts the path where it first enters the object circle -- often on a
+        DIFFERENT bearing than the standoff -- leaving the base parked short of
+        the standoff on the wrong side. That divergence makes the PICK/PLACE build
+        fail at the navigated pose and the standoff snap cross a wall (0
+        candidates). Keeping the full path lets the base reach the verified
+        standoff itself."""
+        return (
+            getattr(self.task, "nav_goal_override", None) is not None
+            and getattr(self, "_nav_goal_override_tried", False)
+        )
+
     def build_policy_plan(self, world_waypoints):
-        world_waypoints = self.stop_plan(world_waypoints)
+        if not self._nav_goal_override_active():
+            world_waypoints = self.stop_plan(world_waypoints)
 
         # the first difference computes theta from first to second waypoint
         pos_deltas = world_waypoints[1:] - world_waypoints[:-1]
@@ -677,7 +693,8 @@ class AStarPlannerPolicy(PlannerPolicy):
 
 class AStarSmoothPlannerPolicy(AStarPlannerPolicy):
     def build_policy_plan(self, world_waypoints):
-        world_waypoints = self.stop_plan(world_waypoints)
+        if not self._nav_goal_override_active():
+            world_waypoints = self.stop_plan(world_waypoints)
 
         plan_length = sum(
             np.linalg.norm(world_waypoints[it] - world_waypoints[it - 1])

@@ -80,7 +80,13 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
 
     # Standoff radius range for the *feasibility* placement near the pickup
     # object (representative of where navigation parks the base for the grasp).
-    manip_standoff_radius_range: tuple[float, float] = (0.35, 0.7)
+    # Upper bound kept well inside the arm's *reliable-tracking* envelope
+    # (< the raw IK reach limit): a base parked ~0.7 m out yields grasps at
+    # ~0.72 m reach that pass the IK gate but fail at runtime -- the interpolated
+    # grasp move can't converge to the pose near the reach boundary, so the
+    # gripper closes on empty space (``no_verified_grasp``, the dominant PICK
+    # failure). Parking <=0.55 m out keeps the grasp comfortably reachable.
+    manip_standoff_radius_range: tuple[float, float] = (0.35, 0.55)
 
     # --- Base-locked grasp-reachability gate (sample time) ------------------
     # The inherited grasp check only verifies a grasp is non-colliding, not that
@@ -124,8 +130,16 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # floor to count as "elevated" (excludes rugs / floor-level geoms).
     elevated_min_height_m: float = 0.30
     # A candidate place surface must have at least this much flat top area (m^2)
-    # so the receptacle actually fits on it.
-    elevated_min_surface_area_m2: float = 0.06
+    # so the receptacle actually fits on it AND the base can find a reachable
+    # place standoff beside it. Tiny ledges (~0.1 m^2) at the far end of a room
+    # are the dominant ``place_ik_infeasible`` source (unreachable / no valid
+    # standoff), so require a more substantial surface.
+    elevated_min_surface_area_m2: float = 0.20
+    # Weight on top-surface area (m^2) in the far-elevated-surface score
+    # ``dist + weight*area``. >0 biases selection toward larger surfaces (more
+    # reachable / placeable) while distance still exercises the place-nav
+    # segment. 0 reproduces the prior pure farthest-first behavior.
+    elevated_surface_area_score_weight: float = 2.0
     # Distance band (m) from the pickup object to stand the place receptacle.
     # Widened from a tight [2,5] band so far *elevated* surfaces (which are
     # sparser than the floor) are found more often before falling back to the
@@ -298,7 +312,7 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # restoring the original placement. Re-enable once the probe replicates the
     # runtime's held-object place-standoff search (higher fidelity), at which
     # point re-sampling can make the place target reachable by construction.
-    place_receptacle_resample_tries: int = 0
+    place_receptacle_resample_tries: int = 8
 
     # --- Overhead clearance for pickup candidates ------------------------- #
     # Reject pickup candidates that have OTHER scene geometry directly above
