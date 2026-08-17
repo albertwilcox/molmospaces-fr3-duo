@@ -1632,13 +1632,36 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         current = self.task.env.current_robot.robot_view.base.pose.copy()
         try:
             self._manip_policy.reset(reset_retries=True)
-            self._locked_base_pose = current
-            self._diag["place_ik_feasible"] = True
+            # The navigated pose is IK-feasible for the place waypoints, but an
+            # IK solution near the arm's reach limit is one the position servo
+            # cannot physically track within the move's settle window -- the
+            # "place" descent then fails the TCP-error gate ("Moving to place ->
+            # Failure detected") and the object is never released (observed:
+            # place_started_but_no_release, object left 0.3-0.8 m short). So we
+            # don't accept the navigated pose on mere IK-feasibility: if the
+            # place waypoints' reach margin is marginal, prefer the reach-margin
+            # standoff search (carrying the object) for a base from which the
+            # place is comfortably reachable, exactly as PICK does.
+            margin_ok = True
+            if getattr(self.policy_config, "place_reach_margin_gate_enabled", True):
+                targets = list(self._manip_policy.target_poses.values())
+                margin = self._targets_reach_margin(targets) if targets else 0.0
+                min_margin = float(
+                    getattr(self.policy_config, "place_reach_margin_min", 0.05)
+                )
+                margin_ok = margin >= min_margin
+            if margin_ok:
+                self._locked_base_pose = current
+                self._diag["place_ik_feasible"] = True
+                log.info(
+                    "[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE "
+                    f"(built at navigated pose ({current[0, 3]:.2f}, {current[1, 3]:.2f}))."
+                )
+                return True
             log.info(
-                "[MOBILE PNP FSM] NAV_TO_RECEPTACLE done → phase PLACE "
-                f"(built at navigated pose ({current[0, 3]:.2f}, {current[1, 3]:.2f}))."
+                "[MOBILE PNP FSM] PLACE reachable at navigated pose but reach "
+                "margin is marginal; searching a higher-margin standoff."
             )
-            return True
         except ValueError:
             log.info(
                 "[MOBILE PNP FSM] PLACE not feasible at navigated pose; "
@@ -1650,6 +1673,21 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             self.config.task_config.place_receptacle_name,
             getattr(self.config.task_config, "place_robot_base_pose", None),
         )
+        if not ok:
+            # The margin-driven search found nothing better; fall back to the
+            # navigated pose if it was at least IK-feasible (never regress below
+            # the accept-on-feasible baseline just because the margin was low).
+            try:
+                self._manip_policy.reset(reset_retries=True)
+                self._locked_base_pose = current
+                self._diag["place_ik_feasible"] = True
+                log.info(
+                    "[MOBILE PNP FSM] PLACE standoff search found nothing better; "
+                    "falling back to the IK-feasible navigated pose."
+                )
+                return True
+            except ValueError:
+                pass
         self._diag["place_ik_feasible"] = bool(ok)
         if not ok:
             self._set_place_cause("place_ik_infeasible_all_standoffs")

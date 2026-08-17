@@ -423,6 +423,15 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # falls back to ``robot_safety_radius`` (legacy behaviour).
     nav_planning_agent_radius: float | None = None
 
+    # Fallback nav-planning agent radius. When the primary planner (inflated to
+    # ``nav_planning_agent_radius`` to clear the stowed arm) finds NO path -- the
+    # inflation can disconnect the free-space graph in a tight house so every
+    # goal is unreachable from a fixed start -- planning retries once with this
+    # thinner radius, recovering the pre-inflation connectivity. ``None`` falls
+    # back to ``robot_safety_radius``. Only used when strictly smaller than the
+    # primary radius (otherwise no fallback is built).
+    nav_planning_fallback_agent_radius: float | None = None
+
     # A* planner parameters (for backward compatibility)
     map_path: str | None = None  # Path to occupancy map
     downscale: int = 5  # Downscaling factor for grid

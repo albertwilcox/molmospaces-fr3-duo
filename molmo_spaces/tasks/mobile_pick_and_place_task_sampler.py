@@ -460,6 +460,19 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             # Never an enclosed container interior (fridge/cabinet ...).
             if self._surface_geom_is_enclosed_container_body(model, om, int(body_id)):
                 continue
+            # Furniture-type filter: skip poor drop targets (chairs/stools ...)
+            # and, when allowlist-only, require a known flat-surface type. This
+            # avoids wasting the (slow) standoff probe on furniture the base can
+            # never stand off from -- the dominant cause of the low realized
+            # furniture-placement rate.
+            lname = name.lower()
+            deny = tuple(getattr(sampler_cfg, "broad_furniture_deny_substrings", ()))
+            if any(sub in lname for sub in deny):
+                continue
+            if bool(getattr(sampler_cfg, "broad_furniture_type_allowlist_only", False)):
+                allow = tuple(getattr(sampler_cfg, "broad_furniture_allow_substrings", ()))
+                if allow and not any(sub in lname for sub in allow):
+                    continue
             # Highest flat descendant geom = the top surface.
             try:
                 geom_ids = descendant_geoms(model, int(body_id), True)
@@ -984,6 +997,21 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             name = om.get_object_name(root_id)
             if not name or om.is_excluded(name) or om.is_structural(name):
                 continue
+            if broad:
+                # Same furniture-type filter as ``_find_furniture_top_geoms`` so
+                # chairs/stools surfaced via the supported-object search are also
+                # excluded (they pass the half-extent gate but the base cannot
+                # stand off from them).
+                lname = name.lower()
+                deny = tuple(getattr(sampler_cfg, "broad_furniture_deny_substrings", ()))
+                if any(sub in lname for sub in deny):
+                    continue
+                if bool(getattr(sampler_cfg, "broad_furniture_type_allowlist_only", False)):
+                    allow = tuple(
+                        getattr(sampler_cfg, "broad_furniture_allow_substrings", ())
+                    )
+                    if allow and not any(sub in lname for sub in allow):
+                        continue
             try:
                 body_center, dims = body_aabb(model, env.current_data, root_id, visual_only=True)
             except Exception:
@@ -1138,6 +1166,13 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         if len(grasp_poses_world) == 0:
             return (False, None, True)
         max_grasps = int(getattr(sampler_cfg, "place_reachable_max_grasps", 8))
+        if broad:
+            # Broad furniture probes many base gaps/anchors; cap grasps tighter to
+            # keep the IK-call count (and sampling time) bounded.
+            max_grasps = min(
+                max_grasps,
+                int(getattr(sampler_cfg, "broad_place_reachable_max_grasps", 4)),
+            )
         grasp_poses_world = grasp_poses_world[:max_grasps]
 
         # Placement-pose geometry (planner formula, see
@@ -1166,6 +1201,10 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         # ``place_edge_margin_m`` / ``place_search_grid_n``.
         grid_margin = float(getattr(sampler_cfg, "place_reachable_edge_margin_m", 0.03))
         grid_n = int(getattr(sampler_cfg, "place_reachable_search_grid_n", 5))
+        if broad:
+            grid_n = min(
+                grid_n, int(getattr(sampler_cfg, "broad_place_reachable_grid_n", 3))
+            )
         half_x = max(float(rec_size[0] / 2.0 - pick_size[0] / 2.0 - grid_margin), 0.0)
         half_y = max(float(rec_size[1] / 2.0 - pick_size[1] / 2.0 - grid_margin), 0.0)
         grid_xs = np.linspace(-half_x, half_x, grid_n) + float(rec_center[0])
@@ -1292,6 +1331,24 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         else:
             anchors = [rec_xy]
             broad_specs = [(rec_xy, None)]
+        # Broad furniture: sweep the base along the outward normal at a set of
+        # REACH-APPROPRIATE gaps (measured beyond the edge anchor), plus a small
+        # lateral jitter, instead of the previous ``anchor + outward*r*2`` which
+        # placed the base up to 1.4m from the anchor (well beyond arm reach) and
+        # tried only 2 poses per edge. The nominal gap comes from
+        # ``broad_place_base_gap_m``; we probe a few gaps around it so the base
+        # parks close enough to reach the top point while staying outside the
+        # footprint / clear of collisions.
+        base_gap_nom = float(getattr(sampler_cfg, "broad_place_base_gap_m", 0.55))
+        # Gaps span from the nominal edge gap outward: larger gaps let the stowed
+        # arm (fr3_link0 projects toward the surface) clear the furniture body,
+        # while the runtime still places at the nearest reachable top point, so a
+        # near-edge point on a large top stays reachable even from a larger gap.
+        broad_gaps = [
+            max(base_gap_nom + d, 0.12)
+            for d in (-0.40, -0.20, 0.0)
+        ]
+        broad_lat = [0.0]
         try:
             for anchor_xy, fixed_base_xy in broad_specs:
                 if found_pose is not None:
@@ -1299,17 +1356,36 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 for r in radii:
                     for k in range(n_ang):
                         if broad and fixed_base_xy is not None:
-                            # Broad furniture: base is fixed OUTSIDE the footprint
-                            # beyond the chosen edge; vary only the standoff radius
-                            # (offset outward). ``n_ang`` collapses to a single
-                            # facing-inward orientation.
-                            if k > 0:
+                            # Broad furniture: base parks OUTSIDE the footprint
+                            # beyond the chosen edge, facing inward. ``k`` indexes
+                            # a grid over outward gap (``broad_gaps``) and lateral
+                            # offset (``broad_lat``) so the base lands at a
+                            # reachable, collision-free spot near the edge. ``r``
+                            # is unused here (the gap replaces it); the outer
+                            # radius loop is short-circuited below.
+                            outward_vec = fixed_base_xy - anchor_xy
+                            nrm = float(np.linalg.norm(outward_vec)) or 1.0
+                            outward = outward_vec / nrm
+                            lateral = np.array([-outward[1], outward[0]])
+                            if k >= len(broad_gaps) * len(broad_lat):
                                 continue
-                            outward = fixed_base_xy - anchor_xy
-                            nrm = float(np.linalg.norm(outward)) or 1.0
-                            outward = outward / nrm
-                            bx = float(anchor_xy[0] + outward[0] * r * 2.0)
-                            by = float(anchor_xy[1] + outward[1] * r * 2.0)
+                            gi = k % len(broad_gaps)
+                            li = k // len(broad_gaps)
+                            gap = broad_gaps[gi]
+                            lat = broad_lat[li]
+                            # ``fixed_base_xy`` sits at (true edge + base_gap_nom)
+                            # along ``outward`` from the inset anchor, so the anchor
+                            # -> edge distance is ``nrm - base_gap_nom``. Place the
+                            # base at (edge + gap) => anchor + (edge_dist + gap) so
+                            # the base is genuinely OUTSIDE the footprint. The prior
+                            # ``anchor + outward*gap`` measured the gap from the
+                            # inset anchor and left the base INSIDE the footprint
+                            # for large tops -- the dominant "base vs furniture"
+                            # collision that reverted almost every redirect.
+                            edge_dist = max(nrm - base_gap_nom, 0.0)
+                            reach_out = edge_dist + gap
+                            bx = float(anchor_xy[0] + outward[0] * reach_out + lateral[0] * lat)
+                            by = float(anchor_xy[1] + outward[1] * reach_out + lateral[1] * lat)
                         else:
                             a = 2.0 * np.pi * k / max(n_ang, 1)
                             bx = float(anchor_xy[0] + r * np.cos(a))
@@ -1365,6 +1441,10 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                         if found_pose is not None:
                             break
                     if found_pose is not None:
+                        break
+                    if broad and fixed_base_xy is not None:
+                        # Gap/lateral grid already swept via ``k``; the outer
+                        # radius loop would only re-probe identical poses.
                         break
                 if found_pose is not None:
                     break

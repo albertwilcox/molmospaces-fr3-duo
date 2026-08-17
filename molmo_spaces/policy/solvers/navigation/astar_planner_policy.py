@@ -68,6 +68,25 @@ class AStarPlannerPolicy(PlannerPolicy):
             self.config.policy_config.planner_config, self.task.env.current_model_path
         )
 
+        # Fallback planner at a SMALLER agent radius. The primary nav radius
+        # (``nav_planning_agent_radius``, e.g. 0.40) is inflated to clear the
+        # stowed arm from walls (fixing the mid-nav wedge), but in tight houses
+        # that inflation can DISCONNECT the free-space graph so no path exists to
+        # a valid goal ("[A* PLAN ATTEMPT FAIL] no valid path found" for every
+        # goal from a fixed start). When the primary planner returns no path we
+        # retry with this thinner planner (down to ``robot_safety_radius``), which
+        # recovers the pre-inflation connectivity. Built lazily on first use.
+        self._nav_planner_fallback: AStarPlanner | None = None
+        fb_radius = getattr(
+            self.config.policy_config, "nav_planning_fallback_agent_radius", None
+        )
+        if fb_radius is None:
+            fb_radius = float(self.config.task_sampler_config.robot_safety_radius)
+        primary_radius = float(self.config.policy_config.planner_config.agent_radius)
+        self._nav_fallback_radius = (
+            float(fb_radius) if float(fb_radius) < primary_radius else None
+        )
+
         self._current_waypoint = 0
         self._reached_waypoints = 0
         self._nav_plan = None
@@ -83,6 +102,26 @@ class AStarPlannerPolicy(PlannerPolicy):
 
     def planners(self):
         return self.nav_planner
+
+    def _fallback_motion_plan(self, target_pos, robot_view):
+        """Plan with a thinner agent radius when the primary (inflated) planner
+        finds no path. Returns world waypoints or None. Lazily builds a second
+        planner at ``self._nav_fallback_radius`` so the primary planner's cached
+        map/graph are untouched."""
+        if self._nav_fallback_radius is None:
+            return None
+        if self._nav_planner_fallback is None:
+            import copy as _copy
+
+            fb_cfg = _copy.copy(self.config.policy_config.planner_config)
+            fb_cfg.agent_radius = self._nav_fallback_radius
+            self._nav_planner_fallback = AStarPlanner(
+                fb_cfg, self.task.env.current_model_path
+            )
+        try:
+            return self._nav_planner_fallback.motion_plan(target_pos, robot_view)
+        except ValueError:
+            return None
 
     def reset(self):
         self._current_waypoint = 0
@@ -456,6 +495,21 @@ class AStarPlannerPolicy(PlannerPolicy):
                             if "starting position" in str(e):
                                 self._nav_plan = None
                                 return self._nav_plan
+
+                        if world_waypoints is None:
+                            # Primary (inflated-radius) planner found no path.
+                            # Retry with the thinner fallback planner before
+                            # giving up: the inflation may have disconnected the
+                            # free-space graph in a tight house.
+                            world_waypoints = self._fallback_motion_plan(
+                                self.target_pos_quat[0], self.robot_view
+                            )
+                            if world_waypoints is not None:
+                                log.info(
+                                    "[A* PLAN] primary radius found no path; "
+                                    f"recovered via fallback radius "
+                                    f"{self._nav_fallback_radius:.2f}m."
+                                )
 
                         if world_waypoints is None:
                             robot_pos = self.robot_view.base.pose[:3, 3]

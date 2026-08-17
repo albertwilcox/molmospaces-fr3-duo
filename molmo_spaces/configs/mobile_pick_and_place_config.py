@@ -195,6 +195,31 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # furniture but are not sensible drop surfaces).
     broad_furniture_min_half_extent_m: float = 0.20
 
+    # Furniture *type* filter for broad place targets. Even with a large flat
+    # top, some furniture makes a poor drop target because the base cannot stand
+    # off from it (chairs/stools are small seats hemmed by table legs; a dining
+    # chair's 0.5x0.5m seat passes the half-extent gate yet is unreachable). We
+    # therefore (a) DENY any furniture whose name contains a deny substring and
+    # (b) when ``broad_furniture_type_allowlist_only`` is True, additionally
+    # require the name to contain an allow substring. Matching is case-insensitive
+    # substring on the body name. Empty deny list + allowlist_only=False restores
+    # the prior (accept-any-flat-top) behaviour.
+    broad_furniture_deny_substrings: tuple[str, ...] = (
+        "chair", "stool", "bench", "toilet", "sink", "lamp", "rug", "mat",
+    )
+    broad_furniture_allow_substrings: tuple[str, ...] = (
+        "table", "counter", "desk", "dresser", "nightstand", "stand",
+        "cabinet", "shelf", "bed", "sofa", "couch", "ottoman", "sideboard",
+        "credenza", "bookcase", "console",
+    )
+    broad_furniture_type_allowlist_only: bool = True
+
+    # Broad-furniture probe cost caps (the broad standoff probe sweeps several
+    # base gaps/anchors, so its IK-call count is bounded tighter than the normal
+    # centre-only probe to keep sampling time reasonable).
+    broad_place_reachable_max_grasps: int = 4
+    broad_place_reachable_grid_n: int = 3
+
     # --- Sample-time place-reachability verification -------------------------
     # The pickup loop already rejects objects with no feasible grasp, but the
     # place receptacle was previously accepted on collision-free placement alone.
@@ -318,6 +343,12 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
         # "wedged mid-navigation / no arc-length progress" abort). 0.30 covers
         # only the base column; 0.40 covers the compact nav-stow arm envelope.
         nav_planning_agent_radius=0.40,
+        # If 0.40 inflation disconnects the free-space graph (tight house -> no
+        # path to any valid goal), retry planning at the base-column radius so
+        # navigation still finds a route (the pure-pursuit tracker + clearance
+        # repair then handle the tighter margin). Prevents the "[A* PLAN FAIL] no
+        # valid trajectory found" -> no_verified_grasp regression seen in house_4.
+        nav_planning_fallback_agent_radius=0.30,
         # Stop the B-spline smoother from cutting corners into walls, which
         # produces the short execution stalls that the pure-pursuit tracker then
         # aborts on.
@@ -379,6 +410,21 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # Reach-margin penalty per metre the standoff sits from the parked base, so
     # a closer standoff wins unless a farther one is meaningfully more interior.
     manip_reach_proximity_penalty_per_m: float = 0.15
+
+    # --- PLACE reach-margin gate --------------------------------------------
+    # The navigated place pose can be IK-feasible yet sit so near the arm's reach
+    # limit that the position servo cannot physically track the final "place"
+    # descent within its settle window -- the TCP-error gate then aborts
+    # ("Moving to place -> Failure detected") and the object is never released
+    # (place_started_but_no_release, object left 0.3-0.8 m short). When enabled,
+    # accept the navigated pose only if the place waypoints' reach margin clears
+    # ``place_reach_margin_min``; otherwise run the carry-aware standoff search
+    # for a higher-margin base (falling back to the IK-feasible navigated pose if
+    # nothing better is found, so we never regress below accept-on-feasible).
+    place_reach_margin_gate_enabled: bool = True
+    # Conservative threshold: only re-search when the margin is genuinely low, so
+    # the carried-object teleport search (small jostle risk) fires rarely.
+    place_reach_margin_min: float = 0.04
 
     # --- Grasp verification + regrasp ---------------------------------------
     # The grasp primitive can report "done" while the gripper closed on empty
