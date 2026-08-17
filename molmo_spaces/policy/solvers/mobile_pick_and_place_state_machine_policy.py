@@ -73,6 +73,12 @@ _BASE_MG_ID = "base"
 # resulting kick (small per-step re-pin drift corrections stay below this).
 _LARGE_BASE_SNAP_M = 0.15
 
+# Gripper-to-receptacle distance (m) above which "transport reached" is treated
+# as spurious in the place-diag taxonomy: at a genuine place standoff the gripper
+# is within roughly arm-reach + standoff of the receptacle, so a larger residual
+# means the base actually stalled mid-transport.
+_TRANSPORT_REACHED_MAX_M = 1.5
+
 
 class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
     """Pick-and-place planner adapted for a mobile base.
@@ -1073,6 +1079,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             return "no_verified_grasp"
         if not d["reached_nav_to_receptacle"]:
             return "grasp_but_no_transport"
+        # Sanity cross-check: if transport is flagged reached but the gripper
+        # ended far from the receptacle, the base actually stalled mid-transport
+        # (a stale/over-eager flag or an aborted approach). Attribute it to the
+        # transport, not to a downstream place cause, so the label matches the
+        # video instead of implying the robot was at the receptacle.
+        grip_to_recept = d.get("final_gripper_to_receptacle_m")
+        if grip_to_recept is not None and grip_to_recept > _TRANSPORT_REACHED_MAX_M:
+            return "grasp_but_no_transport"
         if d["place_ik_feasible"] is False:
             return "place_ik_infeasible"
         if not d["place_phase_started"]:
@@ -1718,6 +1732,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     self._begin_base_approach(APPROACH_PICK, parked_pose)
                 else:
                     parked_pose = self.task.env.current_robot.robot_view.base.pose.copy()
+                    # The transport navigation segment has actually completed
+                    # (nav policy signalled done): the base is parked at the
+                    # receptacle standoff. Mark transport reached HERE -- not when
+                    # NAV_TO_RECEPTACLE was merely *entered* -- so an episode that
+                    # stalls mid-transport (e.g. wedged replanning far from the
+                    # receptacle) is correctly attributed to "grasp_but_no_transport"
+                    # rather than a spurious downstream place cause.
+                    self._diag["reached_nav_to_receptacle"] = True
                     if not self._enter_place():
                         if not self._retry_segment(PLACE):
                             self._phase = DONE
@@ -1861,7 +1883,6 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     self._nav_step_in_segment = 0
                     self._nav_arm_hold = None
                     self._phase = NAV_TO_RECEPTACLE
-                    self._diag["reached_nav_to_receptacle"] = True
                     log.info("[MOBILE PNP FSM] PICK done → phase NAV_TO_RECEPTACLE")
                 else:
                     self._phase = DONE
