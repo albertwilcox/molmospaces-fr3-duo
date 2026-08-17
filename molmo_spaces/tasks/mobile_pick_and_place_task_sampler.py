@@ -309,6 +309,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
 
         floor_z = self._floor_top_z(env)
         min_top_z = floor_z + float(sampler_cfg.elevated_min_height_m)
+        max_top_z = floor_z + float(getattr(sampler_cfg, "elevated_max_height_m", 0.80))
         min_area = float(sampler_cfg.elevated_min_surface_area_m2)
         far_max = float(sampler_cfg.far_max_object_to_receptacle_dist)
         # When restricting the place to the pickup object's room, relax the lower
@@ -348,7 +349,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 continue
             top_z = float(center[2] + dims[2] / 2.0)
             area = float(dims[0] * dims[1])
-            if top_z < min_top_z or area < min_area:
+            if top_z < min_top_z or top_z > max_top_z or area < min_area:
                 continue
             dist = float(np.linalg.norm(np.asarray(center[:2]) - pickup_xy))
             if not (far_min <= dist <= far_max):
@@ -1290,13 +1291,29 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         grid_reject_enabled = bool(
             getattr(sampler_cfg, "place_reject_on_unreachable", False)
         )
+        # Grid-feasible nav goal recording for NORMAL receptacles: the spawned
+        # receptacle is stood on an elevated surface, and its CENTRE place pose is
+        # frequently out of the arm's base-locked reach from every collision-free
+        # ring standoff -- so a centre-only probe records NO nav goal (observed:
+        # 0 verified place standoffs across all houses), PLACE nav then has no
+        # override, parks ~1.3 m from the receptacle, and the place IK fails
+        # (place_started_but_no_release / grasp_but_no_transport). The runtime
+        # itself places at the nearest reachable top-footprint point
+        # (``_nearest_reachable_place_pose``), so mirror that here: enable the
+        # off-centre grid probe and RECORD a grid-feasible standoff as the nav
+        # goal, driving the base to a pose the runtime can actually place from.
+        # ``kinematics.ik`` is deterministic (no episode-RNG draw), so the extra
+        # IK calls do not perturb downstream sampling.
+        grid_record_normal = bool(
+            getattr(sampler_cfg, "place_probe_grid_record_nav_goal", True)
+        )
         # Broad furniture mode: the runtime places at the nearest reachable point
         # on a (potentially large) furniture top, so a centre-only probe wrongly
         # rejects big surfaces whose centre is out of arm reach. Enable the grid
         # probe AND allow a grid-feasible standoff to be RECORDED as the nav goal
         # (so navigation parks where an off-centre top point is reachable). This
         # is what makes bare beds / large tables usable as place targets.
-        grid_enabled = grid_reject_enabled or broad
+        grid_enabled = grid_reject_enabled or broad or grid_record_normal
         reachable_pose: np.ndarray | None = None
         # Standoff anchor points: the ring of base standoffs is built around each
         # anchor at radius ``manip_standoff_radius_range`` facing the anchor. For
@@ -1443,7 +1460,14 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                                     preplace, place = place_poses_for(grasp_world, place_xy)
                                     if ik_ok(base_pose, place) and ik_ok(base_pose, preplace):
                                         reachable_pose = base_pose.copy()
-                                        if broad and found_pose is None:
+                                        # Record the grid-feasible standoff as the
+                                        # nav goal for broad furniture AND normal
+                                        # receptacles (grid_record_normal): the
+                                        # runtime places at this nearest reachable
+                                        # top point, so parking here makes PLACE
+                                        # feasible instead of leaving nav to a far
+                                        # object-centre park.
+                                        if (broad or grid_record_normal) and found_pose is None:
                                             found_pose = base_pose.copy()
                                         break
                         if found_pose is not None:

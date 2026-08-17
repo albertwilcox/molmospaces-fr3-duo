@@ -129,6 +129,14 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # A candidate place surface must have its top at least this far above the
     # floor to count as "elevated" (excludes rugs / floor-level geoms).
     elevated_min_height_m: float = 0.30
+    # Max height (m) of a candidate spawned-receptacle surface's TOP above the
+    # floor. Surfaces above this are excluded: placing a carried object on a
+    # high surface requires the arm to reach up near its vertical limit, and the
+    # base-locked place IK fails for every standoff (observed: 0 verified place
+    # standoffs, receptacle tops at ~0.88 m), wasting the whole rollout
+    # (place_started_but_no_release / grasp_but_no_transport). ~0.80 m keeps the
+    # place within the arm's reliable vertical envelope.
+    elevated_max_height_m: float = 0.80
     # A candidate place surface must have at least this much flat top area (m^2)
     # so the receptacle actually fits on it AND the base can find a reachable
     # place standoff beside it. Tiny ledges (~0.1 m^2) at the far end of a room
@@ -248,6 +256,14 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # the dominant place failure mode. Fail-open: if grasps/metadata are missing
     # the receptacle is kept (never blocks on incomplete data).
     verify_place_reachable: bool = True
+    # Record a grid-feasible (off-centre) standoff as the PLACE nav goal for
+    # NORMAL receptacles (not just broad furniture). The spawned receptacle's
+    # CENTRE place pose is often out of base-locked arm reach from every
+    # collision-free ring standoff, so a centre-only probe records no nav goal;
+    # PLACE nav then parks far (object-centre fallback) and place IK fails. The
+    # runtime places at the nearest reachable top-footprint point, so recording a
+    # grid-feasible standoff drives the base where the runtime can actually place.
+    place_probe_grid_record_nav_goal: bool = True
     # Cap on candidate carried-grasp orientations probed per receptacle.
     place_reachable_max_grasps: int = 8
     # Number of ring standoff angles probed per radius (radii reuse the pickup
