@@ -349,6 +349,19 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # geom must cover to count as blocking (filters slivers / grazing contacts).
     overhead_clearance_min_overlap_frac: float = 0.10
 
+    # Minimum smallest-horizontal-AABB-extent (m) a pickup candidate must have to
+    # remain in the pool. Objects thinner than this across the fingers' close
+    # axis (pens, pencils, forks, butter knives, credit cards, thin phones and
+    # remotes) drive the dominant empty-grasp "Object is not in grasp" failures:
+    # the gripper fingers meet before contacting the thin geometry even at low
+    # approach angle and close reach. The filter never exhausts a house (falls
+    # back to keeping thin candidates if they are all that remain). Default 0.0
+    # DISABLES the filter, preserving the exact prior candidate pool; set to
+    # ~0.015 to exclude cutlery/stationery while keeping cups/mugs/bottles/
+    # potatoes/bowls (whose min extent is well above 1.5cm).
+    min_graspable_thickness_m: float = 0.02
+
+
 
 class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     """Config for the mobile pick-and-place state-machine expert.

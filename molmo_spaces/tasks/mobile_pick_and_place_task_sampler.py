@@ -751,30 +751,74 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                 dropped_enclosed += 1
                 continue
             after_enclosed.append(obj)
-        kept = []
+        after_overhead = []
         dropped_overhead = 0
         for obj in after_enclosed:
             if self._has_overhead_obstruction(env, obj.name):
                 dropped_overhead += 1
                 continue
-            kept.append(obj)
+            after_overhead.append(obj)
         # Never exhaust the pool: if the overhead filter removed every remaining
         # candidate, fall back to the clearance-agnostic set so the house stays
         # usable (an obstructed grasp is still better than no task).
-        if not kept and after_enclosed:
+        if not after_overhead and after_enclosed:
             log.info(
                 "[MOBILE PNP] Overhead-clearance filter would empty the pickup "
                 f"pool ({dropped_overhead} obstructed); keeping obstructed candidates."
             )
-            kept = after_enclosed
+            after_overhead = after_enclosed
             dropped_overhead = 0
-        if dropped_enclosed or dropped_overhead:
+        kept = []
+        dropped_thin = 0
+        for obj in after_overhead:
+            if self._is_too_thin_to_grasp(env, obj.name):
+                dropped_thin += 1
+                continue
+            kept.append(obj)
+        # Same never-exhaust guard: thin objects (pens, cards, cutlery) drive the
+        # empty-grasp "Object is not in grasp" failures, but if every remaining
+        # candidate is thin we keep them rather than fail to sample the house.
+        if not kept and after_overhead:
+            log.info(
+                "[MOBILE PNP] Thin-object filter would empty the pickup pool "
+                f"({dropped_thin} thin); keeping thin candidates."
+            )
+            kept = after_overhead
+            dropped_thin = 0
+        if dropped_enclosed or dropped_overhead or dropped_thin:
             log.info(
                 f"[MOBILE PNP] Excluded {dropped_enclosed} enclosed + "
-                f"{dropped_overhead} overhead-obstructed pickup candidate(s); "
-                f"{len(kept)} remain."
+                f"{dropped_overhead} overhead-obstructed + {dropped_thin} thin "
+                f"pickup candidate(s); {len(kept)} remain."
             )
         return kept
+
+    def _is_too_thin_to_grasp(self, env: CPUMujocoEnv, obj_name: str) -> bool:
+        """True if the object's smallest AABB dimension is below the gripper's
+        reliable-close threshold, so a top-down finger close is prone to an empty
+        grasp ("Object is not in grasp"). Pens, pencils, forks, butter knives,
+        credit cards, thin phones/remotes all fail this way even at low approach
+        angle and close reach -- the fingers meet before contacting the object.
+
+        Gated by ``min_graspable_thickness_m`` (default 0.0 = disabled) so the
+        change is opt-in and never alters behaviour unless configured.
+        """
+        sampler_cfg = self.config.task_sampler_config
+        min_thick = float(getattr(sampler_cfg, "min_graspable_thickness_m", 0.0))
+        if min_thick <= 0.0:
+            return False
+        model = env.current_model
+        data = env.current_data
+        om = env.object_managers[env.current_batch_index]
+        try:
+            obj_body_id = int(om.get_object_body_id(obj_name))
+            _, obj_dims = body_aabb(model, data, obj_body_id)
+        except Exception:
+            return False
+        obj_dims = np.asarray(obj_dims, dtype=np.float64)
+        # Smallest of the two horizontal extents is what the fingers close across.
+        min_horizontal = float(min(obj_dims[0], obj_dims[1]))
+        return min_horizontal < min_thick
 
     # --- Direct-on-furniture / next-to place destination -------------------- #
     def _on_candidate_selected(
