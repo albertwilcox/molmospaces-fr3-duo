@@ -581,6 +581,16 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # NAV_TO_RECEPTACLE -> PLACE transition (e.g. a ~0.2 m single-frame base snap)
     # without the grasp-corruption risk that keeps ``base_approach_enabled`` off.
     base_approach_place_enabled: bool = True
+    # PICK-entry smooth approach. Originally disabled (see ``base_approach_enabled``
+    # above) because an older physics-servo approach corrupted the grasp. The
+    # current approach instead advances the base by bounded qpos *snaps* with the
+    # arm held at stow and an EMPTY gripper (no object to dislodge during PICK),
+    # so its final state is identical to the direct standoff snap -- just spread
+    # over continuous, sub-threshold frames. A 22-episode seed-777 A/B (h1,3,4,5,
+    # 7,8,9,10) showed identical success (22.7% vs 22.7%) with observed base/camera
+    # teleports roughly halved (9->5 episodes), so it is enabled by default.
+    # Override at runtime with MLSPACES_PICK_APPROACH=0 to force the legacy snap.
+    base_approach_pick_enabled: bool = True
     # Position/heading tolerance for declaring the approach complete (the final
     # re-pin to the exact standoff is then far below the teleport threshold).
     base_approach_pos_tol_m: float = 0.04

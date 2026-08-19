@@ -19,6 +19,7 @@ Phases: ``NAV_TO_OBJ`` → ``PICK`` → ``NAV_TO_RECEPTACLE`` → ``PLACE`` → 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -67,6 +68,12 @@ _APPROACH_PARENT = {APPROACH_PICK: NAV_TO_OBJ, APPROACH_PLACE: NAV_TO_RECEPTACLE
 _APPROACH_MANIP = {APPROACH_PICK: PICK, APPROACH_PLACE: PLACE}
 
 _BASE_MG_ID = "base"
+
+
+class _PickMarginMarginal(Exception):
+    """Internal control-flow sentinel: the navigated PICK pose is IK-feasible but
+    its grasp waypoints are only marginally reachable, so fall through to the
+    reach-margin standoff search instead of committing the marginal grasp."""
 
 # Base translation (m) above which a ``_snap_base_pose`` teleport is treated as
 # a large discontinuity and the arm dof velocities are zeroed to absorb the
@@ -883,6 +890,16 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._nav_step_in_segment += 1
         return cmd
 
+    def _pick_approach_enabled(self) -> bool:
+        """Whether PICK enters its manip standoff via the smooth (continuous)
+        base approach rather than the legacy single-frame teleport. Runtime
+        override ``MLSPACES_PICK_APPROACH`` (``0`` forces the legacy snap) takes
+        precedence over the ``base_approach_pick_enabled`` config (default on)."""
+        env = os.environ.get("MLSPACES_PICK_APPROACH")
+        if env is not None:
+            return env not in ("0", "", "false", "False", "no")
+        return bool(getattr(self.policy_config, "base_approach_pick_enabled", True))
+
     def _begin_base_approach(self, approach_phase: str, parked_pose: np.ndarray) -> None:
         """Start a smooth base approach toward the searched manip standoff.
 
@@ -909,6 +926,8 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         approach_on = getattr(cfg, "base_approach_enabled", True) or (
             approach_phase == APPROACH_PLACE
             and getattr(cfg, "base_approach_place_enabled", True)
+        ) or (
+            approach_phase == APPROACH_PICK and self._pick_approach_enabled()
         )
         if not approach_on:
             # Approach disabled: leave the base at the standoff (legacy teleport).
@@ -995,8 +1014,16 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
         for mg, qpos in self._held_nav_arm_setpoints(robot_view).items():
             hold[mg] = qpos
-        # Base is pinned via the snap above; do not command it through the action.
-        hold.pop(_BASE_MG_ID, None)
+        # Emit the intermediate base pose as this step's base command so the
+        # recorded ``action.base_pose_command`` tracks the (snap-advanced) base
+        # continuously. Popping it instead held the command at the last nav value
+        # for the whole approach, then jumped it to the standoff at manip entry --
+        # a command-channel discontinuity ("cmd_only" teleport) even though the
+        # base itself moved smoothly. Emitting the step pose keeps command and
+        # observation continuous together.
+        hold[_BASE_MG_ID] = np.array(
+            [float(new_xy[0]), float(new_xy[1]), float(new_yaw)], dtype=np.float64
+        )
         self._approach_steps += 1
         return hold
 
@@ -1583,12 +1610,39 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         if attempt == 0:
             try:
                 self._manip_policy.reset(reset_retries=True)
+                # PICK reach-margin gate (mirrors the PLACE gate): accepting the
+                # navigated pose on mere IK-feasibility commits marginal,
+                # over-extended standoffs to a base-locked grasp the position
+                # servo cannot track -- the gripper reaches NEAR but not AT the
+                # object and closes on empty space ("Object is not in grasp!",
+                # the dominant PICK miss). When the navigated pose's grasp
+                # waypoints are only marginally reachable, prefer the reach-margin
+                # standoff search for a more interior (robustly trackable) base,
+                # exactly as PLACE does. Env-gated for A/B (default off).
+                gate_on = os.environ.get("MLSPACES_PICK_REACH_GATE", "0") not in (
+                    "0", "", "false", "False", "no"
+                )
+                if gate_on:
+                    targets = list(self._manip_policy.target_poses.values())
+                    margin = self._targets_reach_margin(targets) if targets else 0.0
+                    min_margin = float(
+                        getattr(self.policy_config, "pick_reach_margin_min", 0.05)
+                    )
+                    if margin < min_margin:
+                        log.info(
+                            "[MOBILE PNP FSM] PICK reachable at navigated pose but "
+                            f"reach margin marginal ({margin:.3f} < {min_margin:.3f}); "
+                            "searching a higher-margin standoff."
+                        )
+                        raise _PickMarginMarginal
                 self._locked_base_pose = current
                 log.info(
                     "[MOBILE PNP FSM] NAV_TO_OBJ done → phase PICK "
                     f"(built at navigated pose ({current[0, 3]:.2f}, {current[1, 3]:.2f}))."
                 )
                 return True
+            except _PickMarginMarginal:
+                pass
             except ValueError:
                 rec = getattr(self.config.task_config, "robot_base_pose", None)
                 rec_xy = (rec[0], rec[1]) if rec else (float("nan"), float("nan"))

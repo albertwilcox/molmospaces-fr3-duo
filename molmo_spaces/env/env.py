@@ -1,5 +1,6 @@
 import gc
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,7 +31,11 @@ if TYPE_CHECKING:
     from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG)
+# Default to WARNING to avoid flooding datagen logs with a per-contact
+# "Collision is between ..." DEBUG line every physics substep (megabytes of I/O
+# per episode that also slows rollouts). Override with MLSPACES_ENV_LOG_LEVEL
+# (e.g. DEBUG) when actively debugging collisions.
+log.setLevel(os.environ.get("MLSPACES_ENV_LOG_LEVEL", "WARNING").upper())
 
 HAS_FILAMENT: bool = getattr(mujoco, "mjRENDERER", "classic") == "filament"
 
