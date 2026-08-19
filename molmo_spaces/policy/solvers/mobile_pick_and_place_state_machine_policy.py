@@ -680,6 +680,14 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             "place_completed": False,      # PLACE reached DONE cleanly.
             # Failure attribution (first cause wins).
             "place_fail_cause": None,      # one of the cause strings below.
+            # Nav-end (PICK) arrival quality: captured once when NAV_TO_OBJ
+            # first completes. If the object was too far or unseen by every
+            # camera, a later no_verified_grasp is really a navigation failure.
+            "nav_end_obj_distance_m": None,      # horizontal base→object distance.
+            "nav_end_obj_visible_fraction": None,  # best per-camera seg fraction.
+            "nav_end_obj_near": None,            # distance within threshold?
+            "nav_end_obj_visible": None,         # seen by >=1 camera?
+            "nav_end_ok": None,                  # near AND visible.
             # Final geometry (filled at teardown / DONE).
             "final_gripper_to_receptacle_m": None,
             "retries": {},                 # per-phase retry counts.
@@ -1103,6 +1111,13 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         if d["place_completed"]:
             return "place_completed"
         if not d["grasp_verified"]:
+            # A no_verified_grasp is only genuinely a *grasp* failure if
+            # navigation actually delivered the base near the object with the
+            # object in view. If nav-end quality failed (parked too far, or the
+            # object was in no camera), the grasp never had a chance -- attribute
+            # it to navigation instead so the label matches the video.
+            if d.get("nav_end_ok") is False:
+                return "nav_failed_before_grasp"
             return "no_verified_grasp"
         if not d["reached_nav_to_receptacle"]:
             return "grasp_but_no_transport"
@@ -1253,6 +1268,77 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
             return None
         qadr = int(model.jnt_qposadr[jnt_id])
         return pos_quat_to_pose_mat(data.qpos[qadr : qadr + 3], data.qpos[qadr + 3 : qadr + 7])
+
+    def _capture_nav_end_quality(self) -> None:
+        """Snapshot whether navigation-to-object actually delivered the base to a
+        pose the grasp could start from.
+
+        Two independent, purely diagnostic checks, evaluated once when NAV_TO_OBJ
+        first completes (before any manip / retry):
+
+        * proximity -- the pickup object's centre is within
+          ``nav_end_obj_max_distance_m`` of the base (horizontal distance); and
+        * visibility -- the object occupies at least
+          ``nav_end_obj_min_visible_fraction`` of >=1 registered camera's
+          segmentation frame.
+
+        If either fails, a later ``no_verified_grasp`` is re-attributed to
+        ``nav_failed_before_grasp`` (see ``_derive_place_diag_cause``): the grasp
+        never had a chance because the base parked far from / blind to the object.
+        This records diagnostics only; it never alters control.
+        """
+        cfg = self.config.task_config
+        try:
+            base_pose = self.task.env.current_robot.robot_view.base.pose
+            om = self.task.env.object_managers[self.task.env.current_batch_index]
+            obj = om.get_object_by_name(cfg.pickup_obj_name)
+            model = self.task.env.current_model
+            data = self.task.env.current_data
+            obj_xyz = data.xpos[obj.body_id]
+            dxy = np.asarray(obj_xyz[:2], dtype=float) - np.asarray(
+                base_pose[:2, 3], dtype=float
+            )
+            distance = float(np.linalg.norm(dxy))
+        except Exception as exc:  # never let the diagnostic crash the rollout
+            log.warning(f"[MOBILE PNP FSM] nav-end proximity check errored ({exc}).")
+            return
+
+        best_visible = 0.0
+        try:
+            env = self.task.env
+            for cam_name in env.camera_manager.registry.keys():
+                try:
+                    vis = env.check_visibility(cam_name, obj.name)
+                except Exception:
+                    continue
+                if isinstance(vis, dict):
+                    vis = vis.get(obj.name, 0.0)
+                best_visible = max(best_visible, float(vis))
+        except Exception as exc:
+            log.warning(f"[MOBILE PNP FSM] nav-end visibility check errored ({exc}).")
+            best_visible = None  # unknown; do not penalise
+
+        max_dist = float(getattr(self.policy_config, "nav_end_obj_max_distance_m", 1.75))
+        min_vis = float(
+            getattr(self.policy_config, "nav_end_obj_min_visible_fraction", 0.0005)
+        )
+        near = distance <= max_dist
+        visible = None if best_visible is None else (best_visible > min_vis)
+
+        self._diag["nav_end_obj_distance_m"] = distance
+        self._diag["nav_end_obj_visible_fraction"] = best_visible
+        self._diag["nav_end_obj_near"] = near
+        self._diag["nav_end_obj_visible"] = visible
+        # ok only when both checks are affirmatively satisfied; an unknown
+        # (errored) visibility does not flip ok to False on its own.
+        self._diag["nav_end_ok"] = bool(near and (visible is not False))
+        if not self._diag["nav_end_ok"]:
+            log.info(
+                "[MOBILE PNP FSM] nav-end quality FAILED at object arrival: "
+                f"distance={distance:.2f} m (near={near}), "
+                f"best_visible_fraction={best_visible} (visible={visible}). "
+                "A no_verified_grasp here will be labelled nav_failed_before_grasp."
+            )
 
     def _apply_grasp_lock(self) -> None:
         """Re-assert the held object's pose relative to the current TCP so it
@@ -1817,6 +1903,11 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     # Snapshot the object's resting height before manipulation so
                     # the post-lift grasp check can confirm it was actually lifted.
                     self._capture_pick_reference_z()
+                    # Capture nav-arrival quality once (first completion only, so
+                    # a later ring-search standoff retry doesn't overwrite the
+                    # verdict about where *navigation itself* parked the base).
+                    if self._diag.get("nav_end_ok") is None:
+                        self._capture_nav_end_quality()
                     if not self._enter_pick():
                         if not self._retry_segment(PICK):
                             self._phase = DONE

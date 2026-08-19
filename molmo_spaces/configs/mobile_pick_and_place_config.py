@@ -407,6 +407,19 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     # Camera used by the (default-off) nav goal-visibility gate.
     nav_visibility_camera_name: str = "nav_camera"
 
+    # --- Nav-end quality diagnostic (PICK) ----------------------------------
+    # When navigation-to-object completes we snapshot whether the base actually
+    # arrived somewhere the grasp could plausibly start from: (1) the pickup
+    # object sits within ``nav_end_obj_max_distance_m`` of the base (horizontal),
+    # and (2) the object occupies at least ``nav_end_obj_min_visible_fraction``
+    # of at least one registered camera's segmentation frame. If either check
+    # fails, a subsequent ``no_verified_grasp`` outcome is re-attributed to
+    # ``nav_failed_before_grasp`` -- the grasp never had a chance because the
+    # base never got near / never had the object in view. These are diagnostic
+    # only (they change the failure *label*, not runtime control).
+    nav_end_obj_max_distance_m: float = 1.75  # matches ``max_pregrasp_standoff_m``
+    nav_end_obj_min_visible_fraction: float = 0.0005  # any non-trivial pixel presence
+
     # --- Manip-standoff snap collision gate ---------------------------------
     # After navigation the FSM freezes the base and snaps it to a manip standoff
     # that is IK-feasible for the grasp/place. That snap is instantaneous, so if
