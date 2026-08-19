@@ -100,6 +100,17 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # pathological object can't blow up sample time.
     manip_reach_gate_max_grasps: int = 48
 
+    # --- Ranked standoff selection (sample time) ----------------------------
+    # The mobile pick standoff is chosen by ranked search over the NAV-inflated
+    # free-space cells (closest-first, first collision-free + base-locked-IK-
+    # reachable candidate wins) instead of accept-first random sampling. Drawing
+    # candidates from cells navigation can actually traverse to keeps the
+    # recorded standoff from being snapped ~1 m outward at runtime (the dominant
+    # "robot parks far from the object then reports no_verified_grasp" failure).
+    # This caps how many ranked candidates are IK-checked before falling back to
+    # the legacy random placement, bounding sample-time cost.
+    ranked_standoff_max_candidates: int = 24
+
     # Radius range for the navigable START pose (far enough that navigation is
     # genuinely exercised, close enough that the smoke test stays fast/robust).
     nav_start_radius_range: tuple[float, float] = (2.0, 6.0)

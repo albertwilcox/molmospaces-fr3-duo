@@ -17,6 +17,7 @@ from typing import Any
 
 import mujoco
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.env.env import CPUMujocoEnv
 from molmo_spaces.tasks.mobile_pick_and_place_task import MobilePickAndPlaceTask
@@ -53,46 +54,174 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         task_cfg.pickup_obj_start_pose = pose_mat_to_7d(pickup_obj.pose).tolist()
 
         robot_view = env.current_robot.robot_view
-        robot_placed = env.place_robot_near(
-            robot_view=robot_view,
-            target=pickup_obj,
-            max_tries=sampler_cfg.max_robot_placement_attempts,
-            sampling_radius_range=sampler_cfg.manip_standoff_radius_range,
-            robot_safety_radius=sampler_cfg.robot_safety_radius,
-            preserve_z=sampler_cfg.mobile_base_z,
-            face_target=True,
-            check_camera_visibility=False,
-            excluded_positions=self.used_robot_positions[pickup_obj.name],
-            save_visibility_frames_dir=self.config.output_dir,
-        )
-        if not robot_placed:
-            raise RobotPlacementError(
-                f"Failed to place mobile robot near pickup object: {pickup_obj.name}"
-            )
 
-        # Gate: the collision-only grasp check (inherited from PickTaskSampler)
-        # accepts an object as long as >=1 grasp is non-colliding, but says
-        # nothing about whether the ARM can actually reach any grasp with the
-        # base frozen at this standoff. That optimism is the dominant runtime
-        # failure ("PICK build failed: no reachable base standoff" ->
-        # no_verified_grasp): small/flat objects (e.g. remotes on a surface)
-        # whose only grasps sit outside the arm's base-locked reach envelope.
-        # Re-run the SAME base-locked IK the FSM uses at runtime and reject the
-        # standoff if no grasp's pregrasp+grasp pair is reachable, so a different
-        # (graspable) pickup object is sampled instead.
-        if getattr(sampler_cfg, "manip_reach_gate_enabled", True):
-            if not self._pick_reachable_base_locked(env, pickup_obj, robot_view):
+        # Ranked standoff selection (replaces accept-first random sampling).
+        # Candidates are drawn from the NAV-INFLATED free-space set, so any
+        # accepted standoff is one navigation can actually reach (the base parks
+        # AT it, not ~1 m short after the A* goal snaps out of the inflation
+        # band). Candidates are ranked closest-first (best arm reach within the
+        # standoff band) and the first that passes both the collision check and
+        # the base-locked IK grasp gate is chosen -- typically the very first, so
+        # this does FEWER expensive IK solves than the old random loop, not more.
+        placed_via_ranked = self._place_robot_ranked_standoff(env, pickup_obj, robot_view)
+
+        if not placed_via_ranked:
+            # Fallback to the legacy random-sampling placement (keeps behaviour
+            # for scenes where the nav-inflated free set yields no in-band, IK-
+            # reachable standoff -- e.g. very tight nooks). The separate IK gate
+            # below still guards the recorded standoff.
+            robot_placed = env.place_robot_near(
+                robot_view=robot_view,
+                target=pickup_obj,
+                max_tries=sampler_cfg.max_robot_placement_attempts,
+                sampling_radius_range=sampler_cfg.manip_standoff_radius_range,
+                robot_safety_radius=sampler_cfg.robot_safety_radius,
+                preserve_z=sampler_cfg.mobile_base_z,
+                face_target=True,
+                check_camera_visibility=False,
+                excluded_positions=self.used_robot_positions[pickup_obj.name],
+                save_visibility_frames_dir=self.config.output_dir,
+            )
+            if not robot_placed:
                 raise RobotPlacementError(
-                    "No base-locked-IK-reachable grasp for pickup object "
-                    f"{pickup_obj.name} at the sampled standoff."
+                    f"Failed to place mobile robot near pickup object: {pickup_obj.name}"
                 )
 
+            # Gate: the collision-only grasp check (inherited from PickTaskSampler)
+            # accepts an object as long as >=1 grasp is non-colliding, but says
+            # nothing about whether the ARM can actually reach any grasp with the
+            # base frozen at this standoff. That optimism is the dominant runtime
+            # failure ("PICK build failed: no reachable base standoff" ->
+            # no_verified_grasp): small/flat objects (e.g. remotes on a surface)
+            # whose only grasps sit outside the arm's base-locked reach envelope.
+            # Re-run the SAME base-locked IK the FSM uses at runtime and reject the
+            # standoff if no grasp's pregrasp+grasp pair is reachable, so a
+            # different (graspable) pickup object is sampled instead.
+            if getattr(sampler_cfg, "manip_reach_gate_enabled", True):
+                if not self._pick_reachable_base_locked(env, pickup_obj, robot_view):
+                    raise RobotPlacementError(
+                        "No base-locked-IK-reachable grasp for pickup object "
+                        f"{pickup_obj.name} at the sampled standoff."
+                    )
         self.used_robot_positions[pickup_obj.name].append(robot_view.base.pose[:3, 3])
         task_cfg.robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
 
         pickup_obj_goal_pose = pose_mat_to_7d(pickup_obj.pose)
         pickup_obj_goal_pose[2] += 0.05
         task_cfg.pickup_obj_goal_pose = pickup_obj_goal_pose.tolist()
+
+    def _nav_effective_agent_radius(self) -> float:
+        """The obstacle-inflation radius the runtime A* planner actually uses.
+
+        Mirrors ``_AStarPlannerPolicy.__init__``: prefer the dedicated
+        ``nav_planning_agent_radius`` (inflated to clear the stowed arm) and fall
+        back to ``robot_safety_radius``. Drawing standoff candidates from the free
+        set of a map inflated by THIS radius guarantees a chosen standoff sits in
+        the same traversable space navigation plans over -- so the recorded goal
+        is not snapped ~1 m outward by the planner's nearest-free-cell fallback.
+        """
+        r = getattr(self.config.policy_config, "nav_planning_agent_radius", None)
+        if r:
+            return float(r)
+        return float(self.config.task_sampler_config.robot_safety_radius)
+
+    def _place_robot_ranked_standoff(self, env: CPUMujocoEnv, pickup_obj, robot_view) -> bool:
+        """Choose the pickup standoff by ranked search over nav-reachable cells.
+
+        Replaces the accept-first random loop in ``place_robot_near`` for the
+        mobile pick path. Steps:
+
+        1. Enumerate free points of the map inflated by the *nav* agent radius --
+           i.e. exactly the cells navigation can traverse to. Any standoff drawn
+           from here is nav-reachable (no snap-away short of the object).
+        2. Keep those within the manip standoff band around the object, and rank
+           them closest-first (nearest to the object = best base-locked arm reach
+           within the band, and also the shortest final approach).
+        3. Walk the ranked list; for each, face the object, verify no base
+           collision and (when enabled) that a non-colliding grasp is base-locked
+           IK-reachable. Accept the FIRST that passes -- usually the nearest, so
+           this runs fewer IK solves than the old random loop.
+
+        Returns True and leaves ``robot_view.base.pose`` at the chosen standoff
+        (and records ``robot_base_pose`` / ``pickup_obj_goal_pose``) on success;
+        returns False (base pose restored) so the caller can fall back to the
+        legacy random placement.
+        """
+        sampler_cfg = self.config.task_sampler_config
+        task_cfg = self.config.task_config
+        rmin, rmax = sampler_cfg.manip_standoff_radius_range
+        gate_on = bool(getattr(sampler_cfg, "manip_reach_gate_enabled", True))
+        z = float(sampler_cfg.mobile_base_z)
+        excl = self.used_robot_positions[pickup_obj.name]
+        excl_thr = float(sampler_cfg.robot_placement_exclusion_threshold)
+
+        saved_pose = robot_view.base.pose.copy()
+        try:
+            thormap = env.get_thormap(
+                agent_radius=self._nav_effective_agent_radius(), px_per_m=200
+            )
+            free_points = thormap.get_free_points()  # (N, 3) world metres
+        except Exception as exc:
+            log.info(f"[MOBILE PNP] Ranked standoff: nav map unavailable ({exc}); falling back.")
+            return False
+
+        target_xy = np.asarray(pickup_obj.position)[:2]
+        d = np.linalg.norm(free_points[:, :2] - target_xy, axis=1)
+        in_band = (d > rmin) & (d < rmax)
+        cand_xy = free_points[in_band][:, :2]
+        cand_d = d[in_band]
+        if len(cand_xy) == 0:
+            log.info(
+                "[MOBILE PNP] Ranked standoff: no nav-reachable cell in band "
+                f"({rmin:.2f}-{rmax:.2f} m) around {pickup_obj.name}; falling back."
+            )
+            return False
+
+        order = np.argsort(cand_d)  # closest-first
+        max_candidates = int(getattr(sampler_cfg, "ranked_standoff_max_candidates", 24))
+        checked = 0
+        for idx in order:
+            if checked >= max_candidates:
+                break
+            xy = cand_xy[idx]
+            if len(excl) > 0:
+                if np.any(
+                    np.linalg.norm(np.stack(excl)[:, :2] - xy[None, :], axis=-1) < excl_thr
+                ):
+                    continue
+            checked += 1
+            yaw = float(np.arctan2(target_xy[1] - xy[1], target_xy[0] - xy[0]))
+            pose = pos_quat_to_pose_mat(
+                np.array([xy[0], xy[1], z]),
+                R.from_euler("z", yaw).as_quat(scalar_first=True),
+            )
+            if env.check_if_robot_collision_at_base_pose(robot_view, pose, "robot_0/"):
+                continue
+            robot_view.base.pose = pose
+            mujoco.mj_forward(env.current_model, env.current_data)
+            if gate_on and not self._pick_reachable_base_locked(env, pickup_obj, robot_view):
+                continue
+            # Accepted: record and keep the base here.
+            self.used_robot_positions[pickup_obj.name].append(robot_view.base.pose[:3, 3])
+            task_cfg.robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
+            pickup_obj_goal_pose = pose_mat_to_7d(pickup_obj.pose)
+            pickup_obj_goal_pose[2] += 0.05
+            task_cfg.pickup_obj_goal_pose = pickup_obj_goal_pose.tolist()
+            log.info(
+                "[MOBILE PNP] Ranked standoff selected at "
+                f"({xy[0]:.2f}, {xy[1]:.2f}), {cand_d[idx]:.2f} m from "
+                f"{pickup_obj.name} (checked {checked}/{len(cand_xy)} candidates)."
+            )
+            return True
+
+        robot_view.base.pose = saved_pose
+        mujoco.mj_forward(env.current_model, env.current_data)
+        log.info(
+            "[MOBILE PNP] Ranked standoff: none of "
+            f"{checked} nav-reachable candidates were collision-free + IK-reachable "
+            f"for {pickup_obj.name}; falling back to random placement."
+        )
+        return False
 
     def _arm_move_group_ids_for(self, robot_view) -> list[str]:
         """Arm move groups (arm only; never the holonomic base or the gripper).
