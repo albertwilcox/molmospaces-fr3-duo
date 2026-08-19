@@ -103,7 +103,7 @@ class AStarPlannerPolicy(PlannerPolicy):
     def planners(self):
         return self.nav_planner
 
-    def _fallback_motion_plan(self, target_pos, robot_view):
+    def _fallback_motion_plan(self, target_pos, robot_view, max_goal_snap_m=None):
         """Plan with a thinner agent radius when the primary (inflated) planner
         finds no path. Returns world waypoints or None. Lazily builds a second
         planner at ``self._nav_fallback_radius`` so the primary planner's cached
@@ -119,7 +119,9 @@ class AStarPlannerPolicy(PlannerPolicy):
                 fb_cfg, self.task.env.current_model_path
             )
         try:
-            return self._nav_planner_fallback.motion_plan(target_pos, robot_view)
+            return self._nav_planner_fallback.motion_plan(
+                target_pos, robot_view, max_goal_snap_m=max_goal_snap_m
+            )
         except ValueError:
             return None
 
@@ -135,6 +137,7 @@ class AStarPlannerPolicy(PlannerPolicy):
         self._skipped_candidates = set()
         self._replan_after = None
         self._nav_goal_override_tried = False
+        self._using_override_goal = False
         self.nav_planner.blacklist.clear()
 
     @property
@@ -197,6 +200,7 @@ class AStarPlannerPolicy(PlannerPolicy):
             override = getattr(self.task, "nav_goal_override", None)
             if override is not None and not getattr(self, "_nav_goal_override_tried", False):
                 self._nav_goal_override_tried = True
+                self._using_override_goal = True
                 self._target_pos_quat = (np.asarray(override[0]), np.asarray(override[1]))
                 if hasattr(self.task, "set_planned_nav_goal"):
                     self.task.set_planned_nav_goal(override[0], override[1])
@@ -208,6 +212,7 @@ class AStarPlannerPolicy(PlannerPolicy):
 
             self.nav_goal_sampler.set_target(self.target_object)
             self.nav_goal_sampler.set_robot_view(self.robot_view)
+            self._using_override_goal = False
             cfg = self.config.policy_config
             succ_thr = self.config.task_config.succ_pos_threshold
             margin = getattr(cfg, "nav_goal_success_margin", 0.0)
@@ -502,10 +507,28 @@ class AStarPlannerPolicy(PlannerPolicy):
                         )
                         break
                     else:
+                        # For the feasibility-verified override goal, guard
+                        # against the planner silently snapping the goal into a
+                        # nearby wall (the goal sits inside the inflation band).
+                        # When it would snap too far, the primary returns None and
+                        # we recover the true standoff via the thinner fallback,
+                        # whose graph typically contains it. Sampled goals snap to
+                        # the object ring by design, so they are left unguarded.
+                        snap_guard = (
+                            getattr(
+                                self.config.policy_config,
+                                "nav_goal_override_max_snap_m",
+                                None,
+                            )
+                            if getattr(self, "_using_override_goal", False)
+                            else None
+                        )
                         world_waypoints = None
                         try:
                             world_waypoints = self.nav_planner.motion_plan(
-                                self.target_pos_quat[0], self.robot_view
+                                self.target_pos_quat[0],
+                                self.robot_view,
+                                max_goal_snap_m=snap_guard,
                             )
                         except ValueError as e:
                             if "starting position" in str(e):
@@ -513,12 +536,16 @@ class AStarPlannerPolicy(PlannerPolicy):
                                 return self._nav_plan
 
                         if world_waypoints is None:
-                            # Primary (inflated-radius) planner found no path.
-                            # Retry with the thinner fallback planner before
-                            # giving up: the inflation may have disconnected the
-                            # free-space graph in a tight house.
+                            # Primary (inflated-radius) planner found no path (or
+                            # refused an over-snapped override goal). Retry with
+                            # the thinner fallback planner before giving up: the
+                            # inflation may have disconnected the free-space graph
+                            # in a tight house, or the standoff sits just inside
+                            # the inflation band.
                             world_waypoints = self._fallback_motion_plan(
-                                self.target_pos_quat[0], self.robot_view
+                                self.target_pos_quat[0],
+                                self.robot_view,
+                                max_goal_snap_m=snap_guard,
                             )
                             if world_waypoints is not None:
                                 log.info(

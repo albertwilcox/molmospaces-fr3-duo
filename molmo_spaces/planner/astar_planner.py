@@ -243,6 +243,7 @@ class AStarPlanner(Planner):
         self,
         target_pos: np.ndarray,
         robot_view: RobotView,
+        max_goal_snap_m: float | None = None,
         **kwargs,
     ):
         init_pos = robot_view.base.pose[:3, 3]
@@ -254,5 +255,24 @@ class AStarPlanner(Planner):
         discrete_goal = self.get_discrete_location(target_pos)
         if discrete_goal is None:
             raise ValueError("Non-plannable target position")
+
+        # Goal-snap guard: if ``get_discrete_location`` relocated the goal to a
+        # far-away in-graph cell (the requested goal sits inside the obstacle
+        # inflation band), refuse rather than plan to the wrong pose. Returning
+        # None lets the caller retry with a thinner-radius planner whose graph
+        # contains the requested goal. The world position of the resolved cell is
+        # reconstructed exactly as ``_compute_plan`` does (cell * downscale px ->
+        # metres) so the comparison matches the executed path frame.
+        if max_goal_snap_m is not None:
+            goal_world = self.map.pos_px_to_m(
+                np.array([[discrete_goal[0] * self.downscale, discrete_goal[1] * self.downscale]])
+            )[0][:2]
+            snap = float(np.linalg.norm(goal_world - np.asarray(target_pos)[:2]))
+            if snap > max_goal_snap_m:
+                log.info(
+                    f"[A* PLAN] goal snapped {snap:.2f} m (> {max_goal_snap_m:.2f} m); "
+                    "returning None so caller can fall back to a thinner planner."
+                )
+                return None
 
         return self._compute_plan(discrete_init, discrete_goal)

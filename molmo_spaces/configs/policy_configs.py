@@ -477,6 +477,19 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     visibility_min_fraction: float = 0.0  # min seg fraction (>) to accept a goal
     nav_goal_max_attempts: int = 5  # candidate goals to try before giving up
 
+    # --- Robustness: goal-snap guard for the feasibility-verified override ------
+    # ``AStarPlanner.motion_plan`` silently relocates ("snaps") a goal that is not
+    # in its free-space graph to the nearest in-graph cell. For a feasibility-
+    # verified standoff override (0.35-0.55 m from the object) this snap can be
+    # ~1 m -- the base then parks short of the object, wedged in a wall corner,
+    # and reports success at the wrong pose (the dominant "parked in the wall ->
+    # nav_failed_before_grasp" failure). When the override goal would snap farther
+    # than this many metres, the primary (inflated-radius) planner returns None so
+    # the thinner fallback planner -- whose graph usually DOES contain the standoff
+    # -- is used instead, reaching the true standoff. Only applied to the override
+    # goal; ordinary sampled goals are expected to snap to the object ring.
+    nav_goal_override_max_snap_m: float = 0.35
+
     # --- Robustness: clearance-aware smoothing (feasibility check #2) ----------
     # When True, B-spline-smoothed waypoints whose footprint clearance drops to or
     # below ``nav_smooth_min_clearance`` (metres beyond the inflated footprint) are
