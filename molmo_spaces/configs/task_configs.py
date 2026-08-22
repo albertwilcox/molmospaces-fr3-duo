@@ -187,6 +187,19 @@ class NavToObjTaskConfig(BaseMujocoTaskConfig):
     # Defaults to the RBY1 head camera; mobile-base embodiments override this.
     visibility_camera_name: str = "head_camera"
 
+    # Optional list of registry camera names for the object-visibility success
+    # check. When set, the target counts as visible if it is visible from ANY of
+    # these cameras (OR). Falls back to the single ``visibility_camera_name`` when
+    # None. Used by mobile-base rigs with a left/right shoulder camera pair.
+    visibility_camera_names: list[str] | None = None
+
+    # Minimum fraction of the frame (0..1) the target must occupy in a camera for
+    # it to count as "visible" for the success gate. This backstops the sampler's
+    # physical-size filter: even a normally-sized object counts as visible only if
+    # it presents a large-enough silhouette at the standoff (not a handful of far
+    # pixels). 0.0 keeps the historical "any nonzero pixels" behaviour.
+    min_visible_fraction: float = 0.0
+
     # When True, a nav episode only counts as success if the target is BOTH within
     # ``succ_pos_threshold`` AND visible from ``visibility_camera_name``. When False,
     # success is judged on distance alone (the visibility check is skipped). This

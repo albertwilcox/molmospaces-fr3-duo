@@ -67,6 +67,17 @@ APPROACH_PLACE = "APPROACH_PLACE"
 _APPROACH_PARENT = {APPROACH_PICK: NAV_TO_OBJ, APPROACH_PLACE: NAV_TO_RECEPTACLE}
 _APPROACH_MANIP = {APPROACH_PICK: PICK, APPROACH_PLACE: PLACE}
 
+# Internal control-flow-only phase entered once the object has been released at
+# the place receptacle. It retracts the arm toward the stow config (clearing any
+# robot<->object contact) and holds for a few frames so the object settles onto
+# the receptacle BEFORE the episode terminates and success is judged. Without it
+# the FSM could reach DONE with the arm still touching the just-placed object
+# (``robot_contact`` True) or before the object came to rest, so a physically
+# successful placement was scored as ``released_but_not_scored_success``. It is
+# reported as its parent PLACE phase for subtask labelling.
+PLACE_SETTLE = "PLACE_SETTLE"
+_PHASE_LABEL_PARENT = {**_APPROACH_PARENT, PLACE_SETTLE: PLACE}
+
 _BASE_MG_ID = "base"
 
 
@@ -367,10 +378,15 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
         pickup_obj_size: np.ndarray,
     ) -> np.ndarray | None:
         """Search the receptacle top surface for the IK-reachable place point
-        closest to the base, keeping the object fully on the receptacle.
+        closest to the RECEPTACLE CENTRE, keeping the object on the receptacle
+        and away from its edges.
 
         Returns a 4x4 place pose (orientation/height preserved from ``place_pose``)
-        or ``None`` if no candidate on the surface is reachable.
+        or ``None`` if no candidate within ``place_max_offset_from_center_m`` of
+        the centre is reachable. Choosing the most-central reachable point (not
+        the point nearest the base) avoids setting the object down at a far edge
+        or over a hole/sink cutout, where it falls off the receptacle -- the
+        dominant visually-confirmed off-receptacle drop failure.
         """
         # Shrink the searchable footprint by the object's half-extent (plus a small
         # margin) so the placed object stays within the receptacle top.
@@ -380,14 +396,23 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
         n = self.policy_config.place_search_grid_n
         xs = np.linspace(-half_x, half_x, n) + receptacle_center[0]
         ys = np.linspace(-half_y, half_y, n) + receptacle_center[1]
-        base_xy = self.robot_view.base.pose[:2, 3]
 
+        max_offset = self.policy_config.place_max_offset_from_center_m
+        cx, cy = receptacle_center[0], receptacle_center[1]
         candidates = []
         for x in xs:
             for y in ys:
+                # Optional far-edge reject (disabled by default): on a small
+                # receptacle whose AABB spuriously spans a hole/cutout, a far
+                # point can drop the object off the receptacle. Only applied when
+                # place_max_offset_from_center_m > 0 so large solid tops
+                # (beds/tables) are not wrongly rejected.
+                if max_offset > 0.0 and (x - cx) ** 2 + (y - cy) ** 2 > max_offset ** 2:
+                    continue
                 candidates.append((x, y))
-        # Nearest-to-base first: most likely inside the arm workspace.
-        candidates.sort(key=lambda p: (p[0] - base_xy[0]) ** 2 + (p[1] - base_xy[1]) ** 2)
+        # Most-central first: closest to the receptacle centre, most likely to
+        # land the object squarely on the receptacle and away from edges/holes.
+        candidates.sort(key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
 
         for x, y in candidates:
             candidate = place_pose.copy()
@@ -395,9 +420,10 @@ class _MobileManipPlannerPolicy(PickAndPlacePlannerPolicy):
             candidate[1, 3] = y
             if self.check_feasible_ik(candidate):
                 log.info(
-                    "[MOBILE PNP FSM] Placing at nearest reachable receptacle point "
-                    f"({x:.2f}, {y:.2f}) instead of centre "
-                    f"({receptacle_center[0]:.2f}, {receptacle_center[1]:.2f})."
+                    "[MOBILE PNP FSM] Placing at nearest-to-centre reachable "
+                    f"receptacle point ({x:.2f}, {y:.2f}), "
+                    f"{np.hypot(x - cx, y - cy):.2f}m from centre "
+                    f"({cx:.2f}, {cy:.2f})."
                 )
                 return candidate
         return None
@@ -648,6 +674,10 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # (e.g. a retreat IK hiccup) must NOT retry, which would teleport the
         # already-placed object back into the gripper and undo the success.
         self._place_released: bool = False
+        # Countdown of remaining PLACE_SETTLE steps (arm-retract + object-settle
+        # hold after release, before the episode terminates and success is
+        # judged). Zero when not settling.
+        self._place_settle_left: int = 0
         # Pickup object's world-z captured just before the PICK manipulation
         # begins (its resting height). After the lift we verify the object rose
         # by at least ``grasp_verify_min_rise_m`` to confirm it is actually in the
@@ -1079,7 +1109,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         # phase: the base is still driving toward its goal with the arm stowed,
         # so the subtask labeller merges them into the navigation segment (and
         # they must not surface as unknown phases that would be dropped).
-        return _APPROACH_PARENT.get(self._phase, self._phase)
+        return _PHASE_LABEL_PARENT.get(self._phase, self._phase)
 
     def get_all_phases(self) -> dict[str, int]:
         return {NAV_TO_OBJ: 0, PICK: 1, NAV_TO_RECEPTACLE: 2, PLACE: 3, DONE: 4}
@@ -1160,6 +1190,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         self._grasp_offset = None
         self._grasp_mg_id = None
         self._place_released = False
+        self._place_settle_left = 0
         self._pick_object_ref_z = None
         self._diag = self._fresh_diag()
         self.task.set_nav_target(self.config.task_config.pickup_obj_name)
@@ -1852,6 +1883,16 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
         yaw = float(np.arctan2(base_pose[1, 0], base_pose[0, 0]))
         return np.array([x, y, yaw], dtype=np.float64)
 
+    def _begin_place_settle(self) -> None:
+        """Enter the post-release PLACE_SETTLE phase: retract the arm and let the
+        object settle for a few frames before the episode ends. Resets the arm
+        retract ramp so it starts from the current (place) pose."""
+        self._nav_arm_hold = None
+        self._place_settle_left = max(
+            1, int(getattr(self.policy_config, "place_settle_steps", 20))
+        )
+        self._phase = PLACE_SETTLE
+
     def _done_action(self) -> dict[str, Any]:
         gripper_ids = self.task.env.current_robot.robot_view.get_gripper_movegroup_ids()
         action = self.task.env.current_robot.robot_view.get_ctrl_dict(["arm"] + gripper_ids)
@@ -1949,6 +1990,25 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 self._approach_carry = None
                 continue
 
+            if self._phase == PLACE_SETTLE:
+                # Object has been released at the receptacle. Retract the arm
+                # toward the stow config (ramped at the arm velocity cap) to
+                # clear any lingering robot<->object contact, hold the base, and
+                # keep the gripper at its current (open) command, for a few frames
+                # so the object settles onto the receptacle before the episode
+                # ends and success is judged. Never retries or re-plans.
+                robot_view = self.task.env.current_robot.robot_view
+                gripper_ids = robot_view.get_gripper_movegroup_ids()
+                hold = robot_view.get_ctrl_dict(["arm"] + gripper_ids)
+                for mg, qpos in self._held_nav_arm_setpoints(robot_view).items():
+                    hold[mg] = qpos
+                hold[_BASE_MG_ID] = self._current_base_command()
+                self._place_settle_left -= 1
+                if self._place_settle_left > 0:
+                    return hold
+                self._phase = DONE
+                continue
+
             if self._phase in (PICK, PLACE):
                 # Re-pin the holonomic base each step: it otherwise drifts under
                 # arm/grasp reaction forces (the bolted fixed-base robot cannot),
@@ -1997,9 +2057,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     if self._phase == PLACE and self._place_released:
                         log.info(
                             "[MOBILE PNP FSM] PLACE post-release failure ignored "
-                            "(object already set down) → phase DONE"
+                            "(object already set down) → settle then DONE"
                         )
-                        self._phase = DONE
+                        self._begin_place_settle()
                     elif not self._retry_segment(self._phase):
                         if self._phase == PLACE:
                             self._set_place_cause(
@@ -2026,9 +2086,9 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     if self._phase == PLACE and self._place_released:
                         log.info(
                             "[MOBILE PNP FSM] PLACE post-release failure ignored "
-                            "(object already set down) → phase DONE"
+                            "(object already set down) → settle then DONE"
                         )
-                        self._phase = DONE
+                        self._begin_place_settle()
                     elif not self._retry_segment(self._phase):
                         if self._phase == PLACE:
                             self._set_place_cause(
@@ -2071,9 +2131,13 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                     self._phase = NAV_TO_RECEPTACLE
                     log.info("[MOBILE PNP FSM] PICK done → phase NAV_TO_RECEPTACLE")
                 else:
-                    self._phase = DONE
                     self._diag["place_completed"] = True
-                    log.info("[MOBILE PNP FSM] PLACE done → phase DONE")
+                    # Retract the arm and let the object settle before the episode
+                    # ends and success is judged (the manip retreat already ran,
+                    # but a brief settle guards against scoring while the object is
+                    # still coming to rest or the arm is momentarily in contact).
+                    self._begin_place_settle()
+                    log.info("[MOBILE PNP FSM] PLACE done → settle then DONE")
                 continue
 
             # DONE

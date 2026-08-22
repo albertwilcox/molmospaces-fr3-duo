@@ -118,6 +118,7 @@ class MoveSequence(ActionPrimitive):
         gripper_empty_threshold: float = 0.0,
         gripper_mg_id: str | None = None,
         object_present_fn: Callable[[], bool] | None = None,
+        converge_max_extra_s: float = 0.0,
     ) -> None:
         super().__init__(robot_view, sum(seg.duration for seg in move_segments))
         self._move_segments = move_segments
@@ -127,6 +128,14 @@ class MoveSequence(ActionPrimitive):
         self.is_holding_object = is_holding_object
         self.gripper_empty_threshold = gripper_empty_threshold
         self._gripper_mg_id = gripper_mg_id
+        # Optional convergence gate: when enabled (see ``_await_convergence``),
+        # the sequence does not report done at the nominal end-of-settle if the
+        # arm has not yet actually reached the final target pose -- it keeps
+        # driving toward it for up to ``converge_max_extra_s`` more seconds. This
+        # stops a downstream gripper-close from firing while the TCP is still
+        # lagging its setpoint (the dominant "closed on empty space" grasp miss,
+        # since the move otherwise completes purely on elapsed time).
+        self._converge_max_extra_s = converge_max_extra_s
         # Optional predicate: True iff the target object is still physically in
         # the gripper (e.g. within a small distance of the TCP). When supplied,
         # a fully-closed gripper is only treated as an EMPTY grasp if the object
@@ -148,7 +157,26 @@ class MoveSequence(ActionPrimitive):
             self.move_seg_idx = idx
             self.move_seg_start_time = self.robot_view.mj_data.time
 
-        return self.elapsed_time() >= self.duration + self.settle_time
+        past_settle = self.elapsed_time() >= self.duration + self.settle_time
+        if not past_settle:
+            return False
+        # Optional convergence gate (opt-in via a subclass ``_await_convergence``
+        # override; default no-op keeps historical time-based termination). Keep
+        # driving toward the final target until the arm converges or the extra
+        # time budget is exhausted, so a downstream gripper-close never fires
+        # while the TCP is still lagging its setpoint.
+        if self._await_convergence():
+            return (
+                self.elapsed_time()
+                >= self.duration + self.settle_time + self._converge_max_extra_s
+            )
+        return True
+
+    def _await_convergence(self) -> bool:
+        """Return True iff a convergence gate is enabled AND the arm has not yet
+        reached the final target pose (so termination should be deferred). The
+        base sequence has no TCP notion of convergence and never gates."""
+        return False
 
     def get_current_action(self) -> dict[str, Any]:
         elapsed_time = self.robot_view.mj_data.time - self.move_seg_start_time
@@ -234,6 +262,9 @@ class TCPMoveSequence(MoveSequence):
         tcp_rot_err_threshold: float = np.inf,
         gripper_mg_id: str | None = None,
         object_present_fn: Callable[[], bool] | None = None,
+        converge_pos_tol: float | None = None,
+        converge_rot_tol: float | None = None,
+        converge_max_extra_s: float = 0.0,
     ) -> None:
         super().__init__(
             robot_view,
@@ -243,10 +274,34 @@ class TCPMoveSequence(MoveSequence):
             gripper_empty_threshold,
             gripper_mg_id=gripper_mg_id,
             object_present_fn=object_present_fn,
+            converge_max_extra_s=converge_max_extra_s,
         )
         self.tcp_to_jp_fn = tcp_to_jp_fn
         self.tcp_pos_err_threshold = tcp_pos_err_threshold
         self.tcp_rot_err_threshold = tcp_rot_err_threshold
+        # Convergence gate tolerances (metres / radians). When ``converge_pos_tol``
+        # is set, the sequence defers its "done" until the TCP is within this
+        # position (and, if set, rotation) tolerance of the FINAL target pose, or
+        # ``converge_max_extra_s`` extra seconds elapse. Used for the grasp
+        # descent so the gripper only closes once it has actually reached the
+        # object, eliminating time-based "closed on empty space" misses.
+        self._converge_pos_tol = converge_pos_tol
+        self._converge_rot_tol = converge_rot_tol
+
+    def _await_convergence(self) -> bool:
+        if self._converge_pos_tol is None:
+            return False
+        target = self.move_segments[-1].end_pose
+        gripper_mg_id = self._gripper_mg_id or self.robot_view.get_gripper_movegroup_ids()[0]
+        gripper = self.robot_view.get_gripper(gripper_mg_id)
+        trf = np.linalg.inv(gripper.leaf_frame_to_world) @ target
+        pos_err = float(np.linalg.norm(trf[:3, 3]))
+        rot_err = float(R.from_matrix(trf[:3, :3]).magnitude())
+        converged = pos_err <= self._converge_pos_tol and (
+            self._converge_rot_tol is None or rot_err <= self._converge_rot_tol
+        )
+        # Return True (defer termination) while NOT yet converged.
+        return not converged
 
     @property
     def move_segments(self) -> list[TCPMoveSegment]:

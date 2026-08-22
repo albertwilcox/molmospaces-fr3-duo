@@ -311,3 +311,11 @@ class NavToObjTaskSamplerConfig(ObjectCentricTaskSamplerConfig):
     verbose: bool = False  # Whether to print verbose debug info
 
     max_valid_candidates: int = 6  # maximum number of instances of type in scene to accept the task
+
+    # Minimum physical size (metres) for an object to be an eligible nav target.
+    # Measured as the object's SECOND-LARGEST full AABB extent, i.e. the smaller
+    # of its two broadside dimensions. This rejects thin/tiny objects (pens,
+    # forks, knives, credit cards) that are barely visible in the shoulder
+    # cameras and give the nav policy poor learning signal, while keeping normal
+    # graspables (mugs, cans, bowls, boxes, fruit). 0.0 disables the filter.
+    min_object_size_m: float = 0.0

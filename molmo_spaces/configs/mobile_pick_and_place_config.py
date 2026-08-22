@@ -111,6 +111,14 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # the legacy random placement, bounding sample-time cost.
     ranked_standoff_max_candidates: int = 24
 
+    # Restrict ranked-standoff candidates (and thus the recorded pick standoff) to
+    # the connected free-component of the nav-inflated map that contains the bulk
+    # of navigable space (the component the far nav-start also lands in). Cells
+    # that are free but sit in a walled-off pocket the runtime A* cannot route to
+    # are dropped, eliminating the "primary A* finds no path -> thin 0.30 m
+    # fallback wedges the base -> PurePursuit stops 2-5 m short" far-park failure.
+    ranked_standoff_require_connected: bool = True
+
     # Radius range for the navigable START pose (far enough that navigation is
     # genuinely exercised, close enough that the smoke test stays fast/robust).
     nav_start_radius_range: tuple[float, float] = (2.0, 6.0)
@@ -529,6 +537,16 @@ class MobilePickAndPlacePolicyConfig(BasePolicyConfig):
     arm_max_vel_rad_s: float = 1.5
     # Keep commanded joints this far (rad) inside their position limits.
     arm_pos_limit_margin_rad: float = 0.05
+
+    # --- Post-release place settle -----------------------------------------
+    # After the object is released at the receptacle, hold for this many control
+    # steps while retracting the arm toward the stow config, so any lingering
+    # robot<->object contact clears and the object settles onto the receptacle
+    # BEFORE the episode terminates and success is judged. Without this settle
+    # the FSM could reach DONE with the arm still touching the just-placed object
+    # (robot_contact True) or before it came to rest, scoring a physically
+    # successful placement as ``released_but_not_scored_success``.
+    place_settle_steps: int = 20
 
     # --- Pre-navigation arm retract (stow pose) -----------------------------
     # Before/while navigating, retract the arm to a compact, natural "home" tuck

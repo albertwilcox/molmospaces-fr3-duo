@@ -50,9 +50,18 @@ class ObjectManipulationPlannerPolicyConfig(BasePolicyConfig):
     # Fallback place-target search over the receptacle top when the receptacle
     # centre is out of the (base-locked) arm's reach: sample an n x n grid over
     # the top footprint (shrunk by the object half-extent + this margin) and
-    # place at the reachable point nearest the base.
+    # place at the reachable point CLOSEST TO THE RECEPTACLE CENTRE (staying on
+    # the receptacle and away from its edges), rejecting any candidate farther
+    # from centre than ``place_max_offset_from_center_m`` so the object is never
+    # set down at a far edge / over a sink cutout where it falls off.
     place_edge_margin_m: float = 0.03
     place_search_grid_n: int = 5
+    # Optional cap (metres) on how far from the receptacle centre the fallback
+    # place point may be. 0 = disabled (default), since the grid is already
+    # bounded by the receptacle footprint and a hard cap would wrongly reject
+    # valid off-centre points on genuinely large tops (beds/large tables). Set
+    # >0 only for small receptacles whose AABB spuriously spans a hole/cutout.
+    place_max_offset_from_center_m: float = 0.0
 
     # Speed settings
     speed_slow: float = 0.08  # m/s for precise movements
@@ -77,6 +86,22 @@ class ObjectManipulationPlannerPolicyConfig(BasePolicyConfig):
     max_sequential_ik_failures: int = 8  # Maximum number of IK failures
     tcp_pos_err_threshold: float = 0.1  # Retry if position error is greater than this
     tcp_rot_err_threshold: float = np.radians(30.0)  # Retry if rotation error is greater than this
+
+    # --- Grasp convergence gate --------------------------------------------
+    # Defer completion of the grasp descent (and therefore the gripper close
+    # that follows it) until the TCP is actually within ``grasp_converge_pos_tol``
+    # metres (and ``grasp_converge_rot_tol`` radians) of the grasp pose, rather
+    # than terminating the move purely on elapsed time. Near the arm's reach
+    # limit the interpolated setpoint sweeps to the goal while the arm still lags
+    # several centimetres behind; closing the gripper then grabs empty space
+    # (``inter_finger_dist`` 0.0), the dominant ``no_verified_grasp`` failure.
+    # The move keeps driving toward the grasp pose for up to
+    # ``grasp_converge_max_extra_s`` extra seconds until it converges. Set
+    # ``grasp_converge_pos_tol`` to None to disable (historical time-based
+    # behaviour).
+    grasp_converge_pos_tol: float | None = 0.015
+    grasp_converge_rot_tol: float | None = np.radians(20.0)
+    grasp_converge_max_extra_s: float = 2.0
 
     # grasp sampling configuration (collision checking)
     filter_colliding_grasps: bool = True

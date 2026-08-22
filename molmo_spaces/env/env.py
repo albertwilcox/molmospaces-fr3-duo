@@ -61,6 +61,11 @@ class BaseMujocoEnv(ABC):
         self._depth_frame = None
         self._segmentation_frame = None
         self._camera_name = "camera"
+        # Render-later / CPU-capture mode: when set, per-step dataset RGB/depth
+        # frames are skipped (returned as zeros) so sim can run GPU-free and be
+        # rendered later. Segmentation renders (scene acceptance) are unaffected.
+        self._no_render = os.environ.get("MLSPACES_DATAGEN_NO_RENDER", "0") == "1"
+        self._render_wh: tuple[int, int] | None = None
 
     def is_loaded(self) -> bool:
         """Check if a scene is currently loaded."""
@@ -151,6 +156,10 @@ class BaseMujocoEnv(ABC):
     def step(self, n_steps: int = 1) -> None:
         raise NotImplementedError
 
+    @abstractmethod
+    def sync_derived_state(self) -> None:
+        raise NotImplementedError
+
 
 class CPUMujocoEnv(BaseMujocoEnv):
     def __init__(
@@ -219,6 +228,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
             width, height = self.config.camera_config.img_resolution
         else:
             width, height = (640, 480)  # Default resolution
+        self._render_wh = (width, height)
         if HAS_FILAMENT:
             log.info("Using MuJoCo renderer: filament")
             self._renderer = MjFilamentRenderer(model=self.mj_model, width=width, height=height)
@@ -299,6 +309,10 @@ class CPUMujocoEnv(BaseMujocoEnv):
         if camera_name not in self.camera_manager.registry:
             raise KeyError(f"Camera '{camera_name}' not found in registry.")
 
+        if self._no_render:
+            w, h = self._render_wh or (640, 480)
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
         camera = self.camera_manager.registry[camera_name]
         return self._render_frame(
             camera.pos, camera.forward, camera.up, camera.fov, segmentation=False
@@ -315,6 +329,10 @@ class CPUMujocoEnv(BaseMujocoEnv):
         """
         if camera_name not in self.camera_manager.registry:
             raise KeyError(f"Camera '{camera_name}' not found in registry.")
+
+        if self._no_render:
+            w, h = self._render_wh or (640, 480)
+            return np.zeros((h, w), dtype=np.float32)
 
         camera = self.camera_manager.registry[camera_name]
         depth_frame = self._render_frame(
@@ -406,6 +424,33 @@ class CPUMujocoEnv(BaseMujocoEnv):
                 mujoco.mj_step(self._mj_model, mj_data, n_steps)
 
         # We got new scene state, so anything depending on data must be refreshed
+        for om in self.object_managers:
+            om.invalidate_data_cache()
+
+        self.camera_manager.registry.update_all_cameras(self)
+
+    def sync_derived_state(self) -> None:
+        """Recompute position-dependent derived quantities to be consistent with qpos.
+
+        ``mj_step`` leaves ``data.qpos`` post-integration while ``geom_xpos`` and
+        ``sensordata`` still reflect the pre-integration qpos (they are computed by
+        ``mj_step1`` before ``mj_step2`` integrates). Rendering/sensing right after a
+        physics loop therefore lags its own qpos by one sim substep (~1 mm). Calling
+        ``mj_forward`` here re-derives geom/site/cam poses and sensordata from the
+        final qpos, so images, proprioception and the saved qpos are all mutually
+        consistent. It has no effect on dynamics (no integration).
+        """
+        if self._executor is not None:
+            futures = [
+                self._executor.submit(mujoco.mj_forward, self._mj_model, mj_data)
+                for mj_data in self._mj_datas
+            ]
+            for future in as_completed(futures):
+                future.result()
+        else:
+            for mj_data in self._mj_datas:
+                mujoco.mj_forward(self._mj_model, mj_data)
+
         for om in self.object_managers:
             om.invalidate_data_cache()
 

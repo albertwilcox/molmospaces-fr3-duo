@@ -342,6 +342,12 @@ class BaseMujocoTask(ABC):
         if self._datagen_profiler is not None:
             self._datagen_profiler.end("physics_step")
 
+        # Re-derive position-dependent quantities (geom/cam poses, sensordata) from
+        # the post-integration qpos so the rendered frame and proprioception are
+        # consistent with the saved state (fixes a one-substep render lag). No effect
+        # on dynamics; see CPUMujocoEnv.sync_derived_state.
+        self._env.sync_derived_state()
+
         # Store the action for env 0 for ActionSensors
         self.last_action = actions[0] if actions else None
 

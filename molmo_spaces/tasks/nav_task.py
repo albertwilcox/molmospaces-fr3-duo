@@ -12,6 +12,87 @@ from molmo_spaces.tasks.task import BaseMujocoTask
 log = logging.getLogger(__name__)
 
 
+# Many scene object categories arrive as a single lowercase token with the word
+# boundaries stripped (e.g. "alarmclock", "diningtable", "chestofdrawers"). The
+# per-asset annotation "category" field is inconsistent (some assets store the
+# spaced form, some the concatenated form), so we prettify with an explicit
+# lookup of the known multi-word AI2-THOR / objathor object types the nav task
+# can target. Anything not in the table (already-spaced names, genuine single
+# words like "newspaper"/"basketball") is returned unchanged.
+_OBJECT_NAME_PRETTY: dict[str, str] = {
+    "alarmclock": "alarm clock",
+    "baseballbat": "baseball bat",
+    "butterknife": "butter knife",
+    "cellphone": "cell phone",
+    "chestofdrawers": "chest of drawers",
+    "coffeemachine": "coffee machine",
+    "coffeemaker": "coffee maker",
+    "coffeetable": "coffee table",
+    "compactdisk": "compact disk",
+    "countertop": "counter top",
+    "crapper": "toilet",
+    "creditcard": "credit card",
+    "desklamp": "desk lamp",
+    "diningtable": "dining table",
+    "dishsponge": "dish sponge",
+    "dogbed": "dog bed",
+    "floorlamp": "floor lamp",
+    "garbagebag": "garbage bag",
+    "garbagecan": "garbage can",
+    "handtowel": "hand towel",
+    "handtowelholder": "hand towel holder",
+    "keychain": "key chain",
+    "laundryhamper": "laundry hamper",
+    "lightswitch": "light switch",
+    "papertowelroll": "paper towel roll",
+    "peppershaker": "pepper shaker",
+    "remotecontrol": "remote control",
+    "roomdecor": "room decor",
+    "saltshaker": "salt shaker",
+    "scrubbrush": "scrub brush",
+    "shelvingunit": "shelving unit",
+    "showercurtain": "shower curtain",
+    "showerdoor": "shower door",
+    "showerglass": "shower glass",
+    "showerhead": "shower head",
+    "sidetable": "side table",
+    "sinkbasin": "sink basin",
+    "soapbar": "soap bar",
+    "soapbottle": "soap bottle",
+    "soapdispenser": "soap dispenser",
+    "spraybottle": "spray bottle",
+    "stoveburner": "stove burner",
+    "stoveknob": "stove knob",
+    "tabletopdecor": "table top decor",
+    "tablelamp": "table lamp",
+    "teddybear": "teddy bear",
+    "tennisracket": "tennis racket",
+    "tissuebox": "tissue box",
+    "tissuepaper": "tissue paper",
+    "toiletpaper": "toilet paper",
+    "toiletpaperhanger": "toilet paper hanger",
+    "towelholder": "towel holder",
+    "trashcan": "trash can",
+    "tvstand": "tv stand",
+    "vacuumcleaner": "vacuum cleaner",
+    "wateringcan": "watering can",
+    "winebottle": "wine bottle",
+}
+
+
+def prettify_object_name(name: str) -> str:
+    """Insert word boundaries into concatenated object-type names.
+
+    Looks up the collapsed (spaces removed) form in ``_OBJECT_NAME_PRETTY`` so
+    that both "alarmclock" and an already-spaced "alarm clock" map to the same
+    readable label. Unknown names are returned lowercased and stripped."""
+    if not name:
+        return name
+    cleaned = " ".join(name.split()).strip().lower()
+    collapsed = cleaned.replace(" ", "")
+    return _OBJECT_NAME_PRETTY.get(collapsed, cleaned)
+
+
 class NavToObjTask(BaseMujocoTask):
     """Navigation to object task implementation."""
 
@@ -277,18 +358,11 @@ class NavToObjTask(BaseMujocoTask):
             # Fallback to raw name if natural name lookup fails
             object_name = pickup_obj_name.replace("_", " ").title()
 
-        # Include candidate count if multiple objects
-        num_candidates = (
-            len(self.config.task_config.pickup_obj_candidates)
-            if hasattr(self.config.task_config, "pickup_obj_candidates")
-            and self.config.task_config.pickup_obj_candidates is not None
-            else 1
-        )
+        # Restore word boundaries stripped from concatenated category tokens
+        # (e.g. "alarmclock" -> "alarm clock").
+        object_name = prettify_object_name(object_name)
 
-        if num_candidates > 1:
-            return f"Navigate to any {object_name} ({num_candidates} available)"
-        else:
-            return f"Navigate to the {object_name}"
+        return f"Navigate to the {object_name}"
 
     def _create_sensor_suite_from_config(self, exp_config: MlSpacesExpConfig) -> SensorSuite:
         """Create a sensor suite from configuration using the centralized get_nav_task_sensors function."""
@@ -326,14 +400,21 @@ class NavToObjTask(BaseMujocoTask):
         return max(0.0, center_dist - effective_radius)
 
     def check_object_visible(self, index: int) -> bool:
-        """Check if the nearest navigation object is visible from head camera."""
+        """Check if the nearest navigation object is visible from the success
+        camera(s). ORs over ``visibility_camera_names`` when set (e.g. the
+        shoulder_left/right pair), otherwise uses ``visibility_camera_name``."""
         nearest_obj = self.get_nearest_nav_object(index)
 
-        # Use the registry camera name (e.g. 'head_camera' / 'nav_camera'),
+        # Use the registry camera name(s) (e.g. 'shoulder_left' / 'nav_camera'),
         # not the MJCF name (e.g. 'robot_0/head_camera').
-        camera_name = self.config.task_config.visibility_camera_name
-        visibility = self._env.check_visibility(camera_name, nearest_obj.name)
-        return visibility > 0.0  # Any non-zero visibility fraction
+        camera_names = self.config.task_config.visibility_camera_names
+        if not camera_names:
+            camera_names = [self.config.task_config.visibility_camera_name]
+        min_fraction = float(getattr(self.config.task_config, "min_visible_fraction", 0.0) or 0.0)
+        for camera_name in camera_names:
+            if self._env.check_visibility(camera_name, nearest_obj.name) > min_fraction:
+                return True
+        return False
 
     def get_reward(self) -> np.ndarray:
         """Calculate reward based on distance to target object.

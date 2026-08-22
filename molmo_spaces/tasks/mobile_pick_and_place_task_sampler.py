@@ -168,6 +168,19 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         target_xy = np.asarray(pickup_obj.position)[:2]
         d = np.linalg.norm(free_points[:, :2] - target_xy, axis=1)
         in_band = (d > rmin) & (d < rmax)
+        # Drop cells that are free but sit in a connected free-component
+        # disconnected from the main navigable area: the runtime primary A*
+        # cannot route to them, and the thin fallback planner then wedges the
+        # base short of the goal. Restrict candidates to the largest free
+        # component (the one the far nav-start also occupies).
+        if bool(getattr(sampler_cfg, "ranked_standoff_require_connected", True)):
+            try:
+                conn = self._largest_free_component_mask(thormap, free_points)
+                in_band = in_band & conn
+            except Exception as exc:  # never let the filter crash sampling
+                log.info(
+                    f"[MOBILE PNP] Ranked standoff: connectivity filter skipped ({exc})."
+                )
         cand_xy = free_points[in_band][:, :2]
         cand_d = d[in_band]
         if len(cand_xy) == 0:
@@ -222,6 +235,32 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             f"for {pickup_obj.name}; falling back to random placement."
         )
         return False
+
+    def _largest_free_component_mask(self, thormap, free_points: np.ndarray) -> np.ndarray:
+        """Boolean mask over ``free_points`` keeping only those in the largest
+        connected free-component of the nav-inflated occupancy grid.
+
+        The runtime A* routes over the same nav-inflated free space; cells in a
+        small pocket separated from the main area by furniture/walls are free but
+        unreachable, so a standoff there forces the thin-fallback wedge. The
+        largest component is the main navigable area the far nav-start occupies,
+        so restricting candidates to it keeps every sampled standoff routable.
+        """
+        from scipy.ndimage import label as _cc_label
+
+        occ = np.asarray(thormap.occupancy).astype(bool)
+        labels, n = _cc_label(occ)  # 4-connectivity; labels 1..n, 0 = occupied
+        if n <= 1:
+            return np.ones(len(free_points), dtype=bool)
+        # Largest component by cell count (ignore label 0 = occupied).
+        counts = np.bincount(labels.ravel())
+        counts[0] = 0
+        main_label = int(np.argmax(counts))
+        cand_px = thormap.pos_m_to_px(np.asarray(free_points, dtype=float))
+        h, w = occ.shape
+        rows = np.clip(cand_px[:, 0], 0, h - 1)
+        cols = np.clip(cand_px[:, 1], 0, w - 1)
+        return labels[rows, cols] == main_label
 
     def _arm_move_group_ids_for(self, robot_view) -> list[str]:
         """Arm move groups (arm only; never the holonomic base or the gripper).
@@ -1066,6 +1105,13 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             recep_qadr = int(model.jnt_qposadr[int(model.body_jntadr[recep_id])])
             original_recep_qpos = data.qpos[recep_qadr : recep_qadr + 7].copy()
             original_start_pose = getattr(task_cfg, "place_receptacle_start_pose", None)
+            # Compute the far elevated-surface candidates ONCE for this fixed
+            # pickup position and reuse across every resample try (see
+            # ``_prepare_place_target``): the surface set is invariant to where
+            # the receptacle currently sits, so this removes the per-try re-scan.
+            resample_surface_geoms = self._find_far_elevated_surface_geoms(
+                env, pickup_pos
+            )
             tries = 0
             while standoff is None and tries < n_resample:
                 tries += 1
@@ -1076,6 +1122,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                         pickup_obj_name,
                         pickup_pos,
                         supporting_geom_id,
+                        precomputed_surface_geoms=resample_surface_geoms,
                     ):
                         continue
                 except (ValueError, ObjectPlacementError):
@@ -1671,6 +1718,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         pickup_obj_name: str,
         pickup_obj_pos: np.ndarray,
         supporting_geom_id: int,
+        precomputed_surface_geoms: list[int] | None = None,
     ) -> bool:
         """Stand the place receptacle(s) on an *elevated* surface a real
         navigation distance from the pickup object, so mobile pick-and-place is
@@ -1688,7 +1736,20 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         om = env.object_managers[env.current_batch_index]
 
         if getattr(sampler_cfg, "far_place_on_elevated_surface", True):
-            surface_geoms = self._find_far_elevated_surface_geoms(env, pickup_obj_pos)
+            # The candidate elevated surfaces depend only on the (fixed) scene
+            # furniture and the pickup position, not on where the receptacle is
+            # currently standing. The place-resample loop calls this method up to
+            # ``place_receptacle_resample_tries`` times with an IDENTICAL
+            # ``pickup_obj_pos`` (only the sampled spot ON the surface varies),
+            # so re-running the full scene-geom scan every try is pure waste
+            # (observed 21-56 elevated-surface searches/episode, ~68% of sampling
+            # wall-time). Accept a precomputed list from the caller and reuse it.
+            if precomputed_surface_geoms is not None:
+                surface_geoms = precomputed_surface_geoms
+            else:
+                surface_geoms = self._find_far_elevated_surface_geoms(
+                    env, pickup_obj_pos
+                )
             if surface_geoms and self._place_receptacles_on_surfaces(
                 env, pickup_obj_name, surface_geoms
             ):

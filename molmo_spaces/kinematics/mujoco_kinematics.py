@@ -238,7 +238,11 @@ class MlSpacesKinematics:
                     f"[MlSpacesKinematics][{self._robot_view.name}] IK Jacobian is rank deficient! det(JJ^T)={JJT_det:.0e}"
                 )
 
-            H = J @ J.T + damping * np.eye(J.shape[0])
+            H = J @ J.T
+            # Damped least squares: add ``damping`` to the diagonal in place
+            # rather than allocating ``damping * np.eye(J.shape[0])`` every Newton
+            # iteration (this ran ~300k+ times/episode in the IK hot loop).
+            H.flat[:: H.shape[0] + 1] += damping
             q_dot = J.T @ np.linalg.solve(H, err)
             dq = q_dot * dt
 

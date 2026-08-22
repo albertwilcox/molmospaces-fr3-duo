@@ -298,6 +298,31 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
         candidates = om.get_objects_of_type(self.config.task_sampler_config.pickup_types)
         log.info(f"Found {len(candidates)} candidate nav objects in the scene")
 
+        # Reject physically tiny/thin objects (pens, forks, ...) that are barely
+        # visible in the shoulder cameras and give poor nav-learning signal. An
+        # object is kept only if its SECOND-LARGEST full AABB extent (the smaller
+        # of its two broadside dimensions) is at least ``min_object_size_m``.
+        # ``aabb_size`` is the AABB HALF-extent, so full extent = 2 * aabb_size.
+        min_size = float(getattr(self.config.task_sampler_config, "min_object_size_m", 0.0) or 0.0)
+        if min_size > 0.0 and len(candidates) > 0:
+            kept = []
+            for obj in candidates:
+                try:
+                    full_extents = 2.0 * np.asarray(obj.aabb_size, dtype=float)
+                except Exception:
+                    kept.append(obj)  # can't measure -> don't drop
+                    continue
+                second_largest = float(np.sort(full_extents)[-2])
+                if second_largest >= min_size:
+                    kept.append(obj)
+            n_dropped = len(candidates) - len(kept)
+            if n_dropped > 0:
+                log.info(
+                    f"[nav size filter] dropped {n_dropped}/{len(candidates)} candidate(s) "
+                    f"with second-largest extent < {min_size:.3f} m (too small/thin to be a good nav target)"
+                )
+            candidates = kept
+
         if not len(candidates) > 0:
             log.info("[WARN] No candidate nav objects found in the scene")
             # print all the top-level objects in the scene for debugging

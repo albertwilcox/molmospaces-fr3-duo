@@ -127,9 +127,16 @@ class MoveGroup(ABC):
         """
         self.mj_data.qpos[self._joint_posadr] = joint_pos
 
-    @property
+    @cached_property
     def joint_pos_limits(self) -> np.ndarray:
-        """Joint position limits (min, max) for each joint."""
+        """Joint position limits (min, max) for each joint.
+
+        Cached: derived purely from the immutable model (joint types, limited
+        flags, ranges) which never change for the life of this view. This
+        property is called >1M times per episode from the IK hot loop
+        (``_constrain_state``); recomputing the Python loop every call was a
+        top throughput cost, so the result is memoised per view instance.
+        """
         jnt_range = np.empty((self.pos_dim, 2))
         jnt_range[:, 0] = -np.inf
         jnt_range[:, 1] = np.inf
@@ -567,7 +574,15 @@ class HoloJointsRobotBaseGroup(RobotBaseGroup, SimplyActuatedMoveGroup):
         theta = self.mj_data.qpos[self.mj_model.jnt_qposadr[self._joint_ids[2]]]
         trf[0, 3] = x
         trf[1, 3] = y
-        trf[:2, :2] = R.from_euler("z", theta, degrees=False).as_matrix()[:2, :2]
+        # Direct planar rotation instead of scipy ``R.from_euler("z", theta)``:
+        # this getter is read on every IK Newton iteration (base.pose), and
+        # scipy from_euler was a top inner-loop cost (~640k calls/episode).
+        c = np.cos(theta)
+        s = np.sin(theta)
+        trf[0, 0] = c
+        trf[0, 1] = -s
+        trf[1, 0] = s
+        trf[1, 1] = c
         return trf
 
     @pose.setter

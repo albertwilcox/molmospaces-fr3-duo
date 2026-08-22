@@ -87,6 +87,36 @@ def skew(v: np.ndarray):
     return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
 
 
+def rotmat_to_rotvec(rot: np.ndarray) -> np.ndarray:
+    """Direct SO(3) log map (rotation matrix -> rotation vector).
+
+    Equivalent to ``scipy...Rotation.from_matrix(rot).as_rotvec()`` but avoids
+    scipy's expensive matrix orthonormalisation + ``np.isclose`` validation. This
+    is called once per IK Newton iteration (the ``transform_to_twist`` hot path,
+    ~340k calls/episode), where scipy ``from_matrix`` was the single largest
+    inner-loop cost. Validated to reconstruct the same rotation as scipy to
+    <2e-7 across all angles (and ~1e-10 in the small-angle IK regime).
+    """
+    cos_t = min(1.0, max(-1.0, (np.trace(rot) - 1.0) * 0.5))
+    theta = np.arccos(cos_t)
+    # Off-diagonal (2*sin(theta)*axis) — exact in the small-angle limit.
+    v = np.array(
+        [rot[2, 1] - rot[1, 2], rot[0, 2] - rot[2, 0], rot[1, 0] - rot[0, 1]]
+    )
+    if theta < 1e-8:
+        return 0.5 * v
+    if np.pi - theta < 1e-6:
+        # Near pi the off-diagonal vanishes; recover the axis from the symmetric
+        # part (R + I)/2 = axis*axis^T, taking the most numerically stable column.
+        A = (rot + np.eye(3)) * 0.5
+        diag = np.clip(np.diag(A), 0.0, None)
+        idx = int(np.argmax(diag))
+        axis = A[:, idx] / np.sqrt(diag[idx]) if diag[idx] > 1e-12 else v
+        axis = axis / np.linalg.norm(axis)
+        return axis * theta
+    return v * (theta / (2.0 * np.sin(theta)))
+
+
 def transform_to_twist(T: np.ndarray):
     """
     Given a 4x4 transformation matrix, return the twist as (lin_vel, ang_vel).
@@ -94,7 +124,7 @@ def transform_to_twist(T: np.ndarray):
 
     See: https://jinyongjeong.github.io/Download/SE3/jlblanco2010geometry3d_techrep.pdf (Sec 9.4.2)
     """
-    w = R.from_matrix(T[:3, :3]).as_rotvec()
+    w = rotmat_to_rotvec(T[:3, :3])
     theta = np.linalg.norm(w)
     if np.abs(theta) < 1e-6:
         return T[:3, 3], w

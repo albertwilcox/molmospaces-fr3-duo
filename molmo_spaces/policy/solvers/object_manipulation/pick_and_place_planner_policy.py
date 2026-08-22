@@ -38,6 +38,15 @@ class PickAndPlacePlannerPolicy(BaseObjectManipulationPlannerPolicy):
                 tcp_pos_err_threshold=self.policy_config.tcp_pos_err_threshold,
                 tcp_rot_err_threshold=self.policy_config.tcp_rot_err_threshold,
                 gripper_mg_id=gripper_mg_id,
+                # Defer completion (and thus the gripper close that follows) until
+                # the TCP actually reaches the grasp pose, not merely until the
+                # move's nominal duration elapses. Without this the arm -- slewing
+                # slowly near its reach limit -- could still be up to
+                # ``tcp_pos_err_threshold`` (0.1 m) short when the fingers close,
+                # closing on empty space (the dominant no_verified_grasp miss).
+                converge_pos_tol=getattr(self.policy_config, "grasp_converge_pos_tol", None),
+                converge_rot_tol=getattr(self.policy_config, "grasp_converge_rot_tol", None),
+                converge_max_extra_s=getattr(self.policy_config, "grasp_converge_max_extra_s", 0.0),
                 move_segments=[
                     TCPMoveSegment(
                         name="pregrasp",

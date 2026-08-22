@@ -39,8 +39,10 @@ class NavToObjBaseConfig(MlSpacesExpConfig):
         "elevation": -30.0,
         "lookat": np.array([0.0, 0.0, 0.5]),
     }
-    policy_dt_ms: float = 200.0  # policy time step
-    ctrl_dt_ms: float = 2.0  # control time step
+    policy_dt_ms: float = 50.0  # policy time step -> 20 Hz, matching robocasa's
+    # default control_freq=20. Was 200.0 (5 Hz), which produced coarse ~0.3 m
+    # base jumps per step (teleport-like) far below robocasa's control rate.
+    ctrl_dt_ms: float = 2.0  # control time step (50 is a multiple of 2 -> valid)
     sim_dt_ms: float = 2.0  # simulation time step
     task_horizon: int = 500  # Maximum steps per episode to prevent infinite runs
     record_videos: bool = False  # Whether to record videos of episodes
@@ -162,7 +164,12 @@ class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
     # nav camera for the object-visibility success check.
     task_config: NavToObjTaskConfig = NavToObjTaskConfig(
         task_cls=NavToObjTask,
-        visibility_camera_name="nav_camera",
+        visibility_camera_name="shoulder_left",
+        # Object-visibility success check ORs over BOTH shoulder cameras (robocasa
+        # agentview_left/right rig): a demo counts as success only if the target is
+        # framed in at least one shoulder view. Kills the false positives where the
+        # base reached the goal distance but the object was never on camera.
+        visibility_camera_names=["shoulder_left", "shoulder_right"],
         # Goal is to end within grasping range (the demo precedes a grasp), so a
         # trajectory only counts as success when the base is close to the object,
         # not at the lenient 1.5m default. Combined with
