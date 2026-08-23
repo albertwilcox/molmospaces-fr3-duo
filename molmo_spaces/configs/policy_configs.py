@@ -559,6 +559,28 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # this many consecutive steps (the base is wedged / cannot rotate further),
     # rather than spinning out the full ``pursuit_final_align_max_steps`` budget.
     pursuit_final_align_stall_steps: int = 40
+    # Slew-rate limit (rad/s) on the *commanded* base yaw. The commanded heading
+    # can jump discontinuously step-to-step -- most notably the one-step snap from
+    # the path-following bearing to the fixed final-facing angle at the terminal
+    # phase, and sharp bends in the reference path. Because the base is an
+    # absolute-position servo, such a setpoint jump is applied aggressively within
+    # a single policy step, producing very high yaw jerk in both the recorded
+    # action and the resulting motion. Ramping the commanded yaw toward its target
+    # at no more than this rate spreads large re-orientations over several steps,
+    # yielding a smooth yaw command (a better imitation-learning target) and
+    # smoother base motion. Set <= 0 to disable the limit. 2.0 rad/s (~115 deg/s)
+    # is brisk but smooth; a full ~pi in-place turn takes ~1.6 s (~31 steps at
+    # 20 Hz), comfortably within ``pursuit_final_align_max_steps``.
+    pursuit_max_yaw_rate_rad_s: float = 2.0
+    # Angular-acceleration limit (rad/s^2) on the commanded base yaw, applied on
+    # top of the rate limit. A bare rate cap still steps the yaw velocity from 0
+    # to the cap in a single step at the start/end of a turn, which is itself a
+    # jerk impulse. Bounding the acceleration ramps the velocity up and down
+    # (a trapezoidal yaw-velocity profile with a decel-to-rest approach that
+    # avoids overshoot), so the commanded yaw is C1-smooth and the residual jerk
+    # is bounded by the acceleration step. 4.0 rad/s^2 reaches the 2.0 rad/s rate
+    # cap in ~0.5 s. Set <= 0 to disable the acceleration limit (rate cap only).
+    pursuit_max_yaw_accel_rad_s2: float = 4.0
 
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""

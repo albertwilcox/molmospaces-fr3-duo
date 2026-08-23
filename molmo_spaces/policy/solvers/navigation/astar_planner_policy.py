@@ -802,6 +802,8 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._terminal_steps = 0
         self._align_best_ang_err = np.inf
         self._align_no_improve = 0
+        self._cmd_yaw = None  # continuous slew-limited commanded yaw (see _slew_yaw)
+        self._cmd_yaw_rate = 0.0  # commanded yaw velocity (rad/s), for accel limiting
 
     def build_policy_plan(self, world_waypoints):
         # Build the parent's (x, y, theta) plan, then derive the spatial reference
@@ -823,6 +825,8 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._terminal_steps = 0
         self._align_best_ang_err = np.inf
         self._align_no_improve = 0
+        self._cmd_yaw = None
+        self._cmd_yaw_rate = 0.0
         # Publish the ACTUAL pre-grasp goal pose the follower drives to (plan
         # endpoint + final facing) so the task's goal-pose-reaching success
         # criterion judges arrival on the pose really tracked -- not the raw goal
@@ -833,6 +837,54 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
 
     def _current_yaw(self) -> float:
         return float(R.from_matrix(self.robot_view.base.pose[:3, :3]).as_euler("xyz")[2])
+
+    def _slew_yaw(self, desired: float) -> float:
+        """Rate- and acceleration-limited commanded base yaw toward ``desired``.
+
+        The raw commanded heading can jump discontinuously (the one-step snap to
+        the final-facing angle at the terminal phase, or sharp bends in the
+        reference path). Because the base is an absolute-position servo, such a
+        setpoint jump is applied aggressively within one policy step, producing
+        very high yaw jerk. We instead drive an internal continuous commanded yaw
+        toward ``desired`` with a velocity cap (``pursuit_max_yaw_rate_rad_s``)
+        and, on top of it, an acceleration cap (``pursuit_max_yaw_accel_rad_s2``)
+        so the yaw velocity ramps up/down smoothly and decelerates to rest at the
+        target without overshoot -- a trapezoidal profile. The result is a
+        C1-smooth yaw command (a much better imitation-learning target) and
+        smoother base motion. The ``base.ctrl`` setter re-expresses the wrapped
+        setpoint in a continuous frame, so wrapping here is safe.
+        """
+        cfg = self.config.policy_config
+        max_rate = float(getattr(cfg, "pursuit_max_yaw_rate_rad_s", 0.0))
+        if max_rate <= 0.0:  # disabled -> pass through
+            return float(normalize_ang_error(desired))
+        if self._cmd_yaw is None:  # seed from the actual heading on first command
+            self._cmd_yaw = self._current_yaw()
+            self._cmd_yaw_rate = 0.0
+        dt = float(self.config.policy_dt_ms) / 1000.0
+        err = float(normalize_ang_error(desired - self._cmd_yaw))
+        max_accel = float(getattr(cfg, "pursuit_max_yaw_accel_rad_s2", 0.0))
+        if max_accel <= 0.0:
+            # Rate cap only: step directly toward the target, bounded by max_rate.
+            step = float(np.clip(err, -max_rate * dt, max_rate * dt))
+            self._cmd_yaw += step
+            self._cmd_yaw_rate = step / dt
+            return float(normalize_ang_error(self._cmd_yaw))
+        # Trapezoidal profile: target the largest speed we can still decelerate
+        # from to arrive at rest on the target (sqrt(2*a*|err|)), capped by
+        # max_rate; then bound the per-step change in velocity by max_accel.
+        v_desired = np.sign(err) * min(max_rate, float(np.sqrt(2.0 * max_accel * abs(err))))
+        dv = float(np.clip(v_desired - self._cmd_yaw_rate, -max_accel * dt, max_accel * dt))
+        self._cmd_yaw_rate += dv
+        # Don't step past the target within this tick.
+        step = float(np.clip(self._cmd_yaw_rate * dt, -abs(err), abs(err)))
+        self._cmd_yaw += step
+        # If the overshoot guard shortened the step, sync the stored velocity to
+        # what actually moved so a stale high rate doesn't cause an acceleration
+        # spike on the next tick (keeps the arrival deceleration smooth).
+        if abs(step) < abs(self._cmd_yaw_rate * dt):
+            self._cmd_yaw_rate = step / dt
+        return float(normalize_ang_error(self._cmd_yaw))
 
     def _project_arclength(self, point: np.ndarray) -> float:
         """Arc-length of the closest point on the reference polyline to ``point``."""
@@ -917,7 +969,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
                     f" finishing at step {self.task.num_steps_taken()}."
                 )
                 return self._build_done_action()
-            return {"done": False, "base": np.array([final_xy[0], final_xy[1], self._final_face_theta])}
+            return {"done": False, "base": np.array([final_xy[0], final_xy[1], self._slew_yaw(self._final_face_theta)])}
 
         if self._stall_steps > cfg.pursuit_max_stall_steps:
             log.warning(
@@ -934,4 +986,4 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         else:
             heading = self._final_face_theta
         self._reached_waypoints += 1
-        return {"done": False, "base": np.array([carrot[0], carrot[1], heading])}
+        return {"done": False, "base": np.array([carrot[0], carrot[1], self._slew_yaw(heading)])}
