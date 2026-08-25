@@ -118,12 +118,23 @@ class NavToObjBaseConfig(MlSpacesExpConfig):
         task_cls_str: str | None = None
 
 
-# Compact "tucked" arm pose for the single-arm Mobile Franka while it navigates.
-# Reused from the Franka CAP robot config (a shipped, known-valid pose): the
-# shoulder is pulled back and the elbow folded so the end-effector stays close
-# to the base footprint and won't clip doorways/furniture during navigation.
+# "Tucked" arm pose for the single-arm Mobile Franka while it navigates, matched
+# to RoboCasa's nav (agentview) arm pose so the gripper/wrist sits in the same
+# place in the shoulder cameras as the RoboCasa data we cotrain/eval against
+# (removes a visual OOD gap; the previous CAP-derived pose flexed the wrist ~34
+# deg differently at j5 and ~15 deg at j6). 7-DoF joint targets (rad):
+#   RoboCasa nav mean = [-0.040, -1.494, -0.042, -2.372, 0.023, 1.429, 0.708]
 # NOTE: validate visually in the spike before large runs; tune if it clips.
-MOBILE_FRANKA_RETRACTED_ARM_QPOS: list[float] = [0.0, -1.5, 0.116, -2.45, 0.0, 0.842, 0.965]
+MOBILE_FRANKA_RETRACTED_ARM_QPOS: list[float] = [-0.040, -1.494, -0.042, -2.372, 0.023, 1.429, 0.708]
+
+# Per-joint arm init-noise (rad) so the arm is not unnaturally frozen (RoboCasa's
+# nav arm carries real per-joint variation ~0.24-0.61 rad). Kept conservative
+# relative to the full RoboCasa spread: the nav policy never re-commands the arm,
+# so this offset persists for the whole episode -- too much swings the arm out of
+# the compact footprint and clips furniture/doorways mid-nav (base-placement and
+# stall failures). Larger on the wrist (in-frame, low collision risk), smaller on
+# the shoulder/elbow that govern reach.
+MOBILE_FRANKA_NAV_ARM_QPOS_NOISE: list[float] = [0.05, 0.10, 0.10, 0.10, 0.15, 0.20, 0.20]
 
 
 class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
@@ -131,8 +142,9 @@ class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
 
     Same ``franka_droid`` embodiment as the manipulation pipeline mounted on a
     holonomic mobile base. During navigation the arm is held in a fixed,
-    retracted pose (zero arm init noise + the nav policy never commands the arm),
-    so the only commanded degrees of freedom are the base (x, y, yaw).
+    retracted pose (small per-episode arm init noise + the nav policy never
+    commands the arm), so the only commanded degrees of freedom are the base
+    (x, y, yaw).
     """
 
     task_type: str = "nav_to_obj"
@@ -151,9 +163,11 @@ class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
             "arm": MOBILE_FRANKA_RETRACTED_ARM_QPOS,
             "gripper": [0.00296, 0.00296],  # closed
         },
-        # Zero arm noise => the arm starts identically every episode and, since
-        # the nav policy only commands the base, it stays fixed throughout.
-        init_qpos_noise_range={"arm": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        # Small per-joint arm init noise (was zeroed) so the tucked arm carries
+        # natural variation like the RoboCasa nav data instead of being pinned to
+        # one exact pose. The nav policy still never commands the arm, so this
+        # sampled offset simply persists for the episode.
+        init_qpos_noise_range={"arm": MOBILE_FRANKA_NAV_ARM_QPOS_NOISE},
     )
 
     # Sensible standalone default; the eiger datagen pipeline overrides this with
@@ -198,6 +212,13 @@ class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
         # approach instead of driving forward then spinning in place. Produces
         # natural mixed translate+strafe motion (nonzero egocentric v_y actions).
         nav_enable_strafe=True,
+        # Engage strafing earlier along the approach (default 1.5m) so a larger
+        # fraction of the trajectory carries lateral (v_y) motion -- our nav data
+        # under-uses strafing vs the RoboCasa target (side |mean| ~0.19 vs ~0.40).
+        # The no-backward feasibility cone still self-limits this: far from the
+        # goal the travel/target-facing angle usually exceeds the cone, so strafe
+        # only actually fires once reasonably aligned. No backward motion results.
+        strafe_face_target_within_m=2.5,
     )
 
     task_sampler_config: NavToObjTaskSamplerConfig = NavToObjTaskSamplerConfig(

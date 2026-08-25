@@ -978,11 +978,18 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
             )
             return self._build_done_action()
 
-        # Look-ahead carrot along the path; command the base toward it.
+        # Look-ahead carrot along the path; command the base POSITION toward it.
         carrot = self._point_at_arclength(s_proj + cfg.pursuit_lookahead_m)
-        delta = carrot - cur_xy
-        if np.linalg.norm(delta) > 1e-6:
-            travel_heading = float(np.arctan2(delta[1], delta[0]))
+        # Commanded FACING is derived from a separate, longer look-ahead so the
+        # holonomic base "looks where it is going" a bit further out instead of
+        # chasing the short position carrot's hypersensitive bearing (which caused
+        # a large yaw oscillation). Fall back to the position carrot if the longer
+        # look-ahead knob is unset.
+        head_ahead = float(getattr(cfg, "pursuit_heading_lookahead_m", 0.0) or 0.0)
+        head_pt = self._point_at_arclength(s_proj + head_ahead) if head_ahead > cfg.pursuit_lookahead_m else carrot
+        head_delta = head_pt - cur_xy
+        if np.linalg.norm(head_delta) > 1e-6:
+            travel_heading = float(np.arctan2(head_delta[1], head_delta[0]))
         else:
             travel_heading = self._final_face_theta
         heading = self._strafe_heading(travel_heading, remaining)

@@ -541,6 +541,18 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # projection onto the path, so the base never wedges on an unreachable setpoint.
     use_pure_pursuit: bool = False
     pursuit_lookahead_m: float = 0.4  # look-ahead distance along the path
+    # Separate, longer look-ahead (m) used ONLY to compute the commanded *facing*
+    # (base yaw), decoupled from the position carrot above. The base is holonomic
+    # -- it slides in world x, y toward the position carrot regardless of which way
+    # it faces -- so the yaw is purely a "look" direction. Deriving it from the
+    # short 0.4 m position carrot made the facing bearing hypersensitive to tiny
+    # lateral tracking errors: the carrot bearing swung 100-190 deg and the
+    # slew-limited yaw chased it, producing a large, sustained yaw oscillation in
+    # the recorded motion. Aiming the facing at a point ~1.2 m ahead on the path
+    # (which moves smoothly as the base advances) makes the robot simply "look
+    # where it is going" a bit further out, eliminating the oscillation without
+    # loosening position/obstacle tracking (that still uses the short carrot).
+    pursuit_heading_lookahead_m: float = 1.2
     pursuit_goal_tol_m: float = 0.12  # arc-length remaining (m) that counts as "at end"
     pursuit_final_align_tol_rad: float = float(np.deg2rad(8))  # final-facing tolerance
     pursuit_max_stall_steps: int = 30  # steps without arc-length progress before aborting
@@ -592,18 +604,26 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # the travel bearing toward the final target-facing heading, letting the base
     # SIDLE (strafe) into the standoff while already facing the object. This
     # removes the terminal spin and yields natural mixed translate+strafe motion
-    # (nonzero egocentric v_y in the recorded actions). To avoid driving blindly
-    # backward, the strafe is only engaged while the lateral offset between the
-    # travel bearing and the target-facing heading stays within
-    # ``strafe_max_lateral_angle_rad``; beyond that (target roughly behind the
-    # motion) the base keeps facing its travel direction. Default False preserves
+    # (nonzero egocentric v_y in the recorded actions). Backward travel is
+    # actively avoided: because the base's forward cameras cannot observe where it
+    # is going when moving backward, the strafe is only engaged while the target-
+    # facing heading stays within ``strafe_max_lateral_angle_rad`` of the travel
+    # (carrot) bearing. Keeping this at or below 90 deg guarantees the commanded
+    # motion always has a non-negative forward component (at 90 deg it is pure
+    # sideways, cos=0; below it there is always some forward component), so the
+    # base never drives blindly backward. When the target sits further behind the
+    # motion than the cone, the base keeps facing its travel direction (pure
+    # forward driving) and does any remaining re-facing as an in-place terminal
+    # rotation (zero translation, hence still observable). Default False preserves
     # the historical forward-only behaviour.
     nav_enable_strafe: bool = False
     # Arc-length remaining (m) at which the strafe-in blend begins (0 => disabled).
     strafe_face_target_within_m: float = 1.5
-    # Max |travel bearing - target facing| (rad) for which strafing is allowed;
-    # beyond this the base yaws to face travel instead of strafing backward.
-    strafe_max_lateral_angle_rad: float = float(np.deg2rad(100))
+    # Max |travel bearing - target facing| (rad) for which strafing is engaged.
+    # MUST stay <= pi/2 to forbid backward motion (see note above); 80 deg leaves
+    # a forward-component margin (cos 80 deg ~= 0.17) while still allowing generous
+    # sideways strafing.
+    strafe_max_lateral_angle_rad: float = float(np.deg2rad(80))
 
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""
