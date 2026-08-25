@@ -982,8 +982,38 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         carrot = self._point_at_arclength(s_proj + cfg.pursuit_lookahead_m)
         delta = carrot - cur_xy
         if np.linalg.norm(delta) > 1e-6:
-            heading = float(np.arctan2(delta[1], delta[0]))
+            travel_heading = float(np.arctan2(delta[1], delta[0]))
         else:
-            heading = self._final_face_theta
+            travel_heading = self._final_face_theta
+        heading = self._strafe_heading(travel_heading, remaining)
         self._reached_waypoints += 1
         return {"done": False, "base": np.array([carrot[0], carrot[1], self._slew_yaw(heading)])}
+
+    def _strafe_heading(self, travel_heading: float, remaining: float) -> float:
+        """Commanded base yaw for a carrot-following step.
+
+        Default (strafe disabled): return ``travel_heading`` so the holonomic base
+        yaws to face its direction of travel and drives forward, as before.
+
+        Strafe enabled: within ``strafe_face_target_within_m`` arc-length of the
+        goal, progressively blend the commanded heading from the travel bearing
+        toward the final target-facing heading (``_final_face_theta``), so the base
+        sidles/strafes into the standoff while already facing the object instead of
+        driving forward and then spinning in place. The blend is gated by a
+        feasibility cone (``strafe_max_lateral_angle_rad``): if facing the target
+        would require the base to travel more than that angle off its heading
+        (target roughly behind the motion), keep facing travel so the base never
+        drives blindly backward. ``_slew_yaw`` still rate/accel-limits the result.
+        """
+        cfg = self.config.policy_config
+        if not getattr(cfg, "nav_enable_strafe", False):
+            return travel_heading
+        activate = float(getattr(cfg, "strafe_face_target_within_m", 0.0))
+        if activate <= 0.0 or remaining > activate:
+            return travel_heading
+        face = self._final_face_theta
+        lateral = abs(normalize_ang_error(face - travel_heading))
+        if lateral > float(getattr(cfg, "strafe_max_lateral_angle_rad", np.pi)):
+            return travel_heading
+        alpha = float(np.clip((activate - remaining) / activate, 0.0, 1.0))
+        return float(travel_heading + alpha * normalize_ang_error(face - travel_heading))

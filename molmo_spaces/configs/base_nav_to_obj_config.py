@@ -194,6 +194,10 @@ class MobileFrankaNavToObjConfig(NavToObjBaseConfig):
         # Closed-loop carrot follower: robust to controller lag / unreachable
         # setpoints, which was the dominant open-loop nav stall mode.
         use_pure_pursuit=True,
+        # Sidle (strafe) into the standoff while facing the target on the final
+        # approach instead of driving forward then spinning in place. Produces
+        # natural mixed translate+strafe motion (nonzero egocentric v_y actions).
+        nav_enable_strafe=True,
     )
 
     task_sampler_config: NavToObjTaskSamplerConfig = NavToObjTaskSamplerConfig(

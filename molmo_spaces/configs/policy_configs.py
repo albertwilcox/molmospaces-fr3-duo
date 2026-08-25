@@ -582,6 +582,29 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # cap in ~0.5 s. Set <= 0 to disable the acceleration limit (rate cap only).
     pursuit_max_yaw_accel_rad_s2: float = 4.0
 
+    # --- Strafing (holonomic lateral motion) -----------------------------------
+    # The holonomic base can translate in any direction independently of its
+    # heading, but the pure-pursuit follower normally commands the heading to the
+    # travel (carrot) bearing every step, so the base always drives "forward" and
+    # only faces the target via a large terminal in-place spin. When
+    # ``nav_enable_strafe`` is True, within ``strafe_face_target_within_m``
+    # arc-length of the goal the commanded heading is progressively blended from
+    # the travel bearing toward the final target-facing heading, letting the base
+    # SIDLE (strafe) into the standoff while already facing the object. This
+    # removes the terminal spin and yields natural mixed translate+strafe motion
+    # (nonzero egocentric v_y in the recorded actions). To avoid driving blindly
+    # backward, the strafe is only engaged while the lateral offset between the
+    # travel bearing and the target-facing heading stays within
+    # ``strafe_max_lateral_angle_rad``; beyond that (target roughly behind the
+    # motion) the base keeps facing its travel direction. Default False preserves
+    # the historical forward-only behaviour.
+    nav_enable_strafe: bool = False
+    # Arc-length remaining (m) at which the strafe-in blend begins (0 => disabled).
+    strafe_face_target_within_m: float = 1.5
+    # Max |travel bearing - target facing| (rad) for which strafing is allowed;
+    # beyond this the base yaws to face travel instead of strafing backward.
+    strafe_max_lateral_angle_rad: float = float(np.deg2rad(100))
+
     def model_post_init(self, __context) -> None:
         """Set policy_cls after initialization to avoid circular imports."""
         super().model_post_init(__context)
