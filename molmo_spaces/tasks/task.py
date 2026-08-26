@@ -14,6 +14,7 @@ Action Noise:
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +51,13 @@ class BaseMujocoTask(ABC):
             )
         self._n_sim_steps_per_ctrl = int(self._ctrl_dt_ms // sim_dt_ms)
         self._n_ctrl_steps_per_policy = int(exp_config.policy_dt_ms // self._ctrl_dt_ms)
+        # Render decimation: render dataset camera frames only every k-th policy
+        # step (k = MLSPACES_DATAGEN_RENDER_STRIDE, default 1 = every step). Other
+        # steps reuse the last rendered frame, so RGB is captured at
+        # policy_freq / k while actions + proprioception stay at policy_freq. The
+        # timestamp-based eiger loader resamples each modality independently, so
+        # sub-control-rate RGB is a supported case.
+        self._render_stride = max(1, int(os.environ.get("MLSPACES_DATAGEN_RENDER_STRIDE", "1")))
         self._task_horizon = (
             exp_config.task_horizon if exp_config.task_horizon is not None else np.inf
         )
@@ -219,6 +227,9 @@ class BaseMujocoTask(ABC):
         self.episode_step_count = 0
         self._cumulative_reward = np.zeros(self._env.n_batch)
         self._num_steps_taken = np.zeros(self._env.n_batch, dtype=int)
+        # Ensure the reset (and first) observation renders a fresh frame rather
+        # than reusing a render-cache entry left over from the previous episode.
+        self._env.set_skip_render(False)
 
         # Action tracking for ActionSensors
         self.last_action = None
@@ -352,6 +363,12 @@ class BaseMujocoTask(ABC):
         self.last_action = actions[0] if actions else None
 
         # Sensor polling (cameras, proprioception, etc.)
+        if self._render_stride > 1:
+            # Render dataset frames only every k-th policy step; intermediate
+            # steps reuse the last rendered frame (see BaseMujocoEnv render cache).
+            # episode_step_count was incremented above, so step 1 renders.
+            render_now = (self.episode_step_count - 1) % self._render_stride == 0
+            self._env.set_skip_render(not render_now)
         if self._datagen_profiler is not None:
             self._datagen_profiler.start("sensor_polling")
         observation, reward, terminated, truncated, info = self.get_and_cache_all_step_information()

@@ -66,6 +66,15 @@ class BaseMujocoEnv(ABC):
         # rendered later. Segmentation renders (scene acceptance) are unaffected.
         self._no_render = os.environ.get("MLSPACES_DATAGEN_NO_RENDER", "0") == "1"
         self._render_wh: tuple[int, int] | None = None
+        # Render decimation: when a step is marked skip, dataset RGB/depth frames
+        # reuse the most recently rendered frame per camera instead of issuing a
+        # fresh (expensive) MuJoCo render. This lets RGB be captured at a lower
+        # rate than the control frequency (e.g. 4 fps video vs 20 Hz actions)
+        # while physics + proprioception still step at full rate. The stride is
+        # driven by the task (see MLSPACES_DATAGEN_RENDER_STRIDE).
+        self._skip_render_this_step = False
+        self._rgb_frame_cache: dict[str, np.ndarray] = {}
+        self._depth_frame_cache: dict[str, np.ndarray] = {}
 
     def is_loaded(self) -> bool:
         """Check if a scene is currently loaded."""
@@ -304,6 +313,16 @@ class CPUMujocoEnv(BaseMujocoEnv):
         self.mj_model.vis.global_.fovy = prev_fov  # set global fov back
         return frame
 
+    def set_skip_render(self, skip: bool) -> None:
+        """Mark whether dataset RGB/depth renders for this step should be skipped.
+
+        When ``skip`` is True, :meth:`render_rgb_frame` / :meth:`render_depth_frame`
+        return the last rendered frame for each camera (cached) instead of issuing
+        a fresh MuJoCo render. Used to decimate the render rate below the control
+        frequency without affecting physics or proprioception.
+        """
+        self._skip_render_this_step = skip
+
     def render_rgb_frame(self, camera_name: str) -> np.ndarray:
         """Renders an RGB frame from the perspective of the specified camera."""
         if camera_name not in self.camera_manager.registry:
@@ -313,10 +332,15 @@ class CPUMujocoEnv(BaseMujocoEnv):
             w, h = self._render_wh or (640, 480)
             return np.zeros((h, w, 3), dtype=np.uint8)
 
+        if self._skip_render_this_step and camera_name in self._rgb_frame_cache:
+            return self._rgb_frame_cache[camera_name]
+
         camera = self.camera_manager.registry[camera_name]
-        return self._render_frame(
+        frame = self._render_frame(
             camera.pos, camera.forward, camera.up, camera.fov, segmentation=False
         )
+        self._rgb_frame_cache[camera_name] = frame
+        return frame
 
     def render_depth_frame(self, camera_name: str) -> np.ndarray:
         """Renders a depth frame from the perspective of the specified camera.
@@ -334,13 +358,18 @@ class CPUMujocoEnv(BaseMujocoEnv):
             w, h = self._render_wh or (640, 480)
             return np.zeros((h, w), dtype=np.float32)
 
+        if self._skip_render_this_step and camera_name in self._depth_frame_cache:
+            return self._depth_frame_cache[camera_name]
+
         camera = self.camera_manager.registry[camera_name]
         depth_frame = self._render_frame(
             camera.pos, camera.forward, camera.up, camera.fov, depth=True
         )
 
         # Return raw depth in meters (encoding to RGB happens at save time)
-        return depth_frame.astype(np.float32)
+        depth_frame = depth_frame.astype(np.float32)
+        self._depth_frame_cache[camera_name] = depth_frame
+        return depth_frame
 
     def render_segmentation_frame(self, camera_name: str) -> np.ndarray:
         """Renders a segmentation frame from the perspective of the specified camera."""
