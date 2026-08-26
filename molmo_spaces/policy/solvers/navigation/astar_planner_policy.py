@@ -804,6 +804,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._align_no_improve = 0
         self._cmd_yaw = None  # continuous slew-limited commanded yaw (see _slew_yaw)
         self._cmd_yaw_rate = 0.0  # commanded yaw velocity (rad/s), for accel limiting
+        self._cmd_xy = None  # continuous speed-limited commanded (x, y) (see _slew_xy)
 
     def build_policy_plan(self, world_waypoints):
         # Build the parent's (x, y, theta) plan, then derive the spatial reference
@@ -827,6 +828,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         self._align_no_improve = 0
         self._cmd_yaw = None
         self._cmd_yaw_rate = 0.0
+        self._cmd_xy = None
         # Publish the ACTUAL pre-grasp goal pose the follower drives to (plan
         # endpoint + final facing) so the task's goal-pose-reaching success
         # criterion judges arrival on the pose really tracked -- not the raw goal
@@ -885,6 +887,57 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
         if abs(step) < abs(self._cmd_yaw_rate * dt):
             self._cmd_yaw_rate = step / dt
         return float(normalize_ang_error(self._cmd_yaw))
+
+    def _slew_xy(self, desired_xy: np.ndarray) -> np.ndarray:
+        """Speed-limited commanded base (x, y) toward ``desired_xy``.
+
+        Planar analogue of :meth:`_slew_yaw`. The holonomic base is an absolute-
+        POSITION servo whose per-step motion saturates at the actuator velocity
+        limit (~2.1 m/s), so commanding the far look-ahead carrot directly drives
+        the base far faster than RoboCasa's real nav cruise. We instead advance an
+        internal commanded position toward the carrot by at most
+        ``pursuit_max_speed_m_s * dt`` per step (this advance rate is what caps the
+        recorded per-step displacement, and hence ``action.base_velocity``, at the
+        target speed). Separately, the internal setpoint is allowed to LEAD the true
+        base pose by up to ``pursuit_max_lead_m`` (>> one step): this preserves the
+        servo push-through force ``kp * lead`` so the base can reach cruise speed and
+        drive through friction/minor obstacles instead of stalling, while staying
+        small enough that unwedge catch-up stays below the teleport detector's cap.
+        The cap naturally yields a cruise-then-decelerate profile: far from the goal
+        the carrot is always > one step away so the base cruises at the cap, and
+        near the goal the shrinking carrot distance lets it brake below the cap.
+        Set ``pursuit_max_speed_m_s <= 0`` to pass the carrot through unmodified.
+        """
+        cfg = self.config.policy_config
+        desired_xy = np.asarray(desired_xy, dtype=np.float64)
+        max_speed = float(getattr(cfg, "pursuit_max_speed_m_s", 0.0) or 0.0)
+        if max_speed <= 0.0:  # disabled -> pass through
+            return desired_xy
+        dt = float(self.config.policy_dt_ms) / 1000.0
+        max_step = max_speed * dt
+        # Anti-windup lead cap: allow the setpoint to lead the true pose by more
+        # than one step so the servo keeps push-through force AND can reach the
+        # cruise speed, but bound it so unwedge catch-up stays sub-teleport.
+        max_lead = max(float(getattr(cfg, "pursuit_max_lead_m", 0.0) or 0.0), max_step)
+        cur_xy = self.robot_view.base.pose[:2, 3].astype(np.float64)
+        if self._cmd_xy is None:  # seed from the actual base position on first command
+            self._cmd_xy = cur_xy.copy()
+        # Anti-windup: never let the internal setpoint lead the ACTUAL base by more
+        # than ``max_lead``. If the base stalls (obstacle) while the carrot keeps
+        # advancing, an unclamped setpoint would run arbitrarily far ahead and then
+        # command a large jump once the base frees -- exactly the teleport we are
+        # removing. Pulling the setpoint back to within ``max_lead`` of the true
+        # pose keeps this a bounded velocity command regardless of tracking error.
+        lead = self._cmd_xy - cur_xy
+        lead_dist = float(np.linalg.norm(lead))
+        if lead_dist > max_lead:
+            self._cmd_xy = cur_xy + lead * (max_lead / lead_dist)
+        delta = desired_xy - self._cmd_xy
+        dist = float(np.linalg.norm(delta))
+        if dist > max_step:
+            delta = delta * (max_step / dist)
+        self._cmd_xy = self._cmd_xy + delta
+        return self._cmd_xy
 
     def _project_arclength(self, point: np.ndarray) -> float:
         """Arc-length of the closest point on the reference polyline to ``point``."""
@@ -969,7 +1022,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
                     f" finishing at step {self.task.num_steps_taken()}."
                 )
                 return self._build_done_action()
-            return {"done": False, "base": np.array([final_xy[0], final_xy[1], self._slew_yaw(self._final_face_theta)])}
+            return {"done": False, "base": np.array([*self._slew_xy(final_xy), self._slew_yaw(self._final_face_theta)])}
 
         if self._stall_steps > cfg.pursuit_max_stall_steps:
             log.warning(
@@ -994,7 +1047,7 @@ class PurePursuitNavToObjPolicy(AStarSmoothPlannerPolicy):
             travel_heading = self._final_face_theta
         heading = self._strafe_heading(travel_heading, remaining)
         self._reached_waypoints += 1
-        return {"done": False, "base": np.array([carrot[0], carrot[1], self._slew_yaw(heading)])}
+        return {"done": False, "base": np.array([*self._slew_xy(carrot), self._slew_yaw(heading)])}
 
     def _strafe_heading(self, travel_heading: float, remaining: float) -> float:
         """Commanded base yaw for a carrot-following step.

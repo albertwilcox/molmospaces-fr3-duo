@@ -593,6 +593,32 @@ class AStarNavToObjPolicyConfig(NavToObjPlannerPolicyConfig):
     # is bounded by the acceleration step. 4.0 rad/s^2 reaches the 2.0 rad/s rate
     # cap in ~0.5 s. Set <= 0 to disable the acceleration limit (rate cap only).
     pursuit_max_yaw_accel_rad_s2: float = 4.0
+    # Translational speed cap (m/s) on the *commanded* base (x, y) position, the
+    # planar analogue of ``pursuit_max_yaw_rate_rad_s``. The holonomic base is an
+    # absolute-POSITION servo whose per-step motion saturates at the actuator's
+    # velocity limit (~2.1 m/s), NOT at the intended cruise speed. Commanding the
+    # far look-ahead carrot every step therefore drives the base at ~2.1 m/s --
+    # ~3x RoboCasa's real nav cruise (~0.5-0.7 m/s) and above the teleport
+    # detector's 1.5 m/s physical-plausibility cap, so nearly every episode was
+    # (correctly) flagged as a base teleport and the visuomotor scale seen by the
+    # policy was ~3x too fast. We instead advance an internal commanded position
+    # toward the carrot at no more than this speed (``_slew_xy``), so the recorded
+    # per-step base displacement -- and thus ``action.base_velocity`` -- matches
+    # RoboCasa. 0.70 m/s equals the RoboCasa loader's saturation speed
+    # (loader +-1 == 0.704 m/s), giving a genuine cruise-then-decelerate profile
+    # as the carrot distance shrinks near the goal. Set <= 0 to disable the cap.
+    pursuit_max_speed_m_s: float = 0.70
+
+    # Anti-windup lead cap for ``_slew_xy`` (metres). The holonomic base is a
+    # stiff position servo whose force is ``kp * (setpoint - pose)``; the internal
+    # commanded setpoint must be allowed to LEAD the true base pose by this much so
+    # the servo keeps enough authority to (a) actually reach the ``pursuit_max_speed_m_s``
+    # cruise speed and (b) push through friction/obstacles without stalling. It is
+    # kept small so that when the base wedges and later frees, the catch-up motion
+    # stays below the teleport detector's 1.5 m/s cap (0.07 m / 0.05 s = 1.4 m/s).
+    # Too small (e.g. == one step) starves the servo -> the base crawls and stalls;
+    # too large re-introduces teleport-on-unwedge. Must be > pursuit_max_speed_m_s*dt.
+    pursuit_max_lead_m: float = 0.07
 
     # --- Strafing (holonomic lateral motion) -----------------------------------
     # The holonomic base can translate in any direction independently of its
