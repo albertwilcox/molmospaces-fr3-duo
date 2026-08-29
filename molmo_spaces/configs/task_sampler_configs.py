@@ -319,3 +319,42 @@ class NavToObjTaskSamplerConfig(ObjectCentricTaskSamplerConfig):
     # cameras and give the nav policy poor learning signal, while keeping normal
     # graspables (mugs, cans, bowls, boxes, fruit). 0.0 disables the filter.
     min_object_size_m: float = 0.0
+
+    # --- "Wall-between" placement bias (occluded-target navigation) -----------
+    # When True, reject sampled robot placements that have a clear line of sight
+    # to the target and keep only placements where a solid wall/obstacle lies on
+    # the straight segment between the robot and the target (the target is
+    # "on the other side of a wall"). The A* planner must then route around the
+    # wall, producing the hard occluded-target trajectories the policy otherwise
+    # rarely sees (~2-3% of the default distribution). Combine with
+    # ``face_target=True`` to spawn the robot literally facing the blocking wall.
+    # Off by default -> unchanged behaviour.
+    require_wall_between: bool = False
+    # Max placement resamples spent trying to satisfy the wall-between predicate
+    # before falling back (see ``wall_between_fallback``) for a given task.
+    # Genuine go-around placements are intrinsically rare (~2% of random draws),
+    # so a large budget is needed for reliable yield: at ratio>=1.3 (~2% hit
+    # rate) 150 attempts finds one ~96% of the time vs ~57% at 40.
+    wall_between_max_attempts: int = 150
+    # Minimum geodesic-to-straight-line distance ratio for a placement to count
+    # as "target on the other side of a wall". The robot must route around a
+    # wall so its shortest obstacle-avoiding path is at least this many times the
+    # straight-line distance to the target. Ratio and straight-line distance are
+    # both measured between the same snapped free cells so geodesic >= euclid
+    # always holds. ~1.3 selects genuine go-arounds while keeping enough yield
+    # to bias the dataset (baseline median is ~1.05; only ~2% of placements
+    # reach 1.3).
+    wall_between_min_geodesic_ratio: float = 1.3
+    # Upper bound on the go-around ratio. Placements whose nearest-instance
+    # geodesic exceeds this are rejected: the oracle navigation policy times out
+    # on very long detours to a far instance, yielding nothing and stalling the
+    # house. Keeps the accepted go-arounds genuine but ACHIEVABLE.
+    wall_between_max_geodesic_ratio: float = 2.5
+    # Spawn distance band (m) for wall-between placements. ``None`` reuses the
+    # task's default ``base_pose_sampling_radius_range``. A tighter band (e.g.
+    # (3.0, 10.0)) keeps go-arounds achievable for the oracle nav, raising yield.
+    wall_between_sampling_radius_range: tuple[float, float] | None = (3.0, 10.0)
+    # If no wall-between placement is found within ``wall_between_max_attempts``,
+    # keep the last collision-free placement anyway (True) so per-house yield is
+    # never reduced, or reject the task (False). Defaults to yield-preserving.
+    wall_between_fallback: bool = True

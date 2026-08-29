@@ -341,6 +341,130 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
 
         return candidates
 
+    def _snap_to_free(self, free_ds: np.ndarray, cell: tuple[int, int], max_r: int = 8):
+        """Return the nearest free cell to ``cell`` in the downsampled grid.
+
+        The requested cell (robot footprint / object-on-furniture) is often
+        occupied; ring-search outward for the closest free cell so the geodesic
+        planner has valid endpoints. Returns None if none within ``max_r``.
+        """
+        h, w = free_ds.shape
+        r0, c0 = cell
+        r0 = int(np.clip(r0, 0, h - 1))
+        c0 = int(np.clip(c0, 0, w - 1))
+        if free_ds[r0, c0]:
+            return (r0, c0)
+        for rad in range(1, max_r + 1):
+            lo_r, hi_r = max(0, r0 - rad), min(h, r0 + rad + 1)
+            lo_c, hi_c = max(0, c0 - rad), min(w, c0 + rad + 1)
+            sub = free_ds[lo_r:hi_r, lo_c:hi_c]
+            if sub.any():
+                rr, cc = np.argwhere(sub).T
+                d = np.abs(rr - (r0 - lo_r)) + np.abs(cc - (c0 - lo_c))
+                k = int(np.argmin(d))
+                return (lo_r + int(rr[k]), lo_c + int(cc[k]))
+        return None
+
+    def _detour_ratio(
+        self,
+        robot_pos: np.ndarray,
+        target_pos: np.ndarray,
+        min_ratio: float,
+    ) -> float:
+        """Geodesic-to-straight-line distance ratio between robot and target.
+
+        Computes the geodesic (obstacle-avoiding) shortest-path distance between
+        the robot and target on the cached per-house occupancy map and returns
+        its ratio to the straight-line distance. A large ratio (>= ``min_ratio``)
+        means a wall/large obstacle lies between them and the planner has to go
+        around it -- i.e. the target is "on the other side of a wall". This is
+        far more reliable than a line-of-sight test, which also trips on small
+        furniture the planner merely skirts (negligible detour).
+
+        Occupancy cells are True=free / False=occupied. Doorway paths are cleared
+        in the map, so the geodesic routes through real doors. Returns ``0.0``
+        (fail-open, i.e. "no detour") on any error or when no route exists, so
+        the caller degrades to standard placement. ``min_ratio`` is used only for
+        the optional debug log annotation.
+        """
+        thormap = self._cached_thormap
+        if thormap is None:
+            return 0.0
+        try:
+            from skimage.graph import route_through_array
+
+            occ = np.asarray(thormap.occupancy, dtype=bool)  # True = free
+            # Downsample to ~0.1 m cells for a fast geodesic (a free coarse cell
+            # requires ALL underlying fine cells free, so walls stay solid).
+            px_per_m = float(thormap.px_per_m)
+            s = max(1, int(round(0.1 * px_per_m)))
+            h, w = occ.shape
+            hh, ww = (h // s) * s, (w // s) * s
+            free_ds = occ[:hh, :ww].reshape(hh // s, s, ww // s, s).all(axis=(1, 3))
+            if not free_ds.any():
+                return 0.0
+            cell_m = s / px_per_m
+
+            rp = thormap.pos_m_to_px(np.asarray(robot_pos, dtype=float)[None, :])[0]
+            gp = thormap.pos_m_to_px(np.asarray(target_pos, dtype=float)[None, :])[0]
+            r_cell = self._snap_to_free(free_ds, (rp[0] // s, rp[1] // s))
+            g_cell = self._snap_to_free(free_ds, (gp[0] // s, gp[1] // s))
+            if r_cell is None or g_cell is None:
+                return 0.0
+
+            # Measure euclid between the SAME snapped free cells used as geodesic
+            # endpoints (in meters), so geodesic >= euclid always holds and the
+            # ratio purely reflects the go-around factor. Comparing against the
+            # raw object center is wrong: objects rest inside occupied furniture,
+            # so its cell is snapped to a free edge and the raw straight-line
+            # distance over-counts, deflating the ratio below 1.0.
+            euclid = float(
+                np.linalg.norm(np.asarray(g_cell, float) - np.asarray(r_cell, float))
+            ) * cell_m
+            if euclid < 1e-3:
+                return 0.0
+            # cost 1 in free space, effectively impassable in occupied space.
+            cost = np.where(free_ds, 1.0, 1e6).astype(np.float64)
+            _, weight = route_through_array(
+                cost, r_cell, g_cell, fully_connected=True, geometric=True
+            )
+            if weight >= 1e5:  # path had to cross a wall -> no real route
+                import os as _os
+                _dbg = _os.environ.get("MLSPACES_WB_DEBUG_FILE")
+                if _dbg:
+                    with open(_dbg, "a") as _fh:
+                        _fh.write(f"NOROUTE weight={weight:.1f} euclid={euclid:.3f}\n")
+                return 0.0
+            geodesic_m = float(weight) * cell_m
+            ratio = geodesic_m / euclid
+            import os as _os
+            _dbg = _os.environ.get("MLSPACES_WB_DEBUG_FILE")
+            if _dbg:
+                # true world distance (robot->object) for sanity vs snapped euclid
+                true_d = float(np.linalg.norm(
+                    np.asarray(target_pos, float)[:2] - np.asarray(robot_pos, float)[:2]))
+                # LOS check: does the straight pixel line rp->gp cross any occupied cell?
+                npts = max(2, int(np.hypot(gp[0]-rp[0], gp[1]-rp[1]) / s))
+                rr = np.linspace(rp[0], gp[0], npts).astype(int)
+                cc = np.linspace(rp[1], gp[1], npts).astype(int)
+                rr = np.clip(rr, 0, occ.shape[0]-1); cc = np.clip(cc, 0, occ.shape[1]-1)
+                los_blocked = int((~occ[rr, cc]).sum())  # occupied px on straight line
+                with open(_dbg, "a") as _fh:
+                    _fh.write(
+                        f"euclid={euclid:.3f} geo={geodesic_m:.3f} ratio={ratio:.3f} "
+                        f"true_d={true_d:.3f} los_blocked_px={los_blocked}/{npts} "
+                        f"rob=({robot_pos[0]:.2f},{robot_pos[1]:.2f}) "
+                        f"obj=({target_pos[0]:.2f},{target_pos[1]:.2f}) "
+                        f"ok={ratio>=min_ratio}\n")
+            return ratio
+        except Exception as _e:  # noqa: BLE001 - never let the bias crash datagen
+            import os as _os
+            _dbg = _os.environ.get("MLSPACES_WB_DEBUG_FILE")
+            if _dbg:
+                with open(_dbg, "a") as _fh:
+                    _fh.write(f"EXC {type(_e).__name__}: {_e}\n")
+            return 0.0
+
     def _sample_and_place_robot(self, env: CPUMujocoEnv) -> None:
         """Sample a nav object, place robot using occupancy map, and return sampled params.
 
@@ -371,6 +495,25 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
             pickup_obj_pos = pickup_obj.position
         else:
             raise ValueError(f"Invalid pickup object type: {type(pickup_obj)}")
+
+        # Positions of ALL same-type candidate instances. The navigation policy
+        # and the success criterion target the NEAREST instance to the robot
+        # (get_nav_object_priority), not necessarily ``pickup_obj``. The
+        # wall-between predicate must therefore be evaluated against whichever
+        # instance is nearest to each sampled robot pose, or a closer instance
+        # in open space silently defeats the bias.
+        wb_candidate_positions: list[np.ndarray] = []
+        try:
+            cand_names = getattr(task_cfg, "pickup_obj_candidates", None) or [pickup_obj.name]
+            for _nm in cand_names:
+                try:
+                    wb_candidate_positions.append(np.asarray(om.get_object_by_name(_nm).position))
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            wb_candidate_positions = [np.asarray(pickup_obj_pos)]
+        if not wb_candidate_positions:
+            wb_candidate_positions = [np.asarray(pickup_obj_pos)]
 
         # Check if robot_base_pose is already set (e.g., from frozen_config)
         if task_cfg.robot_base_pose is not None:
@@ -408,18 +551,87 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
             if self._datagen_profiler is not None:
                 self._datagen_profiler.start("robot_place_near_pickup_obj")
 
-            robot_placed = env.place_robot_near(
-                robot_view=robot_view,
-                target=pickup_obj,
-                max_tries=max_robot_placement_attempts,
-                sampling_radius_range=sampling_radius_range,
-                robot_safety_radius=robot_safety_radius,
-                preserve_z=initial_robot_z,
-                face_target=face_target,
-                # check_camera_visibility=self.config.task_sampler_config.check_robot_placement_visibility,
-                # visibility_resolver=self.get_visibility_resolver(env),
-                # excluded_positions=self.used_robot_positions[pickup_obj.name],
+            require_wall_between = bool(
+                getattr(self.config.task_sampler_config, "require_wall_between", False)
             )
+            if not require_wall_between:
+                robot_placed = env.place_robot_near(
+                    robot_view=robot_view,
+                    target=pickup_obj,
+                    max_tries=max_robot_placement_attempts,
+                    sampling_radius_range=sampling_radius_range,
+                    robot_safety_radius=robot_safety_radius,
+                    preserve_z=initial_robot_z,
+                    face_target=face_target,
+                    # check_camera_visibility=self.config.task_sampler_config.check_robot_placement_visibility,
+                    # visibility_resolver=self.get_visibility_resolver(env),
+                    # excluded_positions=self.used_robot_positions[pickup_obj.name],
+                )
+            else:
+                # "Wall-between" bias: reject-sample placements until the robot
+                # must route AROUND a wall to reach the target (geodesic path >>
+                # straight line), i.e. the target sits on the other side of a
+                # wall. Each attempt re-runs the standard placement (its own
+                # collision + radius sampling), then tests the geodesic detour
+                # ratio on the cached occupancy map. Fall back to the last valid
+                # placement if the predicate can't be met (yield-preserving).
+                cfg = self.config.task_sampler_config
+                wb_max = int(getattr(cfg, "wall_between_max_attempts", 40))
+                wb_min_ratio = float(getattr(cfg, "wall_between_min_geodesic_ratio", 1.4))
+                wb_max_ratio = float(getattr(cfg, "wall_between_max_geodesic_ratio", 2.5))
+                wb_fallback = bool(getattr(cfg, "wall_between_fallback", True))
+                # Constrain the spawn distance for wall-between placements. The
+                # default nav radius (up to ~20 m) produces go-arounds so long the
+                # oracle nav times out / fails; a tighter band keeps the detour
+                # genuine but achievable, which both raises the accepted-demo yield
+                # and cuts per-episode time.
+                wb_radius = getattr(cfg, "wall_between_sampling_radius_range", None)
+                wb_sampling_radius_range = (
+                    tuple(wb_radius) if wb_radius else sampling_radius_range
+                )
+                robot_placed = False
+                wall_between_found = False
+                for wb_attempt in range(wb_max):
+                    placed = env.place_robot_near(
+                        robot_view=robot_view,
+                        target=pickup_obj,
+                        max_tries=max_robot_placement_attempts,
+                        sampling_radius_range=wb_sampling_radius_range,
+                        robot_safety_radius=robot_safety_radius,
+                        preserve_z=initial_robot_z,
+                        face_target=face_target,
+                    )
+                    if not placed:
+                        continue
+                    robot_placed = True  # at least one collision-free pose exists
+                    robot_xy = robot_view.base.pose[:3, 3]
+                    # Evaluate the predicate against the NEAREST candidate -- the
+                    # instance the policy will actually navigate to. Require a
+                    # genuine but ACHIEVABLE go-around (ratio in
+                    # [min_ratio, max_ratio]); extreme detours to a far instance
+                    # make the oracle nav time out and yield nothing, so cap them.
+                    rp2 = np.asarray(robot_xy, float)[:2]
+                    nearest = min(
+                        wb_candidate_positions,
+                        key=lambda p: float(np.linalg.norm(p[:2] - rp2)),
+                    )
+                    ratio = self._detour_ratio(robot_xy, nearest, wb_min_ratio)
+                    if wb_min_ratio <= ratio <= wb_max_ratio:
+                        wall_between_found = True
+                        log.info(
+                            f"[wall-between] satisfied after {wb_attempt + 1} attempt(s) "
+                            f"for target '{pickup_obj.name}' (nearest-instance ratio={ratio:.2f})"
+                        )
+                        break
+                if robot_placed and not wall_between_found:
+                    if wb_fallback:
+                        log.info(
+                            f"[wall-between] no around-a-wall placement in {wb_max} attempts for "
+                            f"'{pickup_obj.name}'; falling back to direct placement (yield-preserving)"
+                        )
+                    else:
+                        robot_placed = False
+
             if self._datagen_profiler is not None:
                 self._datagen_profiler.end("robot_place_near_pickup_obj")
 
@@ -430,6 +642,14 @@ class NavToObjTaskSampler(BaseMujocoTaskSampler):
             # Get final robot pose for return data
             task_cfg.robot_base_pose = pose_mat_to_7d(robot_view.base.pose).tolist()
             final_pos = robot_view.base.pose[:3, 3]
+            import os as _os
+            _dbg = _os.environ.get("MLSPACES_WB_DEBUG_FILE")
+            if _dbg and require_wall_between:
+                with open(_dbg, "a") as _fh:
+                    _fh.write(
+                        f"FINAL wb_found={wall_between_found} "
+                        f"pose=({final_pos[0]:.2f},{final_pos[1]:.2f}) "
+                        f"obj=({pickup_obj_pos[0]:.2f},{pickup_obj_pos[1]:.2f})\n")
             log.info("[OK] Successfully placed robot")
             log.info(
                 f"Final robot position: ({final_pos[0]:.3f}, {final_pos[1]:.3f}, {final_pos[2]:.3f})"
