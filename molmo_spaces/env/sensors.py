@@ -23,7 +23,8 @@ from molmo_spaces.utils.pose import pose_mat_to_7d
 log = logging.getLogger(__name__)
 
 
-def _cmd_joint_pos(robot: Robot):
+def _cmd_joint_pos(robot: Robot) -> dict[str, np.ndarray]:
+    """Position targets only; other control modes remain in LastActionSensor."""
     # if the unnoised cmd joint pos is available, use it
     unnoised_cmd_jp = robot.last_unnoised_cmd_joint_pos()
     if unnoised_cmd_jp is not None:
@@ -34,10 +35,6 @@ def _cmd_joint_pos(robot: Robot):
     for name, controller in robot.controllers.items():
         if isinstance(controller, AbstractPositionController):
             cmd_jp[name] = controller.target_pos
-        else:
-            raise NotImplementedError(
-                f"Controller '{name}' is not a position controller, saving is unsupported!"
-            )
     return cmd_jp
 
 
@@ -207,7 +204,10 @@ class LastCommandedRelativeJointPosSensor(Sensor):
         # on the first step, return dummy action
         if self._prev_jp is None:
             self._prev_jp = robot.robot_view.get_qpos_dict()
-            return {name: np.zeros_like(jp).tolist() for name, jp in self._prev_jp.items()}
+            return {
+                name: np.zeros_like(self._prev_jp[name]).tolist()
+                for name in _cmd_joint_pos(robot)
+            }
 
         prev_cmd_jp = _cmd_joint_pos(robot)
         cmd_rel_jp: dict[str, list[float]] = {}

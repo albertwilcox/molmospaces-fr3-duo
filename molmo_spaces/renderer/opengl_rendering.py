@@ -333,7 +333,6 @@ class MjOpenGLRenderer(MjAbstractRenderer):
             np.copyto(self._scene.flags, original_flags)
         else:
             mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
-            mjr_readPixels(rgb=out, depth=None, viewport=rect, con=self._mjr_context)
 
         out[:] = np.flipud(out)
 

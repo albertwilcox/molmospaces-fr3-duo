@@ -13,6 +13,7 @@ Composition strategy:
 """
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import mujoco
@@ -120,8 +121,9 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         the same traversable space navigation plans over -- so the recorded goal
         is not snapped ~1 m outward by the planner's nearest-free-cell fallback.
         """
-        r = getattr(self.config.policy_config, "nav_planning_agent_radius", None)
-        if r:
+        nav_config = getattr(self.config.policy_config, "nav_policy_config", self.config.policy_config)
+        r = getattr(nav_config, "nav_planning_agent_radius", None)
+        if r is not None:
             return float(r)
         return float(self.config.task_sampler_config.robot_safety_radius)
 
@@ -378,7 +380,7 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             )
 
     def _place_robot_at_nav_start(self, env: CPUMujocoEnv) -> None:
-        """Move the mobile base to a far, navigable start pose facing anywhere.
+        """Move to a far navigable start, optionally facing the pickup target.
 
         On failure (no navigable free cell in the requested radius band) the
         robot is left at the manip-feasible pose near the object, yielding a
@@ -394,12 +396,18 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
             target=pickup_obj,
             max_tries=sampler_cfg.max_robot_placement_attempts,
             sampling_radius_range=sampler_cfg.nav_start_radius_range,
-            robot_safety_radius=sampler_cfg.robot_safety_radius,
+            robot_safety_radius=self._nav_effective_agent_radius(),
             preserve_z=sampler_cfg.mobile_base_z,
-            face_target=False,
-            check_camera_visibility=False,
+            face_target=sampler_cfg.nav_start_face_target,
+            yaw_randomization_range_rad=0.0 if sampler_cfg.nav_start_face_target else None,
+            check_camera_visibility=sampler_cfg.nav_start_check_camera_visibility,
+            visibility_resolver=lambda key: [pickup_obj.name]
+            if key == "__pickup_object__"
+            else self.resolve_visibility_object(env, key),
         )
         if not placed:
+            if sampler_cfg.nav_start_check_camera_visibility:
+                raise ValueError("No collision-free navigation start satisfied camera visibility")
             log.warning(
                 "[MOBILE PNP] Could not place robot at a far nav-start pose; "
                 "keeping the manip-feasible pose near the object."
@@ -1321,7 +1329,11 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         return False
 
     def _find_place_standoff(
-        self, env: CPUMujocoEnv, broad: bool = False
+        self,
+        env: CPUMujocoEnv,
+        broad: bool = False,
+        *,
+        standoff_filter: Callable[[np.ndarray], bool] | None = None,
     ) -> tuple[bool, np.ndarray | None, bool]:
         """Probe for a base standoff from which the carried pickup object can be
         placed on the receptacle.
@@ -1351,6 +1363,8 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
         Mirrors the placement planner's pose construction (the carried-object
         grasp orientation, translated so the *object* lands on the receptacle
         top), base-locked to match the runtime manip phase.
+        An optional filter can reject a candidate after collision checking,
+        for example when the policy cameras cannot see the destination.
         """
         sampler_cfg = self.config.task_sampler_config
         task_cfg = self.config.task_config
@@ -1650,6 +1664,8 @@ class MobilePickAndPlaceTaskSampler(PickAndPlaceTaskSampler):
                                 continue
                         except Exception:
                             pass
+                        if standoff_filter is not None and not standoff_filter(base_pose):
+                            continue
                         place_xys = (
                             place_xy_candidates(base_pose) if grid_enabled else []
                         )

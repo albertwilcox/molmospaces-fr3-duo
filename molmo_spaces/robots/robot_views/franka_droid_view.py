@@ -45,10 +45,21 @@ class RobotIQGripperGroup(MJCFFrameMixin, GripperGroup):
 
     @property
     def inter_finger_dist(self) -> float:
-        dist = mujoco.mj_geomDistance(
-            self.mj_model, self.mj_data, self._finger_1_geom_id, self._finger_2_geom_id, 0.1, None
+        ids = [self._finger_1_geom_id, self._finger_2_geom_id]
+        if np.any(self.mj_model.geom_type[ids] != mujoco.mjtGeom.mjGEOM_BOX):
+            raise ValueError("Robotiq aperture measurement requires box finger pads")
+        # Box-box distance queries can spuriously return zero for separated pads.
+        # Measure their inner support planes along the grasp frame's closing axis.
+        axis = self.leaf_frame_to_world[:3, 1]
+        centers = self.mj_data.geom_xpos[ids]
+        rotations = self.mj_data.geom_xmat[ids].reshape(2, 3, 3)
+        radii = np.sum(
+            np.abs(rotations.transpose(0, 2, 1) @ axis) * self.mj_model.geom_size[ids]
         )
-        return max(0.0, dist)
+        gap = float(abs((centers[1] - centers[0]) @ axis) - radii)
+        if not np.isfinite(gap):
+            raise ValueError("Non-finite Robotiq finger-pad aperture")
+        return max(0.0, gap)
 
     @property
     def inter_finger_dist_range(self) -> tuple[float, float]:

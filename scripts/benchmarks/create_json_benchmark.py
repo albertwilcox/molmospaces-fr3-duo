@@ -386,6 +386,20 @@ def frozen_config_to_episode_spec(
     add_if_present("max_place_receptacle_pos_displacement")
     add_if_present("max_place_receptacle_rot_displacement")
 
+    if task_cls_str.endswith(".MobilePickAndPlaceTask"):
+        from molmo_spaces.evaluation.benchmark_schema import MobilePickAndPlaceTaskSpec
+
+        # The sampler stores a pickup standoff in robot_base_pose, not the
+        # navigation start. Holonomic qpos preserves the actual initial XY/yaw.
+        from scipy.spatial.transform import Rotation
+
+        base_qpos = np.asarray(init_qpos["base"], dtype=float)
+        quat = Rotation.from_euler("z", base_qpos[2]).as_quat(scalar_first=True)
+        task_dict["robot_start_pose"] = [*base_qpos[:2], robot_base_pose[2], *quat]
+        for key in MobilePickAndPlaceTaskSpec.model_fields:
+            if key not in {"task_cls", "task_type", "robot_start_pose"}:
+                add_if_present(key)
+
     # Open/close fields
     add_if_present("articulation_object_name")
     add_if_present("joint_name")

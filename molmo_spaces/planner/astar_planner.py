@@ -201,15 +201,21 @@ class AStarPlanner(Planner):
 
         def find_close(missing):
             # TODO check the close location is actually in the same room (e.g. using room polygon)
+            nearest = None
+            nearest_squared_distance = float("inf")
             for search_range in range(1, self.config.max_start_goal_distance + 1):
                 for shiftr in range(-search_range, search_range + 1):
                     for shiftc in range(-search_range, search_range + 1):
-                        if shiftr != search_range and shiftc != search_range:
+                        if abs(shiftr) != search_range and abs(shiftc) != search_range:
                             continue
                         cur_goal = (missing[0] + shiftr, missing[1] + shiftc)
-                        if cur_goal in self.graph:
-                            return cur_goal
-            return None
+                        squared_distance = shiftr * shiftr + shiftc * shiftc
+                        if squared_distance < nearest_squared_distance and cur_goal in self.graph:
+                            nearest = cur_goal
+                            nearest_squared_distance = squared_distance
+                if nearest_squared_distance <= (search_range + 1) ** 2:
+                    return nearest
+            return nearest
 
         if tuple(discrete_pos) not in self.graph:
             discrete_pos = find_close(discrete_pos)

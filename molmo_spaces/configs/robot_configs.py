@@ -9,10 +9,11 @@ This module contains:
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from mujoco import MjData
+from pydantic import Field, FiniteFloat
 
 from molmo_spaces.configs.abstract_config import Config
 from molmo_spaces.molmo_spaces_constants import get_robot_path
@@ -172,7 +173,7 @@ class FrankaRobotConfig(BaseRobotConfig):
         if "gripper" in self.command_mode:
             assert self.command_mode["gripper"] == "joint_position"
         if "arm" in self.command_mode:
-            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position"]
+            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position", "osc_pose"]
 
 
 class MobileFrankaRobotConfig(BaseRobotConfig):
@@ -183,6 +184,11 @@ class MobileFrankaRobotConfig(BaseRobotConfig):
     name: str = "franka_droid"
     robot_xml_path: Path = Path("model.xml")
     base_size: list[float] = [0.5, 0.5, 0.58]
+    base_velocity_reference_mass_kg: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
+    base_yaw_pivot_offset_xy_m: tuple[FiniteFloat, FiniteFloat] = (0.0, 0.0)
+    torque_velocity_reference: Literal["tcp", "arm_root"] = "tcp"
     init_qpos: dict[str, list[float]] = {
         "base": [0, 0, 0],
         "arm": [0, -0.7853, 0, -2.35619, 0, 1.57079, 0.0],
@@ -248,7 +254,7 @@ class FrankaCAPRobotConfig(BaseRobotConfig):
         if "gripper" in self.command_mode:
             assert self.command_mode["gripper"] == "joint_position"
         if "arm" in self.command_mode:
-            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position"]
+            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position", "osc_pose"]
 
 
 class RBY1Config(BaseRobotConfig):
@@ -387,7 +393,7 @@ class I2rtYamRobotConfig(BaseRobotConfig):
         if "gripper" in self.command_mode:
             assert self.command_mode["gripper"] == "joint_position"
         if "arm" in self.command_mode:
-            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position"]
+            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position", "osc_pose"]
 
 
 class BimanualYamRobotConfig(BaseRobotConfig):
@@ -426,7 +432,7 @@ class BimanualYamRobotConfig(BaseRobotConfig):
         if "gripper" in self.command_mode:
             assert self.command_mode["gripper"] == "joint_position"
         if "arm" in self.command_mode:
-            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position"]
+            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position", "osc_pose"]
 
 
 class BimanualFrankaConfig(BaseRobotConfig):
@@ -465,4 +471,4 @@ class BimanualFrankaConfig(BaseRobotConfig):
         if "gripper" in self.command_mode:
             assert self.command_mode["gripper"] == "joint_position"
         if "arm" in self.command_mode:
-            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position"]
+            assert self.command_mode["arm"] in ["joint_position", "joint_rel_position", "osc_pose"]

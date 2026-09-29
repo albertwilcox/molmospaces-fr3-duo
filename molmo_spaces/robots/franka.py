@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 from molmo_spaces.controllers.abstract import Controller
 from molmo_spaces.controllers.joint_pos import JointPosController
 from molmo_spaces.controllers.joint_rel_pos import JointRelPosController
+from molmo_spaces.controllers.osc_pose import OSCPoseController
 from molmo_spaces.kinematics.mujoco_kinematics import MlSpacesKinematics
 from molmo_spaces.kinematics.parallel.warp_kinematics import SimpleWarpKinematics
 from molmo_spaces.robots.abstract import Robot
@@ -74,14 +75,24 @@ class FrankaRobot(Robot):
         self._kinematics = MlSpacesKinematics(config.robot_config)
 
         self._parallel_kinematics = SimpleWarpKinematics(config.robot_config)
-        arm_controller_cls = (
-            JointPosController
+        arm_command_mode = (
+            "joint_position"
             if config.robot_config.command_mode == {}
-            or config.robot_config.command_mode["arm"] == "joint_position"
-            else JointRelPosController
+            else config.robot_config.command_mode["arm"]
         )
+        if arm_command_mode == "osc_pose":
+            arm_controller: Controller = OSCPoseController(
+                self._robot_view.get_move_group("arm"),
+                move_group_id="arm",
+                kinematics=self._kinematics,
+                robot_view=self._robot_view,
+            )
+        elif arm_command_mode == "joint_position":
+            arm_controller = JointPosController(self._robot_view.get_move_group("arm"))
+        else:
+            arm_controller = JointRelPosController(self._robot_view.get_move_group("arm"))
         self._controllers = {
-            "arm": arm_controller_cls(self._robot_view.get_move_group("arm")),
+            "arm": arm_controller,
             "gripper": JointPosController(self._robot_view.get_move_group("gripper")),
         }
 

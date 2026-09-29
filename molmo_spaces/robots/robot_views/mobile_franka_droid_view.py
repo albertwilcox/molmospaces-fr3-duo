@@ -1,3 +1,4 @@
+import numpy as np
 from mujoco import MjData
 
 from molmo_spaces.robots.robot_views.abstract import (
@@ -17,6 +18,11 @@ class MobileFrankaDroidBaseGroup(HoloJointsRobotBaseGroup):
         act = [model.actuator(f"{namespace}base_{axis}_act").id for axis in ["x", "y", "theta"]]
         root_body_id = model.body(f"{namespace}base").id
         super().__init__(mj_data, world_site_id, holo_base_site_id, joints, act, root_body_id)
+        self._yaw_pivot = model.jnt_pos[joints[2]].copy()
+        self._has_yaw_pivot_offset = bool(np.any(self._yaw_pivot))
+        initial_yaw = model.qpos0[model.jnt_qposadr[joints[2]]]
+        c, s = np.cos(initial_yaw), np.sin(initial_yaw)
+        self._initial_pivot_xy = np.array([[c, -s], [s, c]]) @ self._yaw_pivot[:2]
         # The base yaw is a free (unlimited) hinge, but its position actuator ships
         # with ctrlrange=[-pi, pi]. The holonomic ``ctrl`` setter commands the yaw
         # in a *continuous* frame (curr_yaw + normalize(target - curr_yaw)), which
@@ -29,8 +35,25 @@ class MobileFrankaDroidBaseGroup(HoloJointsRobotBaseGroup):
         # The setter still bounds each command to within +-pi of the current qpos,
         # so this never introduces large/unsafe setpoint jumps.
         theta_act = act[2]
-        model.actuator_ctrllimited[theta_act] = 0
-        model.actuator_ctrlrange[theta_act] = [-1.0e6, 1.0e6]
+        if model.actuator_biasprm[theta_act, 1] != 0:
+            model.actuator_ctrllimited[theta_act] = 0
+            model.actuator_ctrlrange[theta_act] = [-1.0e6, 1.0e6]
+
+    @property
+    def pose(self) -> np.ndarray:
+        pose = super().pose
+        # An off-center hinge moves the body origin even when both sliders hold.
+        if self._has_yaw_pivot_offset:
+            pose[:2, 3] += self._initial_pivot_xy - pose[:2, :2] @ self._yaw_pivot[:2]
+        return pose
+
+    @pose.setter
+    def pose(self, pose: np.ndarray) -> None:
+        theta = np.arctan2(pose[1, 0], pose[0, 0])
+        position = pose[:2, 3]
+        if self._has_yaw_pivot_offset:
+            position = position - self._initial_pivot_xy + pose[:2, :2] @ self._yaw_pivot[:2]
+        self.joint_pos = np.array([*position, theta])
 
 
 class MobileFrankaDroidRobotView(RobotView):

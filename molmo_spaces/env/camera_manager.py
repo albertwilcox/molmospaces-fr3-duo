@@ -182,7 +182,8 @@ class RobotMountedCamera(Camera):
         # Reference pose has changed, recalculate camera pose
         if self.camera_quaternion is not None:
             pos, forward, up = env.camera_manager.create_quaternion_camera_pose(
-                env, self._active_reference_body_name, self.camera_offset, self.camera_quaternion
+                env, self._active_reference_body_name, self.camera_offset, self.camera_quaternion,
+                reference_pose=current_reference_pose,
             )
         else:
             pos, forward, up = env.camera_manager.create_robot_mounted_camera_pose(
@@ -857,6 +858,7 @@ class CameraManager:
             reference_body_names: Body name(s) to attach camera to. If list, tries each until one works.
             camera_offset: Camera position relative to reference body frame
             camera_quaternion: Quaternion [w, x, y, z] relative to reference body frame
+            reference_pose: Optional already-computed reference transform to reuse
         """
         robot_camera = RobotMountedCamera(
             camera_name,
@@ -1045,6 +1047,8 @@ class CameraManager:
         reference_body_name: str,
         camera_offset: np.ndarray,
         camera_quaternion: np.ndarray,
+        *,
+        reference_pose: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Create camera pose using quaternion-based orientation relative to reference body.
@@ -1063,10 +1067,11 @@ class CameraManager:
         from molmo_spaces.env.data_views import create_mlspaces_body
 
         # Get reference body for transformations
-        reference_body = create_mlspaces_body(env.current_data, reference_body_name)
+        if reference_pose is None:
+            reference_pose = create_mlspaces_body(env.current_data, reference_body_name).pose
 
         # Calculate camera position in world coordinates
-        camera_pos_world = reference_body.pose[:3, :3] @ camera_offset + reference_body.pose[:3, 3]
+        camera_pos_world = reference_pose[:3, :3] @ camera_offset + reference_pose[:3, 3]
 
         # Calculate camera orientation in world coordinates
         norm_quat = np.linalg.norm(camera_quaternion)
@@ -1074,7 +1079,7 @@ class CameraManager:
             camera_quaternion = camera_quaternion / norm_quat
 
         camera_rotation_matrix = R.from_quat(camera_quaternion, scalar_first=True).as_matrix()
-        world_rotation = reference_body.pose[:3, :3] @ camera_rotation_matrix
+        world_rotation = reference_pose[:3, :3] @ camera_rotation_matrix
 
         # Extract forward and up vectors from the rotation matrix
         # Camera convention: forward is negative Z-axis, up is Y-axis

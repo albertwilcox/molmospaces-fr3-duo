@@ -897,6 +897,7 @@ class CPUMujocoEnv(BaseMujocoEnv):
         excluded_positions: list[np.ndarray] | None = None,
         exclusion_threshold: float | None = None,
         save_visibility_frames_dir: Path | str | None = None,
+        yaw_randomization_range_rad: float | None = None,
     ) -> bool:
         """
         Place robot near a target point or object with collision checking.
@@ -914,10 +915,15 @@ class CPUMujocoEnv(BaseMujocoEnv):
             excluded_positions: List of positions to avoid (e.g. previously used positions)
             exclusion_threshold: Minimum distance from any excluded position
             save_visibility_frames_dir: Optional directory to save camera frames during visibility check
+            yaw_randomization_range_rad: Override placement yaw jitter; None keeps the configured range.
 
         Returns:
             bool: True if placement was successful, False otherwise
         """
+        if yaw_randomization_range_rad is not None and (
+            not np.isfinite(yaw_randomization_range_rad) or yaw_randomization_range_rad < 0
+        ):
+            raise ValueError("Placement yaw randomization must be finite and nonnegative")
         if exclusion_threshold is None:
             exclusion_threshold = (
                 self.config.task_sampler_config.robot_placement_exclusion_threshold
@@ -1056,6 +1062,8 @@ class CPUMujocoEnv(BaseMujocoEnv):
                     # Apply randomization to yaw
                     randomization_range = (
                         self.config.task_sampler_config.robot_placement_rotation_range_rad
+                        if yaw_randomization_range_rad is None
+                        else yaw_randomization_range_rad
                     )
                     if randomization_range > 0:
                         robot_base_yaw += np.random.uniform(

@@ -1762,7 +1762,7 @@ class MobilePickAndPlaceStateMachinePolicy(PlannerPolicy):
                 pass
             except ValueError:
                 rec = getattr(self.config.task_config, "robot_base_pose", None)
-                rec_xy = (rec[0], rec[1]) if rec else (float("nan"), float("nan"))
+                rec_xy = (rec[0], rec[1]) if rec is not None else (float("nan"), float("nan"))
                 log.info(
                     "[MOBILE PNP FSM] PICK not feasible at navigated pose "
                     f"({current[0, 3]:.2f}, {current[1, 3]:.2f}) vs recorded standoff "

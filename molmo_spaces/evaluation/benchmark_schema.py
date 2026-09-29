@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class RobotSpec(BaseModel):
@@ -139,11 +139,34 @@ class PickAndPlaceTaskSpec(PickTaskSpec):
 
     place_receptacle_name: str
     place_receptacle_start_pose: list[float] = Field(..., min_length=7, max_length=7)
+    succ_pos_threshold: float = float("inf")
+
+    @field_validator("succ_pos_threshold", mode="before")
+    @classmethod
+    def restore_disabled_lift_threshold(cls, value: float | None) -> float:
+        # Pydantic serializes the native disabled (infinite) threshold as null.
+        return float("inf") if value is None else value
 
     # Success criteria
     receptacle_supported_weight_frac: float = 0.5
     max_place_receptacle_pos_displacement: float = 0.15
     max_place_receptacle_rot_displacement: float = np.deg2rad(60)
+
+
+class MobilePickAndPlaceTaskSpec(PickAndPlaceTaskSpec):
+    """Mobile episode: initial base pose is distinct from the pickup standoff."""
+
+    max_place_receptacle_pos_displacement: float = 0.1
+    max_place_receptacle_rot_displacement: float = float(np.deg2rad(45))
+    robot_start_pose: list[float] = Field(..., min_length=7, max_length=7)
+    place_robot_base_pose: list[float] | None = Field(default=None, min_length=7, max_length=7)
+    nav_succ_pos_threshold: float = 0.8
+    visibility_camera_name: str = "nav_camera"
+    require_object_visible: bool = False
+    succ_use_goal_pose: bool = True
+    succ_goal_pos_threshold: float = 0.30
+    succ_goal_yaw_threshold: float = float(np.deg2rad(25))
+    max_pregrasp_standoff_m: float = 1.75
 
 
 class PickAndPlaceNextToTaskSpec(PickAndPlaceTaskSpec):
@@ -203,6 +226,7 @@ class DoorOpeningTaskSpec(BaseTaskSpec):
 TaskSpec = (
     PickTaskSpec
     | PickAndPlaceTaskSpec
+    | MobilePickAndPlaceTaskSpec
     | PickAndPlaceColorTaskSpec
     | PickAndPlaceNextToTaskSpec
     | OpenCloseTaskSpec
@@ -214,6 +238,7 @@ TaskSpec = (
 ALL_TASK_SPEC_CLASSES: list[type[BaseTaskSpec]] = [
     PickTaskSpec,
     PickAndPlaceTaskSpec,
+    MobilePickAndPlaceTaskSpec,
     PickAndPlaceNextToTaskSpec,
     PickAndPlaceColorTaskSpec,
     OpenCloseTaskSpec,

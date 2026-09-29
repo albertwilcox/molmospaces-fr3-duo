@@ -337,20 +337,20 @@ def is_object_supported_by_body(
 
     net_force = np.zeros(3)
 
-    for cid in range(data.ncon):
+    roots = model.body_rootid[model.geom_bodyid[data.contact.geom]]
+    matching = ((roots[:, 0] == object_id) & (roots[:, 1] == body_rootid)) | (
+        (roots[:, 1] == object_id) & (roots[:, 0] == body_rootid)
+    )
+    for cid in np.flatnonzero(matching):
         c = data.contact[cid]
-        root_body1, root_body2 = model.body_rootid[model.geom_bodyid[c.geom]]
+        contact_force = np.zeros(6)
+        mujoco.mj_contactForce(model, data, cid, contact_force)
+        if roots[cid, 0] == object_id:
+            contact_force = -contact_force
 
-        # only check contacts between the object and the body
-        if {root_body1, root_body2} == {body_rootid, object_id}:
-            contact_force = np.zeros(6)
-            mujoco.mj_contactForce(model, data, cid, contact_force)
-            if root_body1 == object_id:
-                contact_force = -contact_force
-
-            contact_rotmat = c.frame.reshape(3, 3).T
-            contact_force_world = contact_rotmat @ contact_force[:3]
-            net_force += contact_force_world
+        contact_rotmat = c.frame.reshape(3, 3).T
+        contact_force_world = contact_rotmat @ contact_force[:3]
+        net_force += contact_force_world
 
     if np.linalg.norm(net_force) < eps:
         # no contact between objects

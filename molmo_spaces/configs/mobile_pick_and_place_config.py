@@ -122,6 +122,8 @@ class MobilePickAndPlaceTaskSamplerConfig(PickAndPlaceTaskSamplerConfig):
     # Radius range for the navigable START pose (far enough that navigation is
     # genuinely exercised, close enough that the smoke test stays fast/robust).
     nav_start_radius_range: tuple[float, float] = (2.0, 6.0)
+    nav_start_face_target: bool = False
+    nav_start_check_camera_visibility: bool = False
 
     # Robot footprint radius for occupancy-map placement + A* agent radius.
     robot_safety_radius: float = 0.3

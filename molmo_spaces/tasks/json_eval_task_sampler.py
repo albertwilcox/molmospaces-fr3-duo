@@ -26,6 +26,7 @@ from mujoco import MjSpec
 from scipy.spatial.transform import Rotation as R
 
 from molmo_spaces.configs.abstract_exp_config import MlSpacesExpConfig
+from molmo_spaces.configs.mobile_pick_and_place_config import MobilePickAndPlaceTaskConfig
 from molmo_spaces.configs.camera_configs import (
     CameraSystemConfig,
     FixedExocentricCameraConfig,
@@ -51,6 +52,7 @@ from molmo_spaces.evaluation.benchmark_schema import (
     DoorOpeningTaskSpec,
     EpisodeSpec,
     ExocentricCameraSpec,
+    MobilePickAndPlaceTaskSpec,
     NavToObjTaskSpec,
     OpenCloseTaskSpec,
     PickAndPlaceColorTaskSpec,
@@ -77,6 +79,7 @@ log = logging.getLogger(__name__)
 TASK_CLASS_TO_CONFIG_CLASS: dict[str, type[BaseMujocoTaskConfig]] = {
     "PickTask": PickTaskConfig,
     "PickAndPlaceTask": PickAndPlaceTaskConfig,
+    "MobilePickAndPlaceTask": MobilePickAndPlaceTaskConfig,
     "PickAndPlaceNextToTask": PickAndPlaceNextToTaskConfig,
     "PickAndPlaceColorTask": PickAndPlaceColorTaskConfig,
     "OpeningTask": OpeningTaskConfig,
@@ -90,6 +93,7 @@ TASK_CLASS_TO_CONFIG_CLASS: dict[str, type[BaseMujocoTaskConfig]] = {
 TASK_CLASS_TO_SPEC_CLASS: dict[str, type[BaseTaskSpec]] = {
     "PickTask": PickTaskSpec,
     "PickAndPlaceTask": PickAndPlaceTaskSpec,
+    "MobilePickAndPlaceTask": MobilePickAndPlaceTaskSpec,
     "PickAndPlaceNextToTask": PickAndPlaceNextToTaskSpec,
     "PickAndPlaceColorTask": PickAndPlaceColorTaskSpec,
     "OpeningTask": OpenCloseTaskSpec,
@@ -331,6 +335,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
             "molmo_spaces.tasks.pick_task.PickTask": "pick",
             "molmo_spaces.tasks.opening_tasks.OpeningTask": "open",
             "molmo_spaces.tasks.pick_and_place_task.PickAndPlaceTask": "pick_and_place",
+            "molmo_spaces.tasks.mobile_pick_and_place_task.MobilePickAndPlaceTask": "mobile_pick_and_place",
             "molmo_spaces.tasks.pick_and_place_next_to_task.PickAndPlaceNextToTask": "pick_and_place_next_to",
             "molmo_spaces.tasks.pick_and_place_color_task.PickAndPlaceColorTask": "pick_and_place_color",
             "molmo_spaces.tasks.opening_tasks.DoorOpeningTask": "door_opening",
@@ -817,7 +822,7 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
 
         # The JSON benchmark is authoritative for displacement thresholds.
         # Assert they match the expected defaults rather than overriding.
-        if isinstance(task_config, PickAndPlaceTaskConfig):
+        if isinstance(task_config, PickAndPlaceTaskConfig) and not isinstance(task_config, MobilePickAndPlaceTaskConfig):
             assert task_config.max_place_receptacle_pos_displacement == 0.15, (
                 f"Expected max_place_receptacle_pos_displacement=0.15, "
                 f"got {task_config.max_place_receptacle_pos_displacement}"
@@ -843,19 +848,23 @@ class JsonEvalTaskSampler(BaseMujocoTaskSampler):
         self._apply_task_config()
 
         # Set robot base pose from task dict (validated in __init__)
-        robot_base_pose = self.episode_spec.task["robot_base_pose"]
+        if isinstance(self.config.task_config, MobilePickAndPlaceTaskConfig):
+            robot_base_pose = self.episode_spec.task["robot_start_pose"]
+        else:
+            robot_base_pose = self.episode_spec.task["robot_base_pose"]
         robot_view = env.current_robot.robot_view
         robot_pose_m = pos_quat_to_pose_mat(robot_base_pose[0:3], robot_base_pose[3:7])
         robot_view.base.pose = robot_pose_m
+
+        # Base placement changes qpos; refresh Cartesian frames before controllers
+        # capture their hold targets, especially for desired-goal accumulation.
+        mujoco.mj_forward(env.current_model, env.current_data)
 
         # Reset controllers
         for controller in env.current_robot.controllers.values():
             controller.reset()
         env.current_robot.set_stationary()
         env.current_robot.compute_control()
-
-        # Forward to update positions
-        mujoco.mj_forward(env.current_model, env.current_data)
 
         # Apply object colors (PickAndPlaceColor tasks store per-object rgba).
         object_colors = getattr(self.config.task_config, "object_colors", None)
